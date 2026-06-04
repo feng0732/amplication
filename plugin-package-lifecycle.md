@@ -502,6 +502,313 @@ async getDSGResourceData(...): Promise<CodeGenTypes.DSGResourceData> {
 
 ---
 
+#### 5. 私有插件文件定位关系详解
+
+本章节深入分析私有插件从下载到加载的完整文件路径映射，回答三个核心问题：
+- 下载产物如何放入生成器资产目录？
+- 成功消息中的 `pluginPaths` 为何不直接传入生成流程？
+- 加载阶段怎样定位私有插件？
+
+##### 目录结构与环境变量约定
+
+系统通过以下环境变量定义共享存储路径（各服务通过相同的挂载卷访问）：
+
+| 环境变量 | 典型值 | 用途 |
+|---------|--------|------|
+| `CLONES_FOLDER` | `/tmp/clones` | git-sync-manager 克隆仓库的临时目录 |
+| `DSG_ASSETS_FOLDER` | `/amplication-data/dsg-assets` | DSG 资产根目录（跨服务共享） |
+| `DSG_JOBS_BASE_FOLDER` | `/amplication-data/dsg-jobs` | DSG 作业根目录（build-manager 和 DSG 容器共享） |
+| `DSG_JOBS_RESOURCE_DATA_FILE` | `input.json` | 输入数据文件名（DSG 容器内 `BUILD_SPEC_PATH` 指向此文件） |
+
+---
+
+##### 5.1 下载产物如何放入生成器资产目录？
+
+**第一步：克隆仓库到临时目录**
+[`PrivatePluginService.downloadPrivatePluginsFromSingleRepo()`](ee/packages/git-sync-manager/src/private-plugin/private-plugin.service.ts#L147-L218)
+```typescript
+// 克隆目录：CLONES_FOLDER/private-plugins
+const cloneDirPath = join(
+  this.configService.get<string>(Env.CLONES_FOLDER),
+  "private-plugins"
+);
+
+// 调用 GitClientService 下载插件
+const { pluginPaths, pluginVersions, cleanupPaths } =
+  await gitClientService.downloadPrivatePlugins({
+    owner,
+    repositoryName: repo,
+    cloneDirPath,
+    // ... 其他参数
+  });
+// pluginPaths 示例: ["/tmp/clones/private-plugins/repo-abc/dist/plugin-id-1", ...]
+```
+
+**第二步：复制到 DSG 资产目录**
+[`PrivatePluginService.copyPluginFilesToDsgAssetsDir()`](ee/packages/git-sync-manager/src/private-plugin/private-plugin.service.ts#L220-L247)
+```typescript
+async copyPluginFilesToDsgAssetsDir(
+  pluginPaths: string[],
+  resourceId: string,
+  buildId: string
+): Promise<{ newPluginPaths: string[] }> {
+  // 目标路径: DSG_ASSETS_FOLDER/{resourceId}-{buildId}/private-plugins/
+  const dsgAssetsPath = join(
+    this.configService.get(Env.DSG_ASSETS_FOLDER),
+    `${resourceId}-${buildId}`,
+    "private-plugins"
+  );
+
+  const newPluginPaths: string[] = [];
+  for (const pluginPath of pluginPaths) {
+    const pluginName = pluginPath.split("/").pop();  // 提取 pluginId
+    const pluginPathInAssets = join(dsgAssetsPath, pluginName);
+
+    await copy(pluginPath, pluginPathInAssets);  // 从克隆目录复制到资产目录
+    newPluginPaths.push(pluginPathInAssets);
+  }
+
+  return { newPluginPaths };
+  // newPluginPaths 示例: ["/amplication-data/dsg-assets/res-abc-build-123/private-plugins/plugin-id-1", ...]
+}
+```
+
+**第三步：资产目录复制到 Job 目录（build-manager）**
+[`BuildRunnerService.saveRelevantDsgAssets()`](packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L349-L370)
+```typescript
+async saveRelevantDsgAssets(
+  resourceId: string,
+  buildId: string,      // jobBuildId (可能带分片后缀)
+  plainBuildId: string  // 原始 buildId
+) {
+  // 源路径: DSG_ASSETS_FOLDER/{resourceId}-{plainBuildId}/
+  const dsgAssetsPathForBuild = join(
+    this.configService.get(Env.DSG_ASSETS_FOLDER),
+    `${resourceId}-${plainBuildId}`
+  );
+
+  if (!(await exists(dsgAssetsPathForBuild))) {
+    return;
+  }
+
+  // 目标路径: DSG_JOBS_BASE_FOLDER/{jobBuildId}/dsg-assets/
+  const jobPathForDsgAssets = join(
+    this.configService.get(Env.DSG_JOBS_BASE_FOLDER),
+    buildId,
+    "dsg-assets"
+  );
+
+  await copy(dsgAssetsPathForBuild, jobPathForDsgAssets);
+  // 最终路径示例: /amplication-data/dsg-jobs/job-123/dsg-assets/private-plugins/plugin-id-1/
+}
+```
+
+> **设计要点**：
+> - 两次复制（临时目录 → 资产目录 → Job 目录）是为了支持**构建分片**（一个 build 可拆分为多个 job）
+> - 资产目录按 `{resourceId}-{buildId}` 命名，确保同一资源的不同构建互不干扰
+> - Job 目录按 `{jobBuildId}` 命名，支持并行构建多个分片
+
+---
+
+##### 5.2 成功消息中的 `pluginPaths` 为何不直接传入生成流程？
+
+**成功消息返回 `pluginPaths`，但实际上并未用于后续流程**：
+
+[`PrivatePluginController.downloadPrivatePlugins()`](ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L55-L67)
+```typescript
+const { pluginPaths } = await this.privatePluginService.downloadPrivatePlugins(validArgs);
+
+// 返回成功消息，包含 pluginPaths
+const successEvent: DownloadPrivatePluginsSuccess.KafkaEvent = {
+  key: { resourceId: eventKey.resourceId },
+  value: {
+    buildId: validArgs.buildId,
+    pluginPaths,  // ← 这个字段实际上没有被消费方使用
+  },
+};
+```
+
+[`BuildService.onDownloadPrivatePluginSuccess()`](packages/amplication-server/src/core/build/build.service.ts#L1012-L1042)
+```typescript
+public async onDownloadPrivatePluginSuccess(
+  response: DownloadPrivatePluginsSuccess.Value
+): Promise<void> {
+  const { buildId } = response;  // 只使用了 buildId
+
+  // ... 获取 build 和 user ...
+
+  // 关键：没有使用 response.pluginPaths！
+  await this.generate(logger, build, user);  // 直接调用 generate()
+
+  await this.actionService.complete(step, EnumActionStepStatus.Success);
+}
+```
+
+**为何不直接传入？设计原因分析**：
+
+| 原因 | 说明 |
+|------|------|
+| **按约定优于配置** | 系统通过**路径约定**而非消息传递来定位文件，避免了路径在不同服务间传递可能导致的不一致 |
+| **解耦服务** | `git-sync-manager` 只负责下载，不需要知道 DSG 容器的具体路径；`amplication-server` 也不需要知道下载细节 |
+| **支持多服务实例** | 如果 `git-sync-manager` 和 `amplication-server` 运行在不同的 Pod/节点上，传递本地路径是无意义的，因为路径只在共享存储上有效 |
+| **可观测性** | `pluginPaths` 仍然返回，用于日志记录和调试，但不参与实际业务流程 |
+| **支持构建分片** | 下载时按 `{resourceId}-{buildId}` 存储，后续无论拆分为多少个 job，都能正确找到资产 |
+
+> **架构启示**：这是典型的**共享存储+路径约定**模式，避免了复杂的服务间数据传递。各服务只需要知道"文件会放在约定好的位置"即可。
+
+---
+
+##### 5.3 加载阶段怎样定位私有插件？
+
+DSG 容器启动时通过环境变量 `BUILD_SPEC_PATH` 获取输入文件路径，然后通过**路径约定**推导私有插件位置。
+
+**第一步：DSG 容器启动时注入环境变量**
+[`code-gen.controller.ts` (本地开发环境)](packages/local-data-service-generator-controller/src/code-gen/code-gen.controller.ts#L21-L52)
+```typescript
+// 容器启动时注入的环境变量
+const {
+  DSG_JOBS_BASE_FOLDER: dsgJogsBaseFolder,
+  BUILD_VOLUME_PATH: dockerDsgFolder,     // 容器内路径，如 /amplication-build
+  BUILD_SPEC_PATH: buildSpecPath,        // /amplication-build/input.json
+  // ...
+} = process.env;
+
+// 挂载卷: 主机 DSG_JOBS_BASE_FOLDER/{buildId} → 容器 dockerDsgFolder
+docker.createContainer({
+  HostConfig: {
+    Binds: [`${hostMachineDsgFolder}:${dockerDsgFolder}`],
+  },
+  Env: [
+    `BUILD_SPEC_PATH=${buildSpecPath}`,  // 容器内路径
+    // ...
+  ],
+});
+```
+
+**第二步：DSG 入口读取 `BUILD_SPEC_PATH`**
+[`generateCode()`](packages/data-service-generator/src/generate-code.ts#L66-L94)
+```typescript
+export const generateCode = async (): Promise<void> => {
+  const buildSpecPath = process.env.BUILD_SPEC_PATH;  // 例如: /amplication-build/input.json
+  const buildOutputPath = process.env.BUILD_OUTPUT_PATH;
+
+  const resourceData = await readInputJson(buildSpecPath);  // 读取输入数据
+  await generateCodeByResourceData(resourceData, buildOutputPath);
+};
+```
+
+**第三步：`getPrivatePluginPath` 按约定推导插件路径**
+[`getPrivatePluginPath()`](packages/data-service-generator/src/register-plugin.ts#L24-L37)
+```typescript
+const DSG_ASSETS_FOLDER = "dsg-assets";
+const PRIVATE_PLUGINS_FOLDER = "private-plugins";
+
+const getPrivatePluginPath = (pluginId: string) => {
+  const buildSpecPath = process.env.BUILD_SPEC_PATH;  // /amplication-build/input.json
+
+  // 关键技巧：去掉文件名部分，得到 Job 目录
+  const buildJobFolder = buildSpecPath?.replace("/input.json", "");
+  // buildJobFolder = /amplication-build
+
+  logger.info(`buildJobFolder: ${buildJobFolder}`);
+
+  // 按约定拼接路径: {buildJobFolder}/dsg-assets/private-plugins/{pluginId}
+  return join(
+    buildJobFolder,
+    DSG_ASSETS_FOLDER,
+    PRIVATE_PLUGINS_FOLDER,
+    pluginId
+  );
+  // 返回示例: /amplication-build/dsg-assets/private-plugins/plugin-id-1
+};
+```
+
+**第四步：加载时使用推导的路径**
+[`getPluginFuncGenerator()`](packages/data-service-generator/src/register-plugin.ts#L44-L78)
+```typescript
+async function* getPluginFuncGenerator(
+  pluginList: PluginInstallation[],
+  pluginInstallationPath?: string
+): AsyncGenerator<new () => AmplicationPlugin> {
+  do {
+    // 三种加载路径的选择逻辑
+    const localPackage = pluginList[index].settings?.local
+      ? join("../../../../", pluginList[index].settings?.destPath)    // 本地开发
+      : pluginList[index].isPrivate
+        ? getPrivatePluginPath(pluginList[index].pluginId)            // 私有插件 ← 关键
+        : undefined;
+    const packageName = localPackage || pluginList[index].npm;        // 公共 NPM 包
+
+    // 动态导入
+    const func = await getPlugin(packageName, localPackage ? undefined : pluginInstallationPath);
+
+    // ...
+  } while (pluginListLength > index);
+}
+```
+
+[`getPlugin()`](packages/data-service-generator/src/register-plugin.ts#L80-L96)
+```typescript
+async function getPlugin(
+  packageName: string,
+  customPath: string | undefined  // 对于私有插件，customPath 为 undefined，packageName 是完整路径
+): Promise<any> {
+  if (!customPath) {
+    // 私有插件走这个分支：packageName 是完整绝对路径
+    try {
+      return await import(packageName);  // 直接 import 绝对路径
+    } catch (error) {
+      logger.error(`failed to get plugin: ${error}`);
+      throw error;
+    }
+  }
+  // 公共插件走这个分支：从 node_modules 导入
+  const path = join(customPath, packageName);
+  return await import(path);
+}
+```
+
+---
+
+##### 完整路径映射图
+
+```
+git-sync-manager 服务
+├─ CLONES_FOLDER=/tmp/clones
+│  └─ private-plugins/
+│     └─ {owner}-{repo}-{random}/       ← 临时克隆目录
+│        └─ dist/{pluginId}/            ← 插件源代码
+│
+├─ DSG_ASSETS_FOLDER=/amplication-data/dsg-assets
+│  └─ {resourceId}-{plainBuildId}/
+│     └─ private-plugins/
+│        └─ {pluginId}/                 ← 第一步复制：克隆 → 资产目录
+│           ├─ package.json
+│           └─ dist/index.js
+│
+build-manager 服务
+├─ DSG_JOBS_BASE_FOLDER=/amplication-data/dsg-jobs
+│  └─ {jobBuildId}/
+│     ├─ input.json                     ← DSGResourceData (saveDsgResourceData)
+│     ├─ dsg-assets/                    ← 第二步复制：资产目录 → Job 目录
+│     │  └─ private-plugins/
+│     │     └─ {pluginId}/
+│     └─ code/                          ← 代码生成输出目录
+│
+DSG 容器（通过卷挂载访问 DSG_JOBS_BASE_FOLDER）
+├─ BUILD_SPEC_PATH=/amplication-build/input.json  ← 容器内路径
+│  (实际映射到: /amplication-data/dsg-jobs/{jobBuildId}/input.json)
+│
+└─ 插件加载路径推导:
+   buildJobFolder = BUILD_SPEC_PATH.replace("/input.json", "")
+                  = /amplication-build
+   插件路径 = {buildJobFolder}/dsg-assets/private-plugins/{pluginId}
+            = /amplication-build/dsg-assets/private-plugins/{pluginId}
+            (实际映射到: /amplication-data/dsg-jobs/{jobBuildId}/dsg-assets/...)
+```
+
+---
+
 ## 阶段三：加载阶段 (Loading / Registration)
 
 ### 核心职责
