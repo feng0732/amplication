@@ -6,18 +6,39 @@ Amplication 的代码生成链路是一个从**建模数据**到**最终产物**
 
 ---
 
-## 一、输入组织：建模数据如何传递到生成器
+## 一、输入组织：服务端如何汇总建模数据成 DSGResourceData
 
 ### 1.1 整体数据流转图
 
 ```
 用户建模 (Server/UI)
        ↓
-GraphQL API → 数据库持久化
+GraphQL API → 数据库持久化 (Entity, Field, Role, Plugin 等表)
        ↓
-Build 触发 → Kafka 消息 (CODE_GENERATION_REQUEST_TOPIC)
+用户点击"构建"
        ↓
-BuildRunnerController.onCodeGenerationRequest()
+[amplication-server] BuildService.createBuild()
+       ↓
+BuildService.generate()
+       ├─ getDSGResourceData()  ←──────┐
+       │    ├─ getOrderedEntities()    │
+       │    ├─ getResourceRoles()     │ 14 个数据
+       │    ├─ getOrderedPluginInstallations() │ 源
+       │    ├─ moduleActionService.findMany()  │
+       │    ├─ moduleDtoService.findMany()     │
+       │    ├─ moduleService.findMany()        │
+       │    ├─ resourceService.getRelations()   │
+       │    ├─ resourceSettingsService.getResourceSettingsBlock()
+       │    ├─ serviceSettingsService.getServiceSettingsValues()
+       │    ├─ topicService.findMany()
+       │    ├─ serviceTopicsService.findMany()
+       │    └─ getRelatedResourcesRecursive() → 递归调用 getDSGResourceData()
+       ↓
+saveDsgResourceDataToSharedStorage() → /dsg-resource-data/{buildId}/resource-data.json
+       ↓
+发送 Kafka: CODE_GENERATION_REQUEST_TOPIC (仅 resourceId + buildId)
+       ↓
+[amplication-build-manager] BuildRunnerController.onCodeGenerationRequest()
        ↓
 BuildRunnerService.runBuild()
        ↓
@@ -25,12 +46,100 @@ readDsgResourceDataFromSharedStorage() → 读取 DSGResourceData
        ↓
 splitBuildsIntoJobs() → 拆分为 Server/AdminUI 并行任务
        ↓
-saveDsgResourceData() → 写入 jobs/{buildId}/resource-data.json
+saveDsgResourceData() → 写入 jobs/{jobBuildId}/resource-data.json
        ↓
 DSG Runner (Argo Workflow) → 启动 Docker 容器
        ↓
 data-service-generator/src/main.ts → generateCode()
 ```
+
+### 1.2 DSGResourceData 的构建过程
+
+**核心构建函数** - [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1384-L1521)
+
+```typescript
+async getDSGResourceData(
+  resource: Resource,
+  buildId: string,
+  buildVersion: string,
+  user: User,
+  rootGeneration = true
+): Promise<CodeGenTypes.DSGResourceData>
+```
+
+**14 个数据源的汇总过程**：
+
+| 数据字段 | 数据源获取方式 | 说明 |
+|---------|--------------|------|
+| **entities** | `getOrderedEntities(buildId)` | 按创建时间排序的实体列表，包含字段 |
+| **roles** | `getResourceRoles(resourceId)` | 资源的角色定义 |
+| **pluginInstallations** | `pluginInstallationService.getOrderedPluginInstallations()` | 按顺序的已启用插件 |
+| **moduleContainers** | `moduleService.findMany({ where: { resource: { id: resourceId } } })` | 模块容器（自定义模块） |
+| **moduleActions** | `moduleActionService.findMany({ where: { resource: { id: resourceId } } })` | 模块动作（自定义 API） |
+| **moduleDtos** | `moduleDtoService.findMany({ where: { resource: { id: resourceId } } })` | 自定义 DTO 定义 |
+| **relations** | `resourceService.getRelations(resourceId)` | 实体间关系定义 |
+| **resourceSettings** | `resourceSettingsService.getResourceSettingsBlock()` | 资源级别设置 |
+| **serviceSettings** | `serviceSettingsService.getServiceSettingsValues()` | 服务级设置（仅 Service 类型） |
+| **topics** | `topicService.findMany({ where: { resource: { id: resourceId } } })` | 消息主题 |
+| **serviceTopics** | `serviceTopicsService.findMany({ where: { resource: { id: resourceId } } })` | 服务消息主题映射 |
+| **resourceType** | `resource.resourceType` | 资源类型（Service/MessageBroker 等） |
+| **resourceInfo** | 从 resource 对象组装 | 包含名称、描述、版本、URL、设置等 |
+| **otherResources** | 递归调用 `getDSGResourceData()` | 关联资源的数据（如微服务架构） |
+
+**关键特性**：
+
+1. **实体排序保证** - [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1349-L1371)
+   ```typescript
+   private async getOrderedEntities(buildId: string): Promise<CodeGenTypes.Entity[]> {
+     const entities = await this.entityService.getEntitiesByVersions({...});
+     return orderBy(entities.map((entity) => {
+       return {
+         ...entity,
+         fields: orderBy(entity.fields, (field) => field.name),
+       };
+     }), (entity) => entity.createdAt);
+   }
+   ```
+   - 实体按 `createdAt` 升序排列
+   - 字段按 `name` 字母顺序排列
+   - **目的**：确保代码生成的确定性，避免不必要的变更
+
+2. **递归关联资源**
+   - `rootGeneration = true` 时，递归获取所有关联资源的 DSGResourceData
+   - 支持微服务架构中的跨服务引用
+   - `rootGeneration = false` 时，不包含实体数据（避免循环）
+
+3. **敏感数据过滤**
+   ```typescript
+   return omitDeep(dsgResourceData, DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE);
+   ```
+   - 构建前移除敏感字段
+   - 确保不泄露内部数据
+
+### 1.3 共享存储与消息解耦
+
+**保存到共享存储** - [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L541-L560)
+
+```typescript
+async saveDsgResourceDataToSharedStorage(
+  buildId: string,
+  dsgResourceData: CodeGenTypes.DSGResourceData
+): Promise<void> {
+  const savePath = join(
+    this.configService.get(Env.DSG_RESOURCE_DATA_BASE_FOLDER) ||
+      "/amplication-data/dsg-resource-data",
+    buildId,
+    this.configService.get(Env.DSG_RESOURCE_DATA_FILE) || "resource-data.json"
+  );
+  await fs.writeFile(savePath, JSON.stringify(dsgResourceData));
+}
+```
+
+**Kafka 消息轻量化**：
+- 消息体只包含 `resourceId` 和 `buildId`
+- 不传递完整的 DSGResourceData（可能几 MB 大小）
+- 通过文件系统共享大数据
+- 构建管理器通过 `readDsgResourceDataFromSharedStorage()` 读取
 
 ### 1.2 核心输入数据结构：DSGResourceData
 
@@ -53,7 +162,7 @@ export class DSGResourceData {
 }
 ```
 
-### 1.3 关键节点
+### 1.4 关键节点
 
 **1. 构建任务拆分** - [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
 
@@ -436,9 +545,302 @@ const writeModules = async (
 
 ---
 
-## 四、失败回退机制：异常处理、事务性操作
+## 四、Admin UI 生成流程
 
-### 4.1 异常处理层级结构
+### 4.1 Admin UI 的参与方式
+
+Admin UI 与 Server 是**并行独立生成**的两个任务：
+- 由 `splitBuildsIntoJobs()` 拆分为两个独立的 Job
+- 各自在独立的 DSG 容器中运行
+- 共享同一份 DSGResourceData 输入
+- 通过构建管理器在最后合并产物
+
+### 4.2 Admin UI 生成主流程
+
+[create-admin.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/admin/create-admin.ts#L32-L137)
+
+```typescript
+export function createAdminModules(): Promise<ModuleMap> {
+  return pluginWrapper(
+    createAdminModulesInternal,
+    EventNames.CreateAdminUI,
+    {}
+  );
+}
+
+async function createAdminModulesInternal(): Promise<ModuleMap> {
+  const context = DsgContext.getInstance;
+  const { entities, roles, clientDirectories, logger } = context;
+```
+
+**生成步骤**：
+
+| 步骤 | 模块 | 说明 |
+|-----|------|------|
+| 1 | `readStaticModules()` | 复制静态模板文件 |
+| 2 | `createGitIgnore()` | 生成 .gitignore |
+| 3 | `createAdminUIPackageJson()` | 生成 package.json |
+| 4 | `createPublicFiles()` | 生成公共资源文件 |
+| 5 | `createAdminDTONameToPath()` | DTO 到路径的映射 |
+| 6 | `createDTOModules()` | 生成 DTO 模块 |
+| 7 | `createEnumRolesModule()` | 生成角色枚举 |
+| 8 | `createRolesModule()` | 生成角色模块 |
+| 9 | `createEntityTitleComponents()` | 生成实体标题组件（先执行，被依赖） |
+| 10 | `createEntitiesComponents()` | 生成实体 CRUD 组件 |
+| 11 | `createAppModule()` | 生成 App.tsx 主模块 |
+| 12 | `createDotEnvModule()` | 生成 .env 文件 |
+| 13 | `formatCode()` | 格式化所有 TypeScript 文件 |
+| 14 | `createTypesRelatedFiles()` | 生成类型相关文件 |
+
+### 4.3 实体组件生成机制
+
+[create-entities-components.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/admin/entity/create-entities-components.ts#L8-L27)
+
+```typescript
+export async function createEntitiesComponents(
+  entities: Entity[],
+  entityToDirectory: Record<string, string>,
+  entityToTitleComponent: Record<string, EntityComponent>,
+  entityNameToEntity: Record<string, Entity>
+): Promise<Record<string, EntityComponents>>
+```
+
+**每个实体生成的组件**：
+
+```typescript
+interface EntityComponents {
+  list: EntityComponent;      // 列表页 (List)
+  show: EntityComponent;      // 详情页 (Show)
+  edit: EntityComponent;      // 编辑页 (Edit)
+  create: EntityComponent;    // 创建页 (Create)
+}
+```
+
+**组件依赖链**：
+```
+createEntityTitleComponents()  → 生成 {Entity}Title.tsx
+         ↓
+createEntitiesComponents()
+         ├─ createList()    → {Entity}List.tsx
+         ├─ createShow()    → {Entity}Show.tsx
+         ├─ createEdit()    → {Entity}Edit.tsx
+         └─ createCreate()  → {Entity}Create.tsx
+         ↓
+createEntityComponentsModules() → 转为 ModuleMap
+         ↓
+createAppModule() → App.tsx 中注册所有资源路由
+```
+
+### 4.4 Admin UI 与 Server 的数据共享
+
+**共享上下文**：
+- 同一份 `entities` 数据（从 DSGResourceData 解析）
+- 同一份 `roles` 定义
+- 同一份 `DTOs` 结构
+
+**路径配置**：
+- `clientDirectories.baseDirectory` → `{output}/admin-ui`
+- `serverDirectories.baseDirectory` → `{output}/server`
+
+**API 路径映射**：
+```typescript
+const entityToResource = Object.fromEntries(
+  entities.map((entity) => [
+    entity.name,
+    `${API_PATHNAME}/${paramCase(plural(entity.name))}`,
+  ])
+);
+```
+- 例如：`User` → `/api/users`
+- 与 Server 端 REST API 路径保持一致
+
+---
+
+## 五、构建管理器：合并产物与失败处理
+
+### 5.1 Job 完成状态处理
+
+[build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L208-L255)
+
+```typescript
+async handleDsgJobCompleted(resourceId: string, jobBuildId: string) {
+  const buildId = this.buildJobsHandlerService.extractBuildId(jobBuildId);
+  let otherJobsHaveNotFailed = true;
+
+  try {
+    // 1. 检查其他任务是否已失败
+    const currentBuildStatus =
+      await this.buildJobsHandlerService.getBuildStatus(buildId);
+    otherJobsHaveNotFailed = currentBuildStatus !== EnumJobStatus.Failure;
+
+    // 2. 复制产物到 artifact 目录
+    await this.copyFromJobToArtifact(resourceId, jobBuildId);
+
+    // 3. 更新当前 Job 状态为 Success
+    await this.buildJobsHandlerService.setJobStatus(
+      jobBuildId,
+      EnumJobStatus.Success
+    );
+
+    // 4. 重新检查整体状态
+    const buildStatus = await this.buildJobsHandlerService.getBuildStatus(
+      buildId
+    );
+
+    if (buildStatus === EnumJobStatus.InProgress) {
+      return;  // 还有其他任务在运行
+    }
+
+    if (buildStatus === EnumJobStatus.Success) {
+      // 5. 全部成功：生成包或发送完成通知
+      const dsgResourceData =
+        await this.buildJobsHandlerService.extractDsgResourceData(jobBuildId);
+
+      if (dsgResourceData.packages?.length > 0 && this.enablePackageManager) {
+        await this.generatePackages(buildId, resourceId, dsgResourceData);
+      } else {
+        await this.codeGenerationAndPackagesCompleted(jobBuildId);
+      }
+    }
+  } catch (error) {
+    this.logger.error(error.message, error);
+    if (otherJobsHaveNotFailed) {
+      await this.emitCodeGenerationFailure(buildId, error.message);
+    }
+  }
+}
+```
+
+### 5.2 产物合并机制
+
+[copyFromJobToArtifact()](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L372-L396)
+
+```typescript
+async copyFromJobToArtifact(
+  resourceId: string,
+  jobBuildId: string
+): Promise<void> {
+  const buildId = this.buildJobsHandlerService.extractBuildId(jobBuildId);
+
+  const jobPath = join(
+    this.configService.get(Env.DSG_JOBS_BASE_FOLDER),
+    jobBuildId,
+    this.configService.get(Env.DSG_JOBS_CODE_FOLDER)  // 如 "code"
+  );
+
+  const artifactPath = join(
+    this.configService.get(Env.BUILD_ARTIFACTS_BASE_FOLDER),
+    resourceId,
+    buildId
+  );
+
+  await copy(jobPath, artifactPath);
+}
+```
+
+**目录布局**：
+```
+/dsg-jobs/                          # Job 工作目录
+├── {buildId}-server/              # Server 任务目录
+│   ├── resource-data.json
+│   └── code/                      # Server 生成产物
+│       └── server/
+│           ├── src/
+│           └── package.json
+└── {buildId}-admin-ui/            # Admin UI 任务目录
+    ├── resource-data.json
+    └── code/                      # Admin UI 生成产物
+        └── admin-ui/
+            ├── src/
+            └── package.json
+
+/build-artifacts/                   # 最终产物目录
+└── {resourceId}/
+    └── {buildId}/                  # 合并后的产物
+        ├── server/                 ← 从 {buildId}-server/code/server 复制
+        └── admin-ui/               ← 从 {buildId}-admin-ui/code/admin-ui 复制
+```
+
+**合并特性**：
+- **增量合并**：每个任务完成后立即复制，不等待其他任务
+- **目录隔离**：server/ 和 admin-ui/ 目录天然隔离，不会冲突
+- **幂等操作**：使用 fs-extra 的 `copy()`，默认覆盖已有文件
+
+### 5.3 失败处理的精确逻辑
+
+**失败状态更新** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L257-L277)
+
+```typescript
+async emitCodeGenerationFailureWhenJobStatusFailed(jobBuildId: string) {
+  let otherJobsHaveNotFailed = true;
+
+  const buildId = this.buildJobsHandlerService.extractBuildId(jobBuildId);
+  try {
+    // 检查其他任务是否已失败
+    const currentBuildStatus =
+      await this.buildJobsHandlerService.getBuildStatus(buildId);
+    otherJobsHaveNotFailed = currentBuildStatus !== EnumJobStatus.Failure;
+
+    // 标记当前任务失败
+    await this.buildJobsHandlerService.setJobStatus(
+      jobBuildId,
+      EnumJobStatus.Failure
+    );
+  } catch (error) {
+    this.logger.error(error.message, error);
+  } finally {
+    // 只有第一个失败的任务触发通知
+    if (otherJobsHaveNotFailed) {
+      await this.emitCodeGenerationFailure(buildId);
+    }
+  }
+}
+```
+
+**失败通知去重机制**：
+
+| 场景 | 处理方式 |
+|-----|---------|
+| Server 先失败 | 发送失败通知，Admin UI 即使后续失败也不重复通知 |
+| Admin UI 先失败 | 发送失败通知，Server 即使后续失败也不重复通知 |
+| 两者同时失败 | 只有第一个到达的发送通知 |
+
+**Redis 状态聚合** - [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L101-L122)
+
+```typescript
+async getBuildStatus(key: BuildId): Promise<EnumJobStatus> {
+  const buildValue = await this.redisService.get<RedisValue>(key);
+  const jobsStatus = Object.values(buildValue);
+
+  if (jobsStatus.every(s => s === EnumJobStatus.Success)) 
+    return EnumJobStatus.Success;        // 全成功
+  
+  if (jobsStatus.some(s => s === EnumJobStatus.Failure)) 
+    return EnumJobStatus.Failure;        // 任一失败 → 整体失败
+  
+  if (jobsStatus.some(s => s === EnumJobStatus.InProgress)) 
+    return EnumJobStatus.InProgress;     // 仍在运行
+}
+```
+
+### 5.4 产物保留与清理
+
+**当前策略**：
+- ✅ Job 目录保留：`/dsg-jobs/{jobBuildId}/`
+- ✅ Artifact 目录保留：`/build-artifacts/{resourceId}/{buildId}/`
+- ❌ 无自动清理机制（依赖外部清理策略）
+- ❌ 失败时已复制的产物不会被删除
+
+**潜在问题**：
+1. **部分产物问题**：如果 Server 成功但 Admin UI 失败，artifact 目录会有不完整的 server 代码
+2. **存储空间**：大量构建会占用大量磁盘空间
+3. **调试困难**：Job 目录保留有助于调试，但也可能泄露敏感信息
+
+---
+
+## 六、失败回退机制：异常处理、事务性操作
+
+### 6.1 异常处理层级结构
 
 Amplication 的异常处理采用**多层防御**策略：
 
@@ -476,7 +878,7 @@ Amplication 的异常处理采用**多层防御**策略：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 失败通知机制
+### 6.2 失败通知机制
 
 **BuildManagerNotifier** - [notify-build-manager.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/util/dsg-utils/src/build-manager-notifier/notify-build-manager.ts#L16-L71)
 
@@ -493,7 +895,7 @@ export class BuildManagerNotifier {
 - **failure()**：`generateCode()` 的 catch 块中
 - **notifyPluginVersion()**：每个插件安装成功后
 
-### 4.3 多任务状态聚合
+### 6.3 多任务状态聚合
 
 [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L101-L122)
 
@@ -518,7 +920,7 @@ async getBuildStatus(key: BuildId): Promise<EnumJobStatus> {
 - **任一失败** → Failure（快速失败）
 - **其他情况** → InProgress
 
-### 4.4 失败回退的局限性
+### 6.4 失败回退的局限性
 
 **重要：当前设计不支持事务性回滚**
 
@@ -536,7 +938,7 @@ async getBuildStatus(key: BuildId): Promise<EnumJobStatus> {
 - 捕获 `EEXIST` 错误，记录警告后继续
 - 这种设计假设输出目录是干净的（每次构建使用新目录）
 
-### 4.5 日志与可观测性
+### 6.5 日志与可观测性
 
 **BuildLogger** - [build-logger.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/util/dsg-utils/src/build-logger/build-logger.ts#L6-L64)
 
@@ -559,7 +961,7 @@ export class BuildLogger implements IBuildLogger {
 
 ---
 
-## 五、完整流水线时序图
+## 七、完整流水线时序图
 
 ```
 用户点击"构建"
@@ -627,12 +1029,18 @@ export class BuildLogger implements IBuildLogger {
 
 ---
 
-## 六、关键代码路径索引
+## 八、关键代码路径索引
 
 | 功能 | 文件 | 关键函数 |
 |-----|------|---------|
+| **DSGResourceData 构建** | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1384-L1521) | `getDSGResourceData()` |
+| 实体排序保证 | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1349-L1371) | `getOrderedEntities()` |
+| 共享存储保存 | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L541-L560) | `saveDsgResourceDataToSharedStorage()` |
 | 构建入口 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L159) | `runBuild()` |
 | 任务拆分 | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91) | `splitBuildsIntoJobs()` |
+| Job 完成处理 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L208-L255) | `handleDsgJobCompleted()` |
+| 产物合并 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L372-L396) | `copyFromJobToArtifact()` |
+| 失败状态更新 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L257-L277) | `emitCodeGenerationFailureWhenJobStatusFailed()` |
 | DSG 主入口 | [main.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/main.ts#L1-L9) | `generateCode()` |
 | 代码生成核心 | [generate-code.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/generate-code.ts#L48-L94) | `generateCodeByResourceData()` |
 | 数据服务创建 | [create-data-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/create-data-service.ts#L15-L105) | `createDataService()` |
@@ -640,21 +1048,25 @@ export class BuildLogger implements IBuildLogger {
 | 模板渲染 | [ast.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/utils/ast.ts#L133-L207) | `interpolate()` |
 | 插件包装 | [plugin-wrapper.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L59-L117) | `pluginWrapper()` |
 | 服务端生成 | [create-server.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/server/create-server.ts#L34-L168) | `createServer()` |
+| **Admin UI 生成** | [create-admin.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/admin/create-admin.ts#L32-L137) | `createAdminModules()` |
+| **实体组件生成** | [create-entities-components.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/admin/entity/create-entities-components.ts#L8-L27) | `createEntitiesComponents()` |
 | 文件写入 | [generate-code.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/generate-code.ts#L18-L46) | `writeModules()` |
 | 状态管理 | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L101-L148) | `getBuildStatus()`, `setJobStatus()` |
 | 失败通知 | [notify-build-manager.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/util/dsg-utils/src/build-manager-notifier/notify-build-manager.ts#L16-L71) | `BuildManagerNotifier` |
 
 ---
 
-## 七、设计特点与潜在改进点
+## 九、设计特点与潜在改进点
 
 ### 现有设计优势
 
-1. **AST 级模板**：比字符串模板更健壮，支持复杂的代码变换
-2. **插件管道**：before/after 钩子提供了强大的扩展能力
-3. **并行生成**：各模块生成独立，可并行执行
-4. **任务拆分**：Server/AdminUI 分离构建，提升性能
-5. **双日志系统**：兼顾内部调试和用户反馈
+1. **14 数据源统一汇总**：`getDSGResourceData()` 统一收集实体、角色、插件、模块等 14 个数据源
+2. **AST 级模板**：比字符串模板更健壮，支持复杂的代码变换
+3. **插件管道**：before/after 钩子提供了强大的扩展能力
+4. **任务并行化**：Server/AdminUI 分离构建，独立容器运行
+5. **增量合并**：每个任务完成后立即复制产物，不等待全部完成
+6. **失败去重通知**：只有第一个失败任务触发通知，避免重复告警
+7. **双日志系统**：兼顾内部调试和用户反馈
 
 ### 潜在改进点
 
@@ -662,14 +1074,20 @@ export class BuildLogger implements IBuildLogger {
    - 建议：先写入临时目录，全部成功后再原子性移动到目标目录
    - 或：记录已写入文件列表，失败时遍历删除
 
-2. **错误上下文不足**：插件错误只显示事件名，缺少插件标识
+2. **部分产物问题**：Server 成功但 Admin UI 失败时，artifact 目录有不完整代码
+   - 建议：引入"预备目录"概念，所有任务完成后才移动到最终目录
+
+3. **错误上下文不足**：插件错误只显示事件名，缺少插件标识
    - 建议：在 `pluginWrapper` 中记录具体哪个插件失败
 
-3. **文件覆盖策略**：`flag: "wx"` 在目录不干净时会导致构建失败
+4. **文件覆盖策略**：`flag: "wx"` 在目录不干净时会导致构建失败
    - 建议：构建前先清理输出目录，或提供覆盖选项
 
-4. **缺乏中间状态持久化**：大项目构建中断后需从头开始
+5. **缺乏中间状态持久化**：大项目构建中断后需从头开始
    - 建议：支持增量构建，缓存已生成的模块
 
-5. **内存占用**：所有 ModuleMap 常驻内存，大项目可能 OOM
+6. **内存占用**：所有 ModuleMap 常驻内存，大项目可能 OOM
    - 建议：支持流式写入，或分批生成分批写入
+
+7. **Job 目录无自动清理**：大量构建会占用大量磁盘空间
+   - 建议：增加 TTL 自动清理机制，或在构建成功后清理
