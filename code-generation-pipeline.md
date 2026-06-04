@@ -17,9 +17,29 @@ GraphQL API → 数据库持久化 (Entity, Field, Role, Plugin 等表)
        ↓
 用户点击"构建"
        ↓
-[amplication-server] BuildService.createBuild()
+[amplication-server] GraphQL Mutation: createBuild()
        ↓
-BuildService.generate()
+BuildService.create(args: CreateBuildArgs)  [build.service.ts#L268-L352]
+       ├─ 提取 resourceId 和 userId
+       ├─ 取 commitId 后 8 位作为 version
+       ├─ 获取最新实体版本
+       ├─ 写入数据库 build 表 (status=Running)
+       ├─ 关联 action 和 step
+       ├─ 检查资源类型 (仅 Service/Component)
+       │
+       └─ 检查是否有私有插件
+              ├─ 有私有插件 → downloadPrivatePlugins()  [异步流程]
+              │        ├─ 发送 Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST
+              │        └─ 等待 Kafka 回调: DOWNLOAD_PRIVATE_PLUGINS_SUCCESS
+              │                ↓
+              │        onDownloadPrivatePluginSuccess()
+              │                ↓
+              │        generate(logger, build, user)
+              │
+              └─ 无私有插件 → 直接调用 generate(logger, build, user)
+                                ↓
+generate()  [build.service.ts#L568-L618]
+       ├─ 包装在 actionService.run() 中（step 管理）
        ├─ getDSGResourceData()  ←──────┐
        │    ├─ getOrderedEntities()    │
        │    ├─ getResourceRoles()     │ 14 个数据
@@ -33,11 +53,10 @@ BuildService.generate()
        │    ├─ topicService.findMany()
        │    ├─ serviceTopicsService.findMany()
        │    └─ getRelatedResourcesRecursive() → 递归调用 getDSGResourceData()
-       ↓
-saveDsgResourceDataToSharedStorage() → /dsg-resource-data/{buildId}/resource-data.json
-       ↓
-发送 Kafka: CODE_GENERATION_REQUEST_TOPIC (resourceId + buildId)
-       ↓
+       ├─ 移除敏感字段: omitDeep(dsgResourceData, DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE)
+       ├─ saveDsgResourceDataToSharedStorage() → /dsg-resource-data/{buildId}/resource-data.json
+       └─ 发送 Kafka: CODE_GENERATION_REQUEST_TOPIC (resourceId + buildId)
+                                ↓
 [amplication-build-manager]
        ↓
 BuildRunnerController.onCodeGenerationRequest()  ← Kafka 事件触发
@@ -159,7 +178,192 @@ async saveDsgResourceDataToSharedStorage(
 - 通过文件系统共享大数据
 - 构建管理器通过 `readDsgResourceDataFromSharedStorage()` 读取
 
-### 1.2 核心输入数据结构：DSGResourceData
+---
+
+### 1.4 服务端构建创建的完整调用链
+
+**GraphQL 入口 → createBuild() → generate()**
+
+**1. GraphQL Mutation 入口**
+
+用户点击"构建"按钮后，通过 GraphQL Mutation 调用 `createBuild()`：
+```graphql
+mutation CreateBuild($data: BuildCreateInput!) {
+  createBuild(data: $data) {
+    id
+    status
+    # ...
+  }
+}
+```
+
+**2. BuildService.create() 主流程** - [build.service.ts#L268-L352](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L268-L352)
+
+```typescript
+async create(args: CreateBuildArgs): Promise<Build> {
+  // 2.1 提取基本信息
+  const resourceId = args.data.resource.connect.id;
+  const user = await this.userService.findUser({...});
+  const version = commitId.slice(commitId.length - 8);  // 取 commit 后 8 位
+
+  // 2.2 获取最新实体版本
+  const latestEntityVersions = await this.entityService.getLatestVersions({
+    where: { resourceId }
+  });
+
+  // 2.3 写入数据库 build 表
+  const build = await this.prisma.build.create({
+    data: {
+      ...args.data,
+      version,
+      createdAt: new Date(),
+      status: EnumBuildStatus.Running,      // 状态设为 Running
+      gitStatus: EnumBuildGitStatus.Waiting,
+      entityVersions: {
+        connect: latestEntityVersions.map(v => ({ id: v.id }))
+      },
+      action: {
+        create: {
+          steps: {
+            create: createInitialStepData(version, args.data.message)
+          }
+        }
+      }
+    },
+    include: { commit: true, resource: true }
+  });
+
+  // 2.4 检查资源类型（仅 Service 和 Component 支持代码生成）
+  const resource = await this.resourceService.resource({
+    where: { id: resourceId }
+  });
+  if (resource.resourceType !== EnumResourceType.Service &&
+      resource.resourceType !== EnumResourceType.Component) {
+    logger.info("Code generation is supported only for services and blueprints");
+    return;
+  }
+
+  // 2.5 检查是否有私有插件
+  const resourcePrivatePlugins =
+    await this.pluginInstallationService.getInstalledPrivatePluginsForBuild(
+      resourceId
+    );
+
+  // 2.6 分支处理
+  if (resourcePrivatePlugins.length > 0) {
+    // 有私有插件：异步下载流程
+    logger.info(`${resourcePrivatePlugins.length} private plugins found.`);
+    await this.downloadPrivatePlugins(
+      logger, build, user, resourcePrivatePlugins
+    );
+  } else {
+    // 无私有插件：直接进入代码生成
+    logger.info(JOB_STARTED_LOG);
+    await this.generate(logger, build, user);
+  }
+
+  return build;
+}
+```
+
+**3. 私有插件下载的异步流程**
+
+当存在私有插件时，流程变为异步：
+
+```
+downloadPrivatePlugins()
+       ↓
+发送 Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC
+       ├─ buildId
+       ├─ resourceId
+       └─ repositoryPlugins[]（按仓库分组的插件列表）
+       ↓
+[plugin-manager] 处理下载
+       ↓
+下载成功 → Kafka: DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC
+下载失败 → Kafka: DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC
+       ↓
+[amplication-server]
+BuildController.onDownloadPrivatePluginsSuccess()
+       ↓
+BuildService.onDownloadPrivatePluginSuccess()
+       ↓
+generate(logger, build, user)  ← 进入代码生成流程
+```
+
+**4. generate() 代码生成入口** - [build.service.ts#L568-L618](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L568-L618)
+
+```typescript
+private async generate(
+  logger: ILogger,
+  build: Build,
+  user: User
+): Promise<string> {
+  // 包装在 actionService.run() 中管理 step 状态
+  return this.actionService.run(
+    build.actionId,
+    GENERATE_STEP_NAME,
+    GENERATE_STEP_MESSAGE,
+    async (step) => {
+      const { resourceId, id: buildId, version: buildVersion } = build;
+
+      // 4.1 构建 DSGResourceData
+      const resource = await this.resourceService.resource({...});
+      const dsgResourceData = await this.getDSGResourceData(
+        resource, buildId, buildVersion, user
+      );
+
+      // 4.2 移除敏感字段
+      const filteredDsgResourceData = omitDeep(
+        dsgResourceData,
+        DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE
+      );
+
+      // 4.3 保存到共享存储
+      await this.saveDsgResourceDataToSharedStorage(
+        buildId, filteredDsgResourceData
+      );
+
+      // 4.4 发送 Kafka 触发 DSG
+      const codeGenerationRequest: CodeGenerationRequest.KafkaEvent = {
+        key: null,
+        value: { buildId, resourceId },  // 只传 ID，不传完整数据
+      };
+
+      await this.producerService.emitMessage(
+        KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC,
+        codeGenerationRequest
+      );
+
+      logger.info("Sent code generation request to queue");
+      return "done";
+    }
+  );
+}
+```
+
+**调用链总结**：
+
+```
+GraphQL createBuild()
+       ↓
+BuildService.create()
+       ├─ 创建 build 记录 (status=Running)
+       ├─ 检查资源类型
+       └─ 检查私有插件
+              ├─ 有 → downloadPrivatePlugins() → Kafka 请求 → 等待回调 → generate()
+              └─ 无 → generate()
+                            ↓
+                     getDSGResourceData()  ← 14 个数据源
+                            ↓
+                     saveDsgResourceDataToSharedStorage()
+                            ↓
+                     发送 Kafka: CODE_GENERATION_REQUEST_TOPIC
+                            ↓
+[amplication-build-manager] 接收并处理
+```
+
+### 1.5 核心输入数据结构：DSGResourceData
 
 定义于 [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts#L17-L38)
 
@@ -180,7 +384,7 @@ export class DSGResourceData {
 }
 ```
 
-### 1.4 构建入口的真实调用链
+### 1.6 构建入口的真实调用链
 
 **纠正：构建入口不是直接调用，而是通过 Kafka 事件驱动**
 
@@ -212,7 +416,7 @@ BuildRunnerService.runBuild(resourceId, buildId)
 
 ---
 
-### 1.5 Code Generator 版本选择机制
+### 1.7 Code Generator 版本选择机制
 
 **通过 Catalog Service 动态解析版本** - [code-generator-catalog.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/code-generator/code-generator-catalog.service.ts#L36-L59)
 
@@ -253,7 +457,7 @@ codeGeneratorVersion =
 
 ---
 
-### 1.6 Split 生效条件的精确逻辑
+### 1.8 Split 生效条件的精确逻辑
 
 **三个条件必须同时满足才会拆分** - [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
 
@@ -282,7 +486,7 @@ const shouldSplitBuild =
 
 ---
 
-### 1.7 dsg-assets 的传递机制
+### 1.9 dsg-assets 的传递机制
 
 **从资源目录复制到 Job 目录** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L349-L370)
 
@@ -341,7 +545,7 @@ async saveRelevantDsgAssets(
 
 ---
 
-### 1.8 构建任务拆分
+### 1.10 构建任务拆分
 
 [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
 
@@ -955,7 +1159,7 @@ async onPackageManagerCreateFailure(
 }
 ```
 
-**codeGenerationAndPackagesCompleted 完成函数** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L90-L105)
+**codeGenerationAndPackagesCompleted 完成函数** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L90-L107)
 
 ```typescript
 /// this function accepts either the buildId or the jobBuildId
@@ -967,22 +1171,42 @@ async codeGenerationAndPackagesCompleted(buildIdOrJobBuildId: string) {
 
   const successEvent: CodeGenerationSuccess.KafkaEvent = {
     key: null,
-    value: {
-      buildId,
-      codeGeneratorVersion: this.latestCodeGeneratorVersion || "",
-      resourceId: "",  // Note: resourceId 实际上并未正确填充
-    },
+    value: { buildId },  // ✅ 实际只发送 buildId
   };
 
-  this.logger.debug(
-    "Emitting code generation success event",
-    successEvent
-  );
-
+  this.logger.info("emit code generation success event", successEvent);
   await this.producerService.emitMessage(
     KAFKA_TOPICS.CODE_GENERATION_SUCCESS_TOPIC,
     successEvent
   );
+}
+```
+
+**⚠️ 重要校正**：完成通知 **实际只发送 buildId**，不包含 resourceId 和 codeGeneratorVersion。
+
+**Schema 定义** - [code-generation-success/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/schema-registry/src/lib/code-generation-success/value.ts#L1-L6)
+
+```typescript
+export class Value {
+  @IsString()
+  buildId!: string;
+}
+```
+
+| 字段 | 是否存在 | 说明 |
+|-----|---------|------|
+| buildId | ✅ 是 | 原始 Build ID（不带 -server/-admin-ui 后缀） |
+| resourceId | ❌ 否 | 不发送 |
+| codeGeneratorVersion | ❌ 否 | 不发送 |
+
+**对比 CodeGenerationRequest** - [code-generation-request/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/schema-registry/src/lib/code-generation-request/value.ts#L1-L8)
+
+```typescript
+export class Value {
+  @IsString()
+  buildId!: string;
+  @IsString()
+  resourceId!: string;  // ✅ 请求时有 resourceId
 }
 ```
 
@@ -1389,9 +1613,10 @@ export class BuildLogger implements IBuildLogger {
 
 ### 潜在改进点（新增纠正后的发现）
 
-1. **resourceId 未正确填充**：`codeGenerationAndPackagesCompleted()` 中 `resourceId: ""`
-   - 位置：[build-runner.service.ts#L93](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L93)
-   - 影响：成功事件中的 resourceId 为空，可能导致下游处理错误
+1. **完成通知只发送 buildId**：CodeGenerationSuccess 事件只包含 buildId，不包含 resourceId
+   - Schema 定义：[code-generation-success/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/libs/schema-registry/src/lib/code-generation-success/value.ts#L1-L6)
+   - 说明：这是**设计如此**，不是 Bug。下游服务需要通过 buildId 查询数据库获取 resourceId
+   - 潜在问题：增加了下游服务的数据库查询压力
 
 2. **版本选择是外部依赖**：通过 Catalog Service HTTP 调用解析版本
    - 风险：Catalog Service 不可用时构建会失败
