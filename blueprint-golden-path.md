@@ -245,12 +245,18 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
 [amplication-server] BuildService.create()
     │
     │  创建 Build(status=Running, gitStatus=Waiting)
-    │  创建 Action + Steps(ADD_TO_QUEUE / DOWNLOAD_PRIVATE_PLUGINS / GENERATE_APPLICATION / PUSH_TO_GIT)
+    │  创建 Action + 仅 1 个初始 Step:
+    │    └─ ADD_TO_QUEUE (创建即 Success)
+    │
+    │  其余 Step 由 actionService.run() 在各流程入口动态创建:
+    │    └─ DOWNLOAD_PRIVATE_PLUGINS  ← downloadPrivatePlugins() 时创建
+    │    └─ GENERATE_APPLICATION      ← generate() 时创建
+    │    └─ PUSH_TO_GIT_PROVIDER      ← saveToGitProvider() 时创建
     │
     ├─ 有 Private Plugins?
     │   ├─ 是 → downloadPrivatePlugins()
     │   │        │
-    │   │        │  ActionStep DOWNLOAD_PRIVATE_PLUGINS: Running
+    │   │        │  actionService.run() → 创建 ActionStep DOWNLOAD_PRIVATE_PLUGINS (Running)
     │   │        │
     │   │        ▼
     │   │      Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST
@@ -266,7 +272,7 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
     │   │        │     ▼
     │   │        │   BuildService.onDownloadPrivatePluginSuccess()
     │   │        │     │
-    │   │        │     │ ① 调用 generate() 启动代码生成（先于 Step 完成！）
+    │   │        │     │ ① generate() → 创建 ActionStep GENERATE_APPLICATION (Running)
     │   │        │     │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Success
     │   │        │     │
     │   │        │     └──→ 进入 generate() 流程 ──┐
@@ -283,7 +289,7 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
     │   │        │     │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Failed
     │   │        │     │ ③ Build.status = Failed
     │   │        │     │ ④ Build.gitStatus = Canceled
-    │   │        │     │ （此时 Job 尚未创建，Redis 无 JobStatus 记录）
+    │   │        │     │ （此时 GENERATE_APPLICATION Step 尚未创建，Redis 无 JobStatus 记录）
     │   │        │     │
     │   │        │     └──→ 构建终止，不再进入后续流程
     │   │        │
@@ -294,7 +300,7 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
                        ▼
            generate() 开始代码生成
                        │
-                       │  ActionStep GENERATE_APPLICATION: Running
+                       │  actionService.run() → 创建 ActionStep GENERATE_APPLICATION (Running)
                        │
                        ▼
 组装 DSGResourceData → 保存到共享存储
@@ -325,6 +331,14 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
                        ▼
 更新 Job 状态 (Redis)，聚合所有 Job 状态
   ├─ 全部成功 → Kafka: CODE_GENERATION_SUCCESS
+  │                ↓
+  │              BuildController.onCodeGenerationSuccess()
+  │                ↓
+  │              BuildService.saveToGitProvider()
+  │                ↓
+  │              actionService.run() → 创建 ActionStep PUSH_TO_GIT_PROVIDER (Running)
+  │                ↓
+  │              ... 推送到 Git ...
   ├─ 任一失败 → Kafka: CODE_GENERATION_FAILURE
   └─ 进行中   → 等待其他 Job
 ```
@@ -338,7 +352,10 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
 核心流程：
 ```typescript
 async create(args: CreateBuildArgs): Promise<Build> {
-  // 1. 创建 Build 记录和 Action 步骤
+  // 1. 创建 Build 记录，初始状态为 Running / Waiting
+  //    同时创建 Action，但仅创建 1 个初始 Step:
+  //    - ADD_TO_QUEUE (创建即标记 Success)
+  //    其余 Step 由后续 actionService.run() 动态创建
   const build = await this.prisma.build.create({
     data: {
       status: EnumBuildStatus.Running,
@@ -347,6 +364,7 @@ async create(args: CreateBuildArgs): Promise<Build> {
         create: {
           steps: {
             create: createInitialStepData(version, args.data.message),
+            // ↑ 仅创建 ADD_TO_QUEUE step，状态直接为 Success
           },
         },
       },
@@ -365,8 +383,10 @@ async create(args: CreateBuildArgs): Promise<Build> {
     await this.pluginInstallationService.getInstalledPrivatePluginsForBuild(resourceId);
 
   if (resourcePrivatePlugins.length > 0) {
+    // → actionService.run() 在此动态创建 DOWNLOAD_PRIVATE_PLUGINS step
     await this.downloadPrivatePlugins(logger, build, user, resourcePrivatePlugins);
   } else {
+    // → actionService.run() 在此动态创建 GENERATE_APPLICATION step
     await this.generate(logger, build, user);
   }
 }
@@ -382,6 +402,10 @@ private async downloadPrivatePlugins(logger, build, user, privatePlugins) {
     build.actionId,
     DOWNLOAD_PRIVATE_PLUGINS_STEP_NAME,    // "DOWNLOAD_PRIVATE_PLUGINS"
     DOWNLOAD_PRIVATE_PLUGINS_STEP_MESSAGE, // "Downloading private plugins"
+    // ↑ actionService.run() 内部：
+    //   1. createStep() → 在 DB 创建 ActionStep (status=Running)
+    //   2. 执行 stepFunction
+    //   3. complete() → 标记 Success 或 Failed
     async (step) => {
       // 1. 获取每个插件的具体版本号
       const pluginVersions = await this.getPrivatePluginsWithVersion(...);
@@ -432,7 +456,10 @@ public async onDownloadPrivatePluginSuccess(response): Promise<void> {
 
   const logger = this.logger.child({ buildId, resourceId: build.resourceId, ... });
 
-  // ① 先启动代码生成（await 等待 generate 内部的 Kafka 消息发出）
+  // ① generate() 内部调用 actionService.run()
+  //    → 动态创建 ActionStep GENERATE_APPLICATION (Running)
+  //    → 组装 DSGResourceData、保存到共享存储、发 Kafka 消息
+  //    → 因为 leaveStepOpenAfterSuccessfulExecution=true，不会立即 complete
   await this.generate(logger, build, user);
 
   // ② 后完成 DOWNLOAD_PRIVATE_PLUGINS 步骤
@@ -440,7 +467,7 @@ public async onDownloadPrivatePluginSuccess(response): Promise<void> {
 }
 ```
 
-> **注意**：代码中 `generate()` 在 `actionService.complete()` 之前执行。这是因为 `generate()` 本身只是将 DSGResourceData 保存到共享存储并发送 Kafka 消息，代码生成的实际执行在 DSG 容器中异步进行。`actionService.complete()` 标记的是"插件下载 + 生成请求已发出"这个步骤的成功，而不是"代码生成完成"。
+> **注意**：代码中 `generate()` 在 `actionService.complete()` 之前执行。`generate()` 调用 `actionService.run()` 时传入 `leaveStepOpenAfterSuccessfulExecution=true`（见 [build.service.ts#L616](packages/amplication-server/src/core/build/build.service.ts#L616)），这意味着 `GENERATE_APPLICATION` Step 创建后不会自动标记 Success，而是保持 Running 状态，等待 DSG 容器异步完成后的 Kafka 回调来关闭。
 
 **失败回调**：[packages/amplication-server/src/core/build/build.service.ts](packages/amplication-server/src/core/build/build.service.ts#L1044-L1081)
 
@@ -490,6 +517,11 @@ private async generate(logger, build, user) {
     build.actionId,
     GENERATE_STEP_NAME,      // "GENERATE_APPLICATION"
     GENERATE_STEP_MESSAGE,   // "Generating Application"
+    // ↑ actionService.run() 内部：
+    //   1. createStep() → 动态创建 ActionStep GENERATE_APPLICATION (Running)
+    //   2. 执行 stepFunction（组装数据、保存、发 Kafka）
+    //   3. 因为 leaveStepOpenAfterSuccessfulExecution=true，
+    //      不自动 complete，Step 保持 Running 等待 DSG 回调关闭
     async (step) => {
       // 1. 组装完整的 DSGResourceData（包含 entities、roles、modules、plugins 等）
       const dsgResourceData = await this.getDSGResourceData(
@@ -508,7 +540,8 @@ private async generate(logger, build, user) {
         KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC,
         codeGenerationEvent
       );
-    }
+    },
+    true  // ← leaveStepOpenAfterSuccessfulExecution=true，不自动 complete
   );
 }
 ```
@@ -750,20 +783,61 @@ async handleDsgJobCompleted(resourceId: string, jobBuildId: string) {
 │  Build.gitStatus (DB: prisma.build)                         │
 │  ├─ Waiting      ← 初始创建                                  │
 │  ├─ Canceled     ← 代码生成失败                              │
+│  ├─ Failed       ← Push to Git 失败                          │
 │  └─ Completed    ← Push to Git 成功                          │
 │                                                             │
-│  ActionStep.status (DB: prisma.actionStep)                  │
-│  ├─ ADD_TO_QUEUE             → Success                       │
-│  ├─ DOWNLOAD_PRIVATE_PLUGINS → Success / Failed             │
-│  ├─ GENERATE_APPLICATION     → Running → Success / Failed   │
-│  └─ PUSH_TO_GIT_PROVIDER     → Running → Success / Failed   │
+│  ActionStep (DB: prisma.actionStep) — 动态创建               │
+│  ├─ ADD_TO_QUEUE             ← Build.create() 时创建(Success)│
+│  ├─ DOWNLOAD_PRIVATE_PLUGINS ← downloadPrivatePlugins()时创建│
+│  │   (仅在有私有插件时才创建)                                 │
+│  ├─ GENERATE_APPLICATION     ← generate() 时创建             │
+│  │   (创建后保持 Running，等待 DSG 回调关闭)                  │
+│  └─ PUSH_TO_GIT_PROVIDER     ← saveToGitProvider() 时创建   │
+│      (仅在有 Git 配置时才创建)                                │
 │                                                             │
-│  EnumJobStatus (Redis)                                      │
+│  EnumJobStatus (Redis) — 由 Build Manager 管理              │
 │  ├─ {buildId}-server     ← InProgress / Success / Failure   │
 │  └─ {buildId}-admin-ui   ← InProgress / Success / Failure   │
+│  (仅在 DSG 容器启动后才存在)                                  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+#### ActionStep 动态创建机制
+
+每个 ActionStep 并非在 Build 创建时一次性全部创建，而是由 `actionService.run()` 在各流程入口动态创建：
+
+**`actionService.run()` 的内部逻辑**（[action.service.ts#L275-L295](packages/amplication-server/src/core/action/action.service.ts#L275-L295)）：
+
+```typescript
+async run(actionId, stepName, message, stepFunction, leaveStepOpenAfterSuccessfulExecution = false) {
+  // 1. 动态创建 Step（status=Running）
+  const step = await this.createStep(actionId, stepName, message);
+
+  try {
+    // 2. 执行业务函数
+    const result = await stepFunction(step);
+
+    // 3. 如果不需要保持打开，自动标记 Success
+    if (!leaveStepOpenAfterSuccessfulExecution) {
+      await this.complete(step, EnumActionStepStatus.Success);
+    }
+    return result;
+  } catch (error) {
+    // 4. 出错自动标记 Failed
+    await this.log(step, EnumActionLogLevel.Error, error.message);
+    await this.complete(step, EnumActionStepStatus.Failed);
+    throw error;
+  }
+}
+```
+
+| ActionStep | 创建时机 | 创建者 | 自动完成？ |
+|-----------|---------|--------|----------|
+| ADD_TO_QUEUE | `Build.create()` | `createInitialStepData()` | 创建即 Success |
+| DOWNLOAD_PRIVATE_PLUGINS | `downloadPrivatePlugins()` | `actionService.run()` | 否（异步回调关闭） |
+| GENERATE_APPLICATION | `generate()` | `actionService.run()` | 否（`leaveStepOpen=true`，DSG 回调关闭） |
+| PUSH_TO_GIT_PROVIDER | `saveToGitProvider()` | `actionService.run()` | 否（异步回调关闭） |
 
 ---
 
@@ -1106,6 +1180,7 @@ pluginMap[eventKey] = {
 | **Blueprint 服务** | [packages/amplication-server/src/core/blueprint/blueprint.service.ts](packages/amplication-server/src/core/blueprint/blueprint.service.ts) | Blueprint CRUD 逻辑 |
 | **Service Template** | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts](packages/amplication-server/src/core/resource/serviceTemplate.service.ts) | 服务模板管理（核心） |
 | **Build 服务** | [packages/amplication-server/src/core/build/build.service.ts](packages/amplication-server/src/core/build/build.service.ts) | 构建触发入口 |
+| **Action 服务** | [packages/amplication-server/src/core/action/action.service.ts](packages/amplication-server/src/core/action/action.service.ts) | ActionStep 动态创建与状态管理 |
 | **Build Controller** | [packages/amplication-server/src/core/build/build.controller.ts](packages/amplication-server/src/core/build/build.controller.ts) | Kafka 事件监听与回调 |
 | **Build Runner** | [packages/amplication-build-manager/src/build-runner/build-runner.service.ts](packages/amplication-build-manager/src/build-runner/build-runner.service.ts) | DSG 任务调度 |
 | **Build Jobs Handler** | [packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts](packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts) | 作业拆分与状态管理 |
@@ -1154,8 +1229,12 @@ Golden Path 不是一个具体的代码模块，而是一个**完整的架构模
     ▼
 BuildService.create()
     │
+    │  创建 Build + Action + ADD_TO_QUEUE Step(创建即 Success)
+    │
     ├─ 有私有插件?
     │   ├─ 是 → downloadPrivatePlugins()
+    │   │        │
+    │   │        │  actionService.run() → 动态创建 DOWNLOAD_PRIVATE_PLUGINS Step(Running)
     │   │        │
     │   │        ▼
     │   │      Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST
@@ -1169,8 +1248,8 @@ BuildService.create()
     │   │        ▼
     │   │      BuildService.onDownloadPrivatePluginSuccess()
     │   │        │
-    │   │        │ ① generate() 启动代码生成
-    │   │        │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Success
+    │   │        │ ① generate() → 动态创建 GENERATE_APPLICATION Step(Running)
+    │   │        │ ② DOWNLOAD_PRIVATE_PLUGINS Step: Success
     │   │        │
     │   │        └──→ 进入 generate() ──┐
     │   │                              │
@@ -1182,7 +1261,15 @@ BuildService.create()
               generate() 开始代码生成
                       │
                       ▼
-              后续流程同前...
+              ... DSG 完成 → CODE_GENERATION_SUCCESS ...
+                      │
+                      ▼
+              saveToGitProvider()
+                      │
+                      │  actionService.run() → 动态创建 PUSH_TO_GIT_PROVIDER Step(Running)
+                      │
+                      ▼
+              ... 推送到 Git ...
 ```
 
 #### 失败路径
