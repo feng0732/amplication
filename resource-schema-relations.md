@@ -452,7 +452,183 @@ enum EnumCustomPropertyType {
 }
 ```
 
-### 3.2 自定义属性校验 Schema 生成
+### 3.2 customProperties 查询的 blueprintId 过滤逻辑（核心）
+[customProperty.service.ts#L36-L60](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/customProperty/customProperty.service.ts#L36-L60)
+
+```typescript
+async customProperties(args: CustomPropertyFindManyArgs): Promise<CustomProperty[]> {
+  args.where = args.where || {};
+
+  // 关键：未指定 blueprintId 或 blueprint 时，默认只返回全局属性
+  if (
+    args.where.blueprintId === undefined &&
+    args.where.blueprint === undefined
+  ) {
+    args.where.blueprintId = null;  // 强制过滤：只返回 blueprintId = null 的全局属性
+  }
+
+  const properties = await this.prisma.customProperty.findMany({
+    ...args,
+    where: {
+      ...args.where,
+      deletedAt: null,
+    },
+  });
+  // ...
+}
+```
+
+**过滤规则总结：**
+
+| 查询条件 | 实际过滤的 blueprintId | 返回的属性类型 |
+|---------|----------------------|-------------|
+| 未指定 blueprintId 和 blueprint | `null` | 全局属性 |
+| 指定 `blueprintId: null` | `null` | 全局属性 |
+| 指定 `blueprintId: "xxx"` | `"xxx"` | 指定蓝图的属性 |
+
+### 3.3 两套独立的属性校验体系
+
+#### 3.3.1 全局属性校验 - `validateResourceProperties`
+[resource.service.ts#L1524-L1552](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1524-L1552)
+
+```typescript
+async validateResourceProperties(
+  values: Record<string, unknown>,
+  user: User
+): Promise<void> {
+  if (!values || Object.keys(values).length === 0) {
+    return;
+  }
+
+  // 关键：查询时未指定 blueprintId → 根据 customProperties 默认逻辑，
+  // 只会返回 blueprintId = null 的全局属性
+  const customProperties = await this.customPropertyService.customProperties({
+    where: {
+      workspace: { id: user.workspace.id },
+      enabled: true,
+      // 没有 blueprintId 过滤条件 → 默认为 blueprintId = null
+    },
+  });
+
+  const validationResults =
+    await this.customPropertyService.validateCustomProperties(
+      customProperties,  // 只包含全局属性
+      values
+    );
+
+  if (!validationResults.isValid) {
+    throw new AmplicationError(
+      `Validation failed for resource properties: ${validationResults.errorText}`
+    );
+  }
+}
+```
+
+**调用时机**：仅在 `updateResource` 时调用
+[resource.service.ts#L1568-L1571](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1568-L1571)
+
+```typescript
+async updateResource(args: UpdateOneResourceArgs, user: User): Promise<Resource | null> {
+  // ...
+  await this.validateResourceProperties(
+    args.data.properties as Record<string, unknown>,
+    user
+  );
+  // ...
+}
+```
+
+**存储位置**：`Resource.properties` 字段
+
+**注意**：`createResource` 时**不调用**此校验。
+
+#### 3.3.2 蓝图属性校验 - `validateResourceSettingsProperties`
+[resourceSettings.service.ts#L63-L102](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/resourceSettings/resourceSettings.service.ts#L63-L102)
+
+```typescript
+async validateResourceSettingsProperties(
+  resourceId: string,
+  properties: Record<string, unknown>
+): Promise<void> {
+  if (!properties || Object.keys(properties).length === 0) {
+    return;
+  }
+
+  const resource = await this.resourceService.resource({
+    where: { id: resourceId },
+  });
+
+  if (!resource) {
+    throw new Error(`Resource not found with id ${resourceId}`);
+  }
+
+  if (!resource.blueprintId) {
+    throw new Error(`Blueprint not found for resource with id ${resourceId}`);
+  }
+
+  // 关键：通过 blueprintService.properties 查询，显式指定 blueprintId
+  const blueprintProperties = await this.blueprintService.properties({
+    where: {
+      id: resource.blueprintId,  // 显式指定蓝图 ID
+    },
+  });
+
+  const validationResults =
+    await this.customPropertyService.validateCustomProperties(
+      blueprintProperties,  // 只包含该蓝图的属性
+      properties
+    );
+
+  if (!validationResults.isValid) {
+    throw new AmplicationError(
+      `Validation failed for resource settings properties: ${validationResults.errorText}`
+    );
+  }
+}
+```
+
+**blueprintService.properties 实现**：
+[blueprint.service.ts#L391-L397](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/blueprint/blueprint.service.ts#L391-L397)
+
+```typescript
+async properties(args: FindOneArgs): Promise<CustomProperty[]> {
+  return this.customPropertyService.customProperties({
+    where: {
+      blueprintId: args.where.id,  // 显式指定 blueprintId，绕过默认的 null 过滤
+    },
+  });
+}
+```
+
+**调用时机**：在 `updateResourceSettings` 时调用
+[resourceSettings.service.ts#L108-L111](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/resourceSettings/resourceSettings.service.ts#L108-L111)
+
+```typescript
+async updateResourceSettings(args: UpdateResourceSettingsArgs, user: User): Promise<ResourceSettings> {
+  await this.validateResourceSettingsProperties(
+    args.where.id,
+    args.data.properties as Record<string, unknown>
+  );
+  // ...
+}
+```
+
+**存储位置**：`ResourceSettings.properties` 字段（独立的 Block 存储）
+
+### 3.4 全局属性 vs 蓝图属性校验边界
+
+| 维度 | 全局属性校验 | 蓝图属性校验 |
+|------|------------|-----------|
+| 校验方法 | `ResourceService.validateResourceProperties` | `ResourceSettingsService.validateResourceSettingsProperties` |
+| 存储位置 | `Resource.properties` | `ResourceSettings.properties` |
+| 查询时 blueprintId 过滤 | 未指定 → 默认 `null` | 显式指定 `resource.blueprintId` |
+| 校验的属性类型 | `blueprintId = null` 的全局属性 | `blueprintId = resource.blueprintId` 的蓝图属性 |
+| 调用时机 | `updateResource`（更新资源基本信息） | `updateResourceSettings`（更新资源设置） |
+| createResource 时是否校验 | ❌ 否 | ❌ 否 |
+| 资源无 blueprintId 时 | ✅ 正常工作 | ❌ 抛出错误 |
+| additionalProperties | ✅ `false`（禁止额外属性） | ✅ `false`（禁止额外属性） |
+
+### 3.5 自定义属性校验 Schema 生成
 [customProperty.service.ts#L308-L386](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/customProperty/customProperty.service.ts#L308-L386)
 
 ```typescript
@@ -532,7 +708,7 @@ getValidationSchema(customProperties: CustomProperty[]): JSONSchema {
 }
 ```
 
-### 3.3 JSON Schema 校验服务
+### 3.6 JSON Schema 校验服务
 [jsonSchemaValidation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/services/jsonSchemaValidation.service.ts)
 
 ```typescript
@@ -559,45 +735,6 @@ class JsonSchemaValidationService {
   }
 }
 ```
-
-### 3.4 资源 Properties 校验流程
-[resource.service.ts#L1524-L1552](file:///d:/fz/0601/solo-dogfeeding/code/22-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1524-L1552)
-
-```typescript
-async validateResourceProperties(
-  values: Record<string, unknown>,
-  user: User
-): Promise<void> {
-  if (!values || Object.keys(values).length === 0) {
-    return;
-  }
-
-  // 获取工作区内所有启用的自定义属性
-  const customProperties = await this.customPropertyService.customProperties({
-    where: {
-      workspace: { id: user.workspace.id },
-      enabled: true,
-    },
-  });
-
-  // 执行校验
-  const validationResults =
-    await this.customPropertyService.validateCustomProperties(
-      customProperties,
-      values
-    );
-
-  if (!validationResults.isValid) {
-    throw new AmplicationError(
-      `Validation failed for resource properties: ${validationResults.errorText}`
-    );
-  }
-}
-```
-
-**校验触发时机：**
-- 更新资源时 (`updateResource`) 自动调用
-- `additionalProperties: false` 确保 properties 中只能包含已定义的自定义属性
 
 ---
 
