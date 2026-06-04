@@ -243,56 +243,90 @@ async upgradeServiceToLatestTemplateVersion(args, user): Promise<Resource> {
 用户 Commit 代码
     ↓
 [amplication-server] BuildService.create()
-    ↓
-创建 Build 记录、Action、Steps
-    ↓
-有 Private Plugins?
-    ├─ 是 → 发送 Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST
-    │        ↓
-    │      [git-sync-manager] 下载私有插件到共享存储
-    │        ↓
-    │      成功 → Kafka: DOWNLOAD_PRIVATE_PLUGINS_SUCCESS
-    │        ↓
-    │      BuildController.onDownloadPrivatePluginsSuccess()
-    │        ↓
-    │      BuildService.onDownloadPrivatePluginSuccess()
-    │        ↓
-    │      完成 DOWNLOAD_PRIVATE_PLUGINS Step
-    │        ↓
-    │      调用 BuildService.generate() 开始代码生成
-    │        ↓
-    └─ 否 → 直接调用 BuildService.generate()
-                ↓
-组装 DSGResourceData
-    ↓
-保存到共享存储 (/amplication-data/dsg-resource-data/{buildId})
-    ↓
+    │
+    │  创建 Build(status=Running, gitStatus=Waiting)
+    │  创建 Action + Steps(ADD_TO_QUEUE / DOWNLOAD_PRIVATE_PLUGINS / GENERATE_APPLICATION / PUSH_TO_GIT)
+    │
+    ├─ 有 Private Plugins?
+    │   ├─ 是 → downloadPrivatePlugins()
+    │   │        │
+    │   │        │  ActionStep DOWNLOAD_PRIVATE_PLUGINS: Running
+    │   │        │
+    │   │        ▼
+    │   │      Kafka: DOWNLOAD_PRIVATE_PLUGINS_REQUEST
+    │   │        │
+    │   │        ▼
+    │   │      [git-sync-manager] 下载私有插件到共享存储
+    │   │        │
+    │   │        ├─ 成功 → Kafka: DOWNLOAD_PRIVATE_PLUGINS_SUCCESS
+    │   │        │     │
+    │   │        │     ▼
+    │   │        │   BuildController.onDownloadPrivatePluginsSuccess()
+    │   │        │     │
+    │   │        │     ▼
+    │   │        │   BuildService.onDownloadPrivatePluginSuccess()
+    │   │        │     │
+    │   │        │     │ ① 调用 generate() 启动代码生成（先于 Step 完成！）
+    │   │        │     │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Success
+    │   │        │     │
+    │   │        │     └──→ 进入 generate() 流程 ──┐
+    │   │        │                                  │
+    │   │        ├─ 失败 → Kafka: DOWNLOAD_PRIVATE_PLUGINS_FAILURE
+    │   │        │     │
+    │   │        │     ▼
+    │   │        │   BuildController.onDownloadPrivatePluginsFailure()
+    │   │        │     │
+    │   │        │     ▼
+    │   │        │   BuildService.onDownloadPrivatePluginFailure()
+    │   │        │     │
+    │   │        │     │ ① onDownloadPrivatePluginLog() 写入错误日志
+    │   │        │     │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Failed
+    │   │        │     │ ③ Build.status = Failed
+    │   │        │     │ ④ Build.gitStatus = Canceled
+    │   │        │     │ （此时 Job 尚未创建，Redis 无 JobStatus 记录）
+    │   │        │     │
+    │   │        │     └──→ 构建终止，不再进入后续流程
+    │   │        │
+    │   └─ 否 ──────────────────────────────────────┘
+    │                                                │
+    └────────────────────────────────────────────────┘
+                       │
+                       ▼
+           generate() 开始代码生成
+                       │
+                       │  ActionStep GENERATE_APPLICATION: Running
+                       │
+                       ▼
+组装 DSGResourceData → 保存到共享存储
+                       │
+                       ▼
 发送 Kafka: CODE_GENERATION_REQUEST_TOPIC
-    ↓
+                       │
+                       ▼
 [amplication-build-manager] BuildRunnerService.runBuild()
-    ↓
+                       │
+                       ▼
 按业务域拆分 Job（Server + AdminUI，可选）
-    ↓
-设置 Job 状态为 InProgress (Redis)
-    ↓
+  → Redis: {buildId}-server = InProgress
+  → Redis: {buildId}-admin-ui = InProgress
+                       │
+                       ▼
 调用 DSG Runner (Argo Events HTTP)
-    ↓
+                       │
+                       ▼
 [generator-blueprints] 容器启动执行
-    ↓
-读取 BUILD_SPEC_PATH / BUILD_OUTPUT_PATH
-    ↓
+                       │
+                       ▼
 执行代码生成（Context → Plugin Wrapper → Blueprint 插件）
-    ↓
-发送成功/失败回调
-    ↓
-BuildRunnerService.handleDsgJobCompleted()
-    ↓
-更新 Job 状态 (Redis)
-    ↓
-聚合所有 Job 状态
-    ├─ 全部成功 → Kafka: CODE_GENERATION_SUCCESS
-    ├─ 任一失败 → Kafka: CODE_GENERATION_FAILURE
-    └─ 进行中 → 等待其他 Job
+                       │
+                       ▼
+发送成功/失败回调 → BuildRunnerService.handleDsgJobCompleted()
+                       │
+                       ▼
+更新 Job 状态 (Redis)，聚合所有 Job 状态
+  ├─ 全部成功 → Kafka: CODE_GENERATION_SUCCESS
+  ├─ 任一失败 → Kafka: CODE_GENERATION_FAILURE
+  └─ 进行中   → 等待其他 Job
 ```
 
 ### 3.2 关键入口点详解
@@ -398,13 +432,15 @@ public async onDownloadPrivatePluginSuccess(response): Promise<void> {
 
   const logger = this.logger.child({ buildId, resourceId: build.resourceId, ... });
 
-  // 关键：插件下载完成后，开始代码生成！
+  // ① 先启动代码生成（await 等待 generate 内部的 Kafka 消息发出）
   await this.generate(logger, build, user);
 
-  // 完成 DOWNLOAD_PRIVATE_PLUGINS 步骤
+  // ② 后完成 DOWNLOAD_PRIVATE_PLUGINS 步骤
   await this.actionService.complete(step, EnumActionStepStatus.Success);
 }
 ```
+
+> **注意**：代码中 `generate()` 在 `actionService.complete()` 之前执行。这是因为 `generate()` 本身只是将 DSGResourceData 保存到共享存储并发送 Kafka 消息，代码生成的实际执行在 DSG 容器中异步进行。`actionService.complete()` 标记的是"插件下载 + 生成请求已发出"这个步骤的成功，而不是"代码生成完成"。
 
 **失败回调**：[packages/amplication-server/src/core/build/build.service.ts](packages/amplication-server/src/core/build/build.service.ts#L1044-L1081)
 
@@ -412,16 +448,16 @@ public async onDownloadPrivatePluginSuccess(response): Promise<void> {
 public async onDownloadPrivatePluginFailure(response): Promise<void> {
   const { buildId } = response;
 
-  // 1. 记录错误日志
+  // ① 记录错误日志到 ActionStep
   await this.onDownloadPrivatePluginLog({
     buildId, level: "error", message: response.errorMessage, ...
   });
 
-  // 2. 标记步骤失败
+  // ② ActionStep DOWNLOAD_PRIVATE_PLUGINS → Failed
   const step = await this.getBuildStep(buildId, DOWNLOAD_PRIVATE_PLUGINS_STEP_NAME);
   await this.actionService.complete(step, EnumActionStepStatus.Failed);
 
-  // 3. 更新 Build 状态为 Failed
+  // ③ Build.status → Failed, Build.gitStatus → Canceled
   await this.updateBuildStatuses(
     buildId,
     EnumBuildStatus.Failed,
@@ -429,6 +465,20 @@ public async onDownloadPrivatePluginFailure(response): Promise<void> {
   );
 }
 ```
+
+**下载失败时各层状态变化的详细说明**：
+
+| 层级 | 状态变化 | 说明 |
+|------|---------|------|
+| **Build.status** | `Running` → `Failed` | 数据库 `prisma.build` 记录整体构建失败 |
+| **Build.gitStatus** | `Waiting` → `Canceled` | 代码未生成，Git 推送被取消 |
+| **ActionStep DOWNLOAD_PRIVATE_PLUGINS** | `Running` → `Failed` | 插件下载步骤失败，错误信息写入步骤日志 |
+| **ActionStep GENERATE_APPLICATION** | 未创建 / 仍为初始状态 | 因为 `generate()` 从未被调用，此步骤不会启动 |
+| **ActionStep PUSH_TO_GIT_PROVIDER** | 未创建 / 仍为初始状态 | 前置步骤失败，此步骤不会启动 |
+| **Redis JobStatus** | **无记录** | 插件下载失败发生在 `generate()` 之前，Build Manager 从未收到 `CODE_GENERATION_REQUEST`，因此不会拆分 Job，Redis 中没有任何 JobStatus 记录 |
+| **DSG 容器** | 未启动 | 代码生成容器从未被调度 |
+
+> **关键**：下载失败时，构建流程在 `amplication-server` 层即终止，不会产生任何 Kafka 事件发往 `amplication-build-manager`，因此 Job 拆分、Redis 状态、DSG 容器执行等后续环节全部不会发生。
 
 #### 3.2.4 代码生成触发 - BuildService.generate()
 
@@ -1096,6 +1146,8 @@ Golden Path 不是一个具体的代码模块，而是一个**完整的架构模
 
 ### 9.3 私有插件下载与代码生成的时序关联
 
+#### 成功路径
+
 ```
 用户 Commit
     │
@@ -1115,15 +1167,13 @@ BuildService.create()
     │   │      Kafka: DOWNLOAD_PRIVATE_PLUGINS_SUCCESS
     │   │        │
     │   │        ▼
-    │   │      BuildController.onDownloadPrivatePluginsSuccess()
-    │   │        │
-    │   │        ▼
     │   │      BuildService.onDownloadPrivatePluginSuccess()
     │   │        │
-    │   │        ├─ 完成 DOWNLOAD_PRIVATE_PLUGINS Step
+    │   │        │ ① generate() 启动代码生成
+    │   │        │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Success
     │   │        │
-    │   │        └─ 调用 generate() ──┐
-    │   │                             │
+    │   │        └──→ 进入 generate() ──┐
+    │   │                              │
     │   └─ 否 ────────────────────────┘
     │                                 │
     └─────────────────────────────────┘
@@ -1134,3 +1184,32 @@ BuildService.create()
                       ▼
               后续流程同前...
 ```
+
+#### 失败路径
+
+```
+git-sync-manager 下载插件失败
+    │
+    ▼
+Kafka: DOWNLOAD_PRIVATE_PLUGINS_FAILURE
+    │
+    ▼
+BuildService.onDownloadPrivatePluginFailure()
+    │
+    │ ① onDownloadPrivatePluginLog() → 写入错误日志
+    │ ② ActionStep DOWNLOAD_PRIVATE_PLUGINS: Running → Failed
+    │ ③ Build.status: Running → Failed
+    │ ④ Build.gitStatus: Waiting → Canceled
+    │
+    └──→ 构建终止
+         （Job 未创建，Redis 无记录，DSG 容器未启动）
+```
+
+### 9.4 各阶段失败时的状态对比
+
+| 失败阶段 | Build.status | Build.gitStatus | DOWNLOAD_PRIVATE_PLUGINS Step | GENERATE_APPLICATION Step | Redis JobStatus | 后续是否继续 |
+|---------|-------------|-----------------|------------------------------|--------------------------|-----------------|------------|
+| **私有插件下载失败** | Failed | Canceled | Failed | 未启动 | 无记录 | 否 |
+| **代码生成失败** | Failed | Canceled | Success | Failed | 可能有残留记录 | 否 |
+| **Push to Git 失败** | Failed | Failed | Success | Success | 全部 Success | 否 |
+| **全部成功** | Completed | Completed | Success | Success | 全部 Success | 是 |
