@@ -307,39 +307,65 @@ private async generate(
     async (step) => {
       const { resourceId, id: buildId, version: buildVersion } = build;
 
-      // 4.1 构建 DSGResourceData
-      const resource = await this.resourceService.resource({...});
+      logger.info("Preparing build generation message");
+
+      // 4.1 获取资源信息
+      const resource = await this.resourceService.resource({
+        where: { id: resourceId },
+      });
+
+      // 4.2 构建 DSGResourceData
+      // ⚠️ 注意：omitDeep 敏感字段过滤是在 getDSGResourceData 内部完成的
       const dsgResourceData = await this.getDSGResourceData(
-        resource, buildId, buildVersion, user
+        resource,
+        buildId,
+        buildVersion,
+        user
       );
 
-      // 4.2 移除敏感字段
-      const filteredDsgResourceData = omitDeep(
-        dsgResourceData,
-        DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE
-      );
+      // 4.3 直接保存到共享存储（dsgResourceData 已经过滤了敏感字段）
+      logger.info("Saving DSG resource data to shared storage");
+      await this.saveDsgResourceDataToSharedStorage(buildId, dsgResourceData);
 
-      // 4.3 保存到共享存储
-      await this.saveDsgResourceDataToSharedStorage(
-        buildId, filteredDsgResourceData
-      );
+      logger.info("Writing lightweight build generation message to queue");
 
-      // 4.4 发送 Kafka 触发 DSG
-      const codeGenerationRequest: CodeGenerationRequest.KafkaEvent = {
+      // 4.4 发送 Kafka 触发 DSG（只传 ID，不传完整数据）
+      const codeGenerationEvent: CodeGenerationRequest.KafkaEvent = {
         key: null,
-        value: { buildId, resourceId },  // 只传 ID，不传完整数据
+        value: {
+          resourceId,
+          buildId,
+        },
       };
 
-      await this.producerService.emitMessage(
+      // ⚠️ 注意：成员名是 kafkaProducerService，不是 producerService
+      await this.kafkaProducerService.emitMessage(
         KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC,
-        codeGenerationRequest
+        codeGenerationEvent
       );
 
-      logger.info("Sent code generation request to queue");
-      return "done";
-    }
+      logger.info("Build generation message sent");
+
+      return null;  // ⚠️ 注意：返回 null，不是 "done"
+    },
+    true  // actionService.run 的第二个参数
   );
 }
+```
+
+**⚠️ 三个需要校正的事实错误**：
+
+| 错误点 | 之前错误描述 | 真实实现 |
+|-------|-------------|---------|
+| **敏感字段过滤位置** | 在 generate() 内部调用 omitDeep | 在 `getDSGResourceData()` 内部最后一行返回时调用 |
+| **Kafka producer 成员名** | `this.producerService.emitMessage()` | `this.kafkaProducerService.emitMessage()` |
+| **返回值** | `return "done"` | `return null` |
+
+**敏感字段过滤的真实位置** - [build.service.ts#L1520](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1518-L1521)
+
+```typescript
+// getDSGResourceData() 方法的最后
+return omitDeep(dsgResourceData, DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE);
 ```
 
 **调用链总结**：
