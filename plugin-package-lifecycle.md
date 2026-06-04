@@ -770,6 +770,312 @@ async function getPlugin(
 
 ---
 
+##### 5.4 版本选择与目录命名规则
+
+本章节深入分析两个核心问题：
+- **版本或默认分支是如何决定下载来源的？**
+- **稀疏检出如何确保目录名与安装标识匹配？**
+
+---
+
+###### 5.4.1 版本选择逻辑（从安装记录到 Git 引用）
+
+私有插件的版本选择发生在 `BuildService` 组装下载请求时，支持两种模式：**指定版本号** 和 **latest（自动选择最新稳定版）**。
+
+**第一步：解析安装记录的版本字段**
+[`getPrivatePluginsWithVersion()`](packages/amplication-server/src/core/build/build.service.ts#L739-L800)
+```typescript
+private async getPrivatePluginsWithVersion(
+  resourceId: string,
+  privatePlugins: PluginInstallation[]
+) {
+  // 获取私有插件目录配置（含可用版本列表）
+  const privatePluginBlocks =
+    await this.privatePluginService.availablePrivatePluginsForResource({
+      where: { resource: { id: resourceId } },
+    });
+
+  for (const privatePlugin of privatePlugins) {
+    const privatePluginBlock = privatePluginBlocks.find(
+      (block) => block.pluginId === privatePlugin.pluginId
+    );
+
+    // 模式1: 用户指定了具体版本号（非 latest）
+    if (privatePlugin.version !== "latest") {
+      pluginsToDownload.push({
+        pluginId: privatePlugin.pluginId,
+        pluginVersion: privatePlugin.version,
+        requestedFullPackageName: `${privatePlugin.pluginId}@${privatePlugin.version}`,
+        pluginRepositoryResourceId: privatePluginBlock.resourceId,
+      });
+      continue;
+    }
+
+    // 模式2: latest - 自动选择最新稳定版
+    const sortedEnabledVersions = privatePluginBlock.versions
+      .filter(
+        (version) => version.enabled && !version.version.includes("dev")
+      )
+      .sort((a, b) => compareBuild(b.version, a.version));  // 降序排序
+
+    const pluginVersion = sortedEnabledVersions[0];  // 取第一个（最新）
+
+    if (!pluginVersion) {
+      throw new Error(`Could not find enabled version for plugin ${privatePlugin.pluginId}`);
+    }
+
+    pluginsToDownload.push({
+      pluginId: privatePlugin.pluginId,
+      pluginVersion: pluginVersion.version,
+      requestedFullPackageName: `${privatePlugin.pluginId}@latest`,
+      pluginRepositoryResourceId: privatePluginBlock.resourceId,
+    });
+  }
+  return pluginsToDownload;
+}
+```
+
+**版本选择规则总结**：
+
+| 安装版本值 | 处理逻辑 | Git 引用类型 |
+|-----------|---------|-------------|
+| `"1.2.3"` (具体版本号) | 直接使用该版本 | Tag 或 Branch |
+| `"latest"` | 从可用版本中筛选：<br>1. `version.enabled === true`<br>2. `version.version` 不包含 `"dev"`<br>3. 按版本号降序排序取第一个 | Tag 或 Branch |
+
+---
+
+###### 5.4.2 按 Git 引用分组与克隆优化
+
+为了优化下载性能（同一分支/标签的多个插件只需克隆一次），系统会按 **Git 引用（版本号或分支名）** 分组插件。
+
+[`downloadPrivatePlugins()`](libs/util/git/src/git-client.service.ts#L127-L235)
+```typescript
+// 按 Git 引用分组插件
+const pluginsByGitRef = pluginsToDownload.reduce(
+  (acc: { [key: string]: string[] }, plugin) => {
+    // 关键：判断用版本号还是用 baseBranch
+    const versionKey =
+      plugin.pluginVersion && !plugin.pluginVersion.includes("dev")
+        ? `${plugin.pluginId}@${plugin.pluginVersion}`  // 有正式版本号: 用 pluginId@version
+        : baseBranch;                                    // 无版本号或含 dev: 用默认分支
+    if (!acc[versionKey]) {
+      acc[versionKey] = [];
+    }
+    acc[versionKey].push(plugin.pluginId);
+    return acc;
+  },
+  {}
+);
+
+// 每个 Git 引用只克隆一次
+for (const [pluginVersion, pluginIds] of Object.entries(pluginsByGitRef)) {
+  const pluginVersionDir = join(gitRepoDir, pluginVersion);
+  
+  const gitCli = new GitCli(this.logger, {
+    originUrl: cloneUrl,
+    repositoryDir: pluginVersionDir,  // 每个版本一个独立目录
+  });
+
+  await gitCli.clone();  // 只克隆一次
+  
+  await gitCli.sparseCheckout(
+    pluginVersion,  // Git 引用（tag/branch 名）
+    pluginIds.map((id) => `plugins/${id}`)  // 稀疏检出路径
+  );
+}
+```
+
+**Git 引用分组规则**：
+
+| pluginVersion 值 | 包含 "dev" 吗？ | 分组 key | 说明 |
+|-----------------|----------------|---------|------|
+| `"1.2.3"` | ❌ No | `"plugin-id@1.2.3"` | 正式版本，按 pluginId@version 分组 |
+| `"v2.0.0-dev"` | ✅ Yes | `baseBranch`（如 `"main"`） | 开发版本，回退到默认分支 |
+| `undefined` | - | `baseBranch` | 未指定版本，使用默认分支 |
+
+> **设计意图**：
+> - 同一 Git 引用下的多个插件只克隆一次仓库，通过稀疏检出获取所有需要的目录
+> - 开发版本（含 "dev"）强制使用默认分支，避免 Tag 不存在的问题
+
+---
+
+###### 5.4.3 稀疏检出（Sparse Checkout）如何确保目录匹配
+
+为了只下载需要的插件目录，系统使用 Git 的**稀疏检出**功能，只拉取 `plugins/{pluginId}` 目录。
+
+**稀疏检出的执行流程**：
+[`sparseCheckout()`](libs/util/git/src/providers/git-cli.ts#L84-L92)
+```typescript
+async sparseCheckout(
+  branchName: string,           // Git 引用（tag/branch 名）
+  pathsToCheckout: string[]     // ["plugins/plugin-a", "plugins/plugin-b"]
+): Promise<void> {
+  await this.git.fetch();
+  await this.git.raw(["sparse-checkout", "init", "--cone"]);
+  await this.git.raw(["sparse-checkout", "set", ...pathsToCheckout]);
+  await this.git.raw(["checkout", branchName]);  // 检出指定的 tag/branch
+}
+```
+
+**克隆时的性能优化**：
+[`clone()`](libs/util/git/src/providers/git-cli.ts#L161-L171)
+```typescript
+async clone(): Promise<void> {
+  if (!this.isCloned) {
+    await this.git.clone(this.options.originUrl, this.options.repositoryDir, [
+      "--no-checkout",      // 不自动检出，减少 IO
+      "--filter=blob:none", // 不下载 blob 对象，按需下载
+    ]);
+    this.isCloned = true;
+  }
+  await this.git.cwd(this.options.repositoryDir);
+}
+```
+
+**稀疏检出的目录约定**：
+
+```
+私有插件 Git 仓库结构约定：
+plugin-repository/
+└── plugins/
+    ├── plugin-id-1/           ← 目录名必须等于 pluginId
+    │   ├── package.json
+    │   ├── dist/
+    │   │   └── index.js
+    │   └── ...
+    ├── plugin-id-2/
+    │   ├── package.json
+    │   └── ...
+    └── ...
+
+稀疏检出后本地结构：
+{gitRepoDir}/{pluginVersion}/  ← 如 /tmp/clones/.../plugin-id@v1.0.0/
+└── plugins/
+    ├── plugin-id-1/           ← 只检出需要的目录
+    └── plugin-id-2/
+```
+
+> **关键约束**：插件在 Git 仓库中**必须**放在 `plugins/{pluginId}` 目录下，且**目录名必须与 `pluginId` 完全一致**。这是系统的硬性约定，没有任何配置项可以修改。
+
+---
+
+###### 5.4.4 目录命名与 pluginId 的匹配链路
+
+从 Git 仓库到最终 DSG 容器，目录名与 `pluginId` 的匹配经过三次传递：
+
+**匹配点 1：稀疏检出路径构造**
+[`downloadPrivatePlugins()`](libs/util/git/src/git-client.service.ts#L216-L223)
+```typescript
+await gitCli.sparseCheckout(
+  pluginVersion,
+  pluginIds.map((id) => `plugins/${id}`)  // 用 pluginId 构造路径
+);
+
+pluginPaths.push(
+  ...pluginIds.map((id) => `${pluginVersionDir}/plugins/${id}`)  // 路径中包含 pluginId
+);
+```
+
+**匹配点 2：复制到资产目录时提取目录名**
+[`copyPluginFilesToDsgAssetsDir()`](ee/packages/git-sync-manager/src/private-plugin/private-plugin.service.ts#L220-L247)
+```typescript
+for (const pluginPath of pluginPaths) {
+  // 从路径中提取最后一段（即 pluginId）
+  const pluginName = pluginPath.split("/").pop();  // 关键：路径最后一段就是 pluginId
+  
+  const pluginPathInAssets = join(dsgAssetsPath, pluginName);
+  // 目标目录名 = pluginId
+  await copy(pluginPath, pluginPathInAssets);
+}
+```
+
+**匹配点 3：DSG 加载时按 pluginId 推导路径**
+[`getPrivatePluginPath()`](packages/data-service-generator/src/register-plugin.ts#L24-L37)
+```typescript
+const getPrivatePluginPath = (pluginId: string) => {
+  // 用安装记录中的 pluginId 构造路径
+  return join(buildJobFolder, "dsg-assets", "private-plugins", pluginId);
+};
+```
+
+**匹配链路图示**：
+
+```
+安装记录 pluginId
+    ↓ (构造稀疏检出路径)
+Git 仓库 plugins/{pluginId}/
+    ↓ (稀疏检出)
+本地克隆目录 {pluginVersionDir}/plugins/{pluginId}/
+    ↓ (提取路径最后一段)
+资产目录 {dsgAssetsPath}/{pluginId}/
+    ↓ (用 pluginId 推导)
+DSG 加载路径 {buildJobFolder}/dsg-assets/private-plugins/{pluginId}/
+```
+
+---
+
+###### 5.4.5 目录不匹配时的加载失败点
+
+如果 Git 仓库中的目录名与 `pluginId` 不一致，会在以下三个阶段失败：
+
+**失败点 1：稀疏检出后路径不存在（git-sync-manager）**
+[`copyPluginFilesToDsgAssetsDir()`](ee/packages/git-sync-manager/src/private-plugin/private-plugin.service.ts#L236-L241)
+```typescript
+const pathExist = await pathExists(pluginPath);
+if (!pathExist) {
+  throw new Error(
+    `Can't find plugin '${pluginName}' in the source repository`
+  );
+}
+```
+> **触发条件**：Git 仓库中没有 `plugins/{pluginId}` 目录
+> **错误信息**：`Can't find plugin '{pluginName}' in the source repository`
+> **影响范围**：该仓库的所有插件下载失败，整个构建流程中止
+
+**失败点 2：动态导入时模块找不到（DSG 容器）**
+[`getPlugin()`](packages/data-service-generator/src/register-plugin.ts#L80-L96)
+```typescript
+async function getPlugin(packageName, customPath) {
+  if (!customPath) {
+    try {
+      return await import(packageName);  // packageName 是绝对路径
+    } catch (error) {
+      logger.error(`failed to get plugin: ${error}`);
+      throw error;  // ← 在这里抛出
+    }
+  }
+  // ...
+}
+```
+> **触发条件**：资产目录复制成功但目录结构异常（如缺少 package.json 或 dist/index.js）
+> **错误信息**：`Cannot find module '{path}'`
+> **影响范围**：单个插件加载失败，整个构建流程中止
+
+**失败点 3：插件导出异常（DSG 容器）**
+[`getPluginFuncGenerator()`](packages/data-service-generator/src/register-plugin.ts#L68-L71)
+```typescript
+if (!func.hasOwnProperty("default")) yield EmptyPlugin;
+
+func.default.prototype.pluginName = packageName;
+yield func.default;
+```
+> **触发条件**：插件模块没有 `default` 导出（即 `export default class Plugin`）
+> **影响**：返回空插件 `EmptyPlugin`，不会报错但插件不会生效
+
+---
+
+###### 5.4.6 目录不匹配故障排查矩阵
+
+| 问题现象 | 可能原因 | 检查点 |
+|---------|---------|--------|
+| git-sync-manager 抛出 `Can't find plugin` | 目录名与 pluginId 不一致 | Git 仓库路径是否为 `plugins/{pluginId}` |
+| DSG 抛出 `Cannot find module` | 插件构建产物缺失 | 目录下是否有 `package.json` 和 `dist/index.js` |
+| 插件不生效但无报错 | 缺少 default 导出 | 插件代码是否有 `export default class Plugin` |
+| 始终下载到默认分支代码 | 版本号包含 "dev" | `pluginVersion` 是否包含 "dev" 字符串 |
+| 不同插件互相覆盖 | 不同 Git 引用目录冲突 | 检查 `pluginsByGitRef` 分组逻辑 |
+
+---
+
 ##### 完整路径映射图
 
 ```
