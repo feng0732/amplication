@@ -36,18 +36,36 @@ BuildService.generate()
        ↓
 saveDsgResourceDataToSharedStorage() → /dsg-resource-data/{buildId}/resource-data.json
        ↓
-发送 Kafka: CODE_GENERATION_REQUEST_TOPIC (仅 resourceId + buildId)
+发送 Kafka: CODE_GENERATION_REQUEST_TOPIC (resourceId + buildId)
        ↓
-[amplication-build-manager] BuildRunnerController.onCodeGenerationRequest()
+[amplication-build-manager]
        ↓
-BuildRunnerService.runBuild()
+BuildRunnerController.onCodeGenerationRequest()  ← Kafka 事件触发
        ↓
-readDsgResourceDataFromSharedStorage() → 读取 DSGResourceData
-       ↓
-splitBuildsIntoJobs() → 拆分为 Server/AdminUI 并行任务
-       ↓
-saveDsgResourceData() → 写入 jobs/{jobBuildId}/resource-data.json
-       ↓
+BuildRunnerService.runBuild(resourceId, buildId)
+       ├─ readDsgResourceDataFromSharedStorage()  读取 DSGResourceData
+       ├─ codeGeneratorNameToContainerImageName()  转换代码生成器名称
+       ├─ codeGeneratorService.getCodeGeneratorVersion()  ← 调用 Catalog Service
+       │   └─ POST /api/versions/code-generator-version  版本解析
+       ├─ emitCodeGenerationNotifyVersion()  通知版本选择结果
+       │
+       ├─ buildJobsHandlerService.splitBuildsIntoJobs()  ← 检查 3 个条件
+       │   ├─ 条件1: resourceType === Service ?
+       │   ├─ 条件2: codeGeneratorVersion !== "latest-local" ?
+       │   └─ 条件3: version >= FEATURE_SPLIT_JOBS_MIN_DSG_VERSION ?
+       │
+       └─ 对每个 Job: runJob()
+            ├─ saveDsgResourceData()  写入 jobs/{jobBuildId}/resource-data.json
+            ├─ saveRelevantDsgAssets()  ←──────┐  复制 dsg-assets
+            │   └─ {DSG_ASSETS_FOLDER}/{resourceId}-{plainBuildId}/
+            │      → {DSG_JOBS_BASE_FOLDER}/{jobBuildId}/dsg-assets/
+            │
+            └─ POST {DSG_RUNNER_URL}  ← 触发 Argo Workflow
+                 ├─ resourceId
+                 ├─ buildId: jobBuildId (带后缀)
+                 ├─ codeGeneratorVersion (镜像 tag)
+                 └─ codeGeneratorName (镜像名称)
+                      ↓
 DSG Runner (Argo Workflow) → 启动 Docker 容器
        ↓
 data-service-generator/src/main.ts → generateCode()
@@ -162,9 +180,170 @@ export class DSGResourceData {
 }
 ```
 
-### 1.4 关键节点
+### 1.4 构建入口的真实调用链
 
-**1. 构建任务拆分** - [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
+**纠正：构建入口不是直接调用，而是通过 Kafka 事件驱动**
+
+[BuildRunnerController.onCodeGenerationRequest()](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L68-L78)
+
+```typescript
+@EventPattern(KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC)
+async onCodeGenerationRequest(
+  @Payload() message: CodeGenerationRequest.Value
+): Promise<void> {
+  await this.buildRunnerService.runBuild(message.resourceId, message.buildId);
+}
+```
+
+**调用链**：
+```
+amplication-server → Kafka (CODE_GENERATION_REQUEST_TOPIC)
+       ↓
+amplication-build-manager (Kafka Consumer)
+       ↓
+BuildRunnerController.onCodeGenerationRequest()
+       ↓
+BuildRunnerService.runBuild(resourceId, buildId)
+       ├─ 读取 DSGResourceData
+       ├─ 解析代码生成器版本
+       ├─ 拆分任务
+       └─ 触发每个 Job 的 Argo Workflow
+```
+
+---
+
+### 1.5 Code Generator 版本选择机制
+
+**通过 Catalog Service 动态解析版本** - [code-generator-catalog.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/code-generator/code-generator-catalog.service.ts#L36-L59)
+
+```typescript
+async getCodeGeneratorVersion({
+  codeGeneratorFullName,
+  codeGeneratorVersion,
+  codeGeneratorStrategy,
+}: {
+  codeGeneratorFullName: string;
+  codeGeneratorVersion?: string;
+  codeGeneratorStrategy?: CodeGeneratorVersionStrategy;
+}): Promise<string | undefined>
+```
+
+**版本选择流程** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L114-L131)
+
+```typescript
+codeGeneratorVersion =
+  await this.codeGeneratorService.getCodeGeneratorVersion({
+    codeGeneratorFullName,
+    codeGeneratorVersion:
+      dsgResourceData.resourceInfo.codeGeneratorVersionOptions
+        .codeGeneratorVersion,
+    codeGeneratorStrategy:
+      dsgResourceData.resourceInfo.codeGeneratorVersionOptions
+        .codeGeneratorStrategy,
+  });
+```
+
+**版本策略**：
+| 策略 | 说明 | 示例 |
+|-----|------|------|
+| **Specific** | 使用用户指定的精确版本 | `v1.2.0` → `v1.2.0` |
+| **LatestMinor** | 使用指定 minor 版本的最新 patch | `v1.2.0` + LatestMinor → `v1.2.5` |
+| **LatestMajor** | 使用指定 major 版本的最新 minor | `v1.2.0` + LatestMajor → `v1.5.3` |
+| **latest-local** | 特殊本地开发版本，跳过版本解析 |
+
+---
+
+### 1.6 Split 生效条件的精确逻辑
+
+**三个条件必须同时满足才会拆分** - [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
+
+```typescript
+const shouldSplitBuild =
+  // 条件1: 资源类型必须是 Service
+  dsgResourceData.resourceType === EnumResourceType.Service &&
+  // 条件2: 不是本地开发版本
+  codeGeneratorVersion !== "latest-local" &&
+  // 条件3: 版本 >= 环境变量配置的最低版本
+  this.codeGeneratorService.compareVersions(
+    codeGeneratorVersion,
+    this.minDsgVersionToSplitBuild  // 来自 FEATURE_SPLIT_JOBS_MIN_DSG_VERSION
+  ) >= 0;
+```
+
+**不满足条件时**：
+- 不拆分，只创建一个 Job
+- Job ID = 原始 Build ID（不带 -server/-admin-ui 后缀）
+- 同时生成 Server 和 Admin UI
+
+**满足条件时**：
+- 根据 `generateServer` 和 `generateAdminUI` 设置决定创建哪些 Job
+- Server Job: 设置 `generateAdminUI = false`，Job ID = `{buildId}-server`
+- AdminUI Job: 设置 `generateServer = false`，Job ID = `{buildId}-admin-ui`
+
+---
+
+### 1.7 dsg-assets 的传递机制
+
+**从资源目录复制到 Job 目录** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L349-L370)
+
+```typescript
+async saveRelevantDsgAssets(
+  resourceId: string,
+  buildId: string,      // jobBuildId (带后缀)
+  plainBuildId: string  // 原始 buildId
+) {
+  // 源路径: 按 resourceId + plainBuildId 组织
+  const dsgAssetsPathForBuild = join(
+    this.configService.get(Env.DSG_ASSETS_FOLDER),
+    `${resourceId}-${plainBuildId}`
+  );
+
+  if (!(await exists(dsgAssetsPathForBuild))) {
+    return;  // 没有 assets 则跳过
+  }
+
+  // 目标路径: 每个 Job 目录下的 dsg-assets
+  const jobPathForDsgAssets = join(
+    this.configService.get(Env.DSG_JOBS_BASE_FOLDER),
+    buildId,
+    "dsg-assets"
+  );
+
+  await copy(dsgAssetsPathForBuild, jobPathForDsgAssets);
+}
+```
+
+**dsg-assets 目录结构**：
+```
+{DSG_ASSETS_FOLDER}/
+└── {resourceId}-{plainBuildId}/     ← 源目录 (按资源+构建组织)
+    ├── plugin-a/
+    ├── plugin-b/
+    └── ...
+
+{DSG_JOBS_BASE_FOLDER}/
+├── {buildId}-server/
+│   ├── resource-data.json
+│   └── dsg-assets/                  ← 复制到这里 (Server Job)
+│       ├── plugin-a/
+│       └── ...
+└── {buildId}-admin-ui/
+    ├── resource-data.json
+    └── dsg-assets/                  ← 复制到这里 (AdminUI Job)
+        ├── plugin-a/
+        └── ...
+```
+
+**关键点**：
+- dsg-assets 是**可选**的，不存在时静默跳过
+- 每个 Job 都获得完整的 assets 副本
+- 用于传递插件二进制文件、静态资源等
+
+---
+
+### 1.8 构建任务拆分
+
+[build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91)
 
 ```typescript
 async splitBuildsIntoJobs(
@@ -174,7 +353,7 @@ async splitBuildsIntoJobs(
 ): Promise<ResourceTuple[]>
 ```
 
-- **拆分条件**：Service 类型 + DSG 版本 >= 最低支持版本
+- **拆分条件**：Service 类型 + 非 latest-local + DSG 版本 >= 最低支持版本
 - **拆分策略**：
   - Server 任务：`generateAdminUI = false`，只生成后端
   - AdminUI 任务：`generateServer = false`，只生成前端
@@ -711,7 +890,139 @@ async handleDsgJobCompleted(resourceId: string, jobBuildId: string) {
 }
 ```
 
-### 5.2 产物合并机制
+### 5.2 包生成与完成回调
+
+**包生成触发时机** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L236-L246)
+
+```typescript
+if (buildStatus === EnumJobStatus.Success) {
+  const dsgResourceData =
+    await this.buildJobsHandlerService.extractDsgResourceData(jobBuildId);
+
+  // package manager is called only after all the jobs are completed
+  if (dsgResourceData.packages?.length > 0 && this.enablePackageManager) {
+    await this.generatePackages(buildId, resourceId, dsgResourceData);
+  } else {
+    this.logger.info("No packages to generate - complete build");
+    await this.codeGenerationAndPackagesCompleted(jobBuildId);
+  }
+}
+```
+
+**关键点**：
+- 包生成**只在所有 Job 都成功后**才触发
+- 只有当 `dsgResourceData.packages.length > 0` 且 `enablePackageManager` 为 true 时才执行
+- 否则直接调用完成回调
+
+---
+
+**包生成完成回调流程** - [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L44-L66)
+
+```typescript
+// 包生成成功回调
+@EventPattern(KAFKA_TOPICS.PACKAGE_MANAGER_CREATE_SUCCESS)
+async onPackageManagerCreateSuccess(
+  @Payload() message: PackageManagerCreateSuccess.Value
+): Promise<void> {
+  await this.buildRunnerService.onPackageManagerCreateSuccess(args);
+}
+
+// 包生成失败回调
+@EventPattern(KAFKA_TOPICS.PACKAGE_MANAGER_CREATE_FAILURE)
+async onPackageManagerCreateFailure(
+  @Payload() message: PackageManagerCreateFailure.Value
+): Promise<void> {
+  await this.buildRunnerService.onPackageManagerCreateFailure(args);
+}
+```
+
+**完成回调处理** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L54-L67)
+
+```typescript
+async onPackageManagerCreateSuccess(
+  response: PackageManagerCreateSuccess.Value
+) {
+  await this.codeGenerationAndPackagesCompleted(response.buildId);
+}
+
+async onPackageManagerCreateFailure(
+  response: PackageManagerCreateFailure.Value
+) {
+  await this.emitCodeGenerationFailure(
+    response.buildId,
+    response.errorMessage
+  );
+}
+```
+
+**codeGenerationAndPackagesCompleted 完成函数** - [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L90-L105)
+
+```typescript
+/// this function accepts either the buildId or the jobBuildId
+/// This method is called when the code generation and the packages generation are completed
+/// It emits a kafka event with the buildId and the code generator version
+async codeGenerationAndPackagesCompleted(buildIdOrJobBuildId: string) {
+  const buildId =
+    this.buildJobsHandlerService.extractBuildId(buildIdOrJobBuildId);
+
+  const successEvent: CodeGenerationSuccess.KafkaEvent = {
+    key: null,
+    value: {
+      buildId,
+      codeGeneratorVersion: this.latestCodeGeneratorVersion || "",
+      resourceId: "",  // Note: resourceId 实际上并未正确填充
+    },
+  };
+
+  this.logger.debug(
+    "Emitting code generation success event",
+    successEvent
+  );
+
+  await this.producerService.emitMessage(
+    KAFKA_TOPICS.CODE_GENERATION_SUCCESS_TOPIC,
+    successEvent
+  );
+}
+```
+
+**完整的成功路径**：
+```
+所有 DSG Job 成功
+       ↓
+检查是否需要生成包
+       ├─ 不需要 → codeGenerationAndPackagesCompleted() → Kafka Success
+       └─ 需要 → generatePackages() → Package Manager
+                          ↓
+                Package Manager 处理完成
+                          ↓
+                Kafka: PACKAGE_MANAGER_CREATE_SUCCESS
+                          ↓
+                codeGenerationAndPackagesCompleted() → Kafka Success
+```
+
+**完整的失败路径**：
+```
+任一 DSG Job 失败
+       ↓
+handleDsgJobCompleted catch 块
+       ↓
+emitCodeGenerationFailure() → Kafka Failure
+
+或
+
+包生成失败
+       ↓
+Kafka: PACKAGE_MANAGER_CREATE_FAILURE
+       ↓
+onPackageManagerCreateFailure()
+       ↓
+emitCodeGenerationFailure() → Kafka Failure
+```
+
+---
+
+### 5.3 产物合并机制
 
 [copyFromJobToArtifact()](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L372-L396)
 
@@ -1036,9 +1347,17 @@ export class BuildLogger implements IBuildLogger {
 | **DSGResourceData 构建** | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1384-L1521) | `getDSGResourceData()` |
 | 实体排序保证 | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L1349-L1371) | `getOrderedEntities()` |
 | 共享存储保存 | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-server/src/core/build/build.service.ts#L541-L560) | `saveDsgResourceDataToSharedStorage()` |
-| 构建入口 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L159) | `runBuild()` |
-| 任务拆分 | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91) | `splitBuildsIntoJobs()` |
+| **构建 Kafka 入口** | [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L68-L78) | `onCodeGenerationRequest()` |
+| **构建主流程** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L159) | `runBuild()` |
+| **版本选择** | [code-generator-catalog.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/code-generator/code-generator-catalog.service.ts#L36-L59) | `getCodeGeneratorVersion()` |
+| **任务拆分条件** | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L35-L91) | `splitBuildsIntoJobs()` |
+| **dsg-assets 传递** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L349-L370) | `saveRelevantDsgAssets()` |
+| Job 执行 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L161-L192) | `runJob()` |
 | Job 完成处理 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L208-L255) | `handleDsgJobCompleted()` |
+| **包生成触发** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L69-L88) | `generatePackages()` |
+| **包生成成功回调** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L54-L58) | `onPackageManagerCreateSuccess()` |
+| **包生成失败回调** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L60-L67) | `onPackageManagerCreateFailure()` |
+| **完成通知** | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L90-L105) | `codeGenerationAndPackagesCompleted()` |
 | 产物合并 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L372-L396) | `copyFromJobToArtifact()` |
 | 失败状态更新 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L257-L277) | `emitCodeGenerationFailureWhenJobStatusFailed()` |
 | DSG 主入口 | [main.ts](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/data-service-generator/src/main.ts#L1-L9) | `generateCode()` |
@@ -1068,26 +1387,42 @@ export class BuildLogger implements IBuildLogger {
 6. **失败去重通知**：只有第一个失败任务触发通知，避免重复告警
 7. **双日志系统**：兼顾内部调试和用户反馈
 
-### 潜在改进点
+### 潜在改进点（新增纠正后的发现）
 
-1. **缺乏事务性回滚**：失败时已写入的文件不会被清理
+1. **resourceId 未正确填充**：`codeGenerationAndPackagesCompleted()` 中 `resourceId: ""`
+   - 位置：[build-runner.service.ts#L93](file:///d:/fz/0601/solo-dogfeeding/code/23-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L93)
+   - 影响：成功事件中的 resourceId 为空，可能导致下游处理错误
+
+2. **版本选择是外部依赖**：通过 Catalog Service HTTP 调用解析版本
+   - 风险：Catalog Service 不可用时构建会失败
+   - 建议：增加降级策略，使用用户指定版本作为 fallback
+
+3. **dsg-assets 复制到每个 Job 目录**：存在冗余
+   - 当前：Server 和 AdminUI Job 各复制一份相同的 assets
+   - 建议：使用符号链接或共享挂载，减少磁盘占用
+
+4. **latest-local 特殊处理**：硬编码判断 `codeGeneratorVersion !== "latest-local"`
+   - 问题：本地开发时不会拆分任务，与生产环境行为不一致
+   - 建议：通过配置或环境变量控制，而非硬编码版本号
+
+5. **缺乏事务性回滚**：失败时已写入的文件不会被清理
    - 建议：先写入临时目录，全部成功后再原子性移动到目标目录
    - 或：记录已写入文件列表，失败时遍历删除
 
-2. **部分产物问题**：Server 成功但 Admin UI 失败时，artifact 目录有不完整代码
+6. **部分产物问题**：Server 成功但 Admin UI 失败时，artifact 目录有不完整代码
    - 建议：引入"预备目录"概念，所有任务完成后才移动到最终目录
 
-3. **错误上下文不足**：插件错误只显示事件名，缺少插件标识
+7. **错误上下文不足**：插件错误只显示事件名，缺少插件标识
    - 建议：在 `pluginWrapper` 中记录具体哪个插件失败
 
-4. **文件覆盖策略**：`flag: "wx"` 在目录不干净时会导致构建失败
+8. **文件覆盖策略**：`flag: "wx"` 在目录不干净时会导致构建失败
    - 建议：构建前先清理输出目录，或提供覆盖选项
 
-5. **缺乏中间状态持久化**：大项目构建中断后需从头开始
+9. **缺乏中间状态持久化**：大项目构建中断后需从头开始
    - 建议：支持增量构建，缓存已生成的模块
 
-6. **内存占用**：所有 ModuleMap 常驻内存，大项目可能 OOM
-   - 建议：支持流式写入，或分批生成分批写入
+10. **内存占用**：所有 ModuleMap 常驻内存，大项目可能 OOM
+    - 建议：支持流式写入，或分批生成分批写入
 
-7. **Job 目录无自动清理**：大量构建会占用大量磁盘空间
-   - 建议：增加 TTL 自动清理机制，或在构建成功后清理
+11. **Job 目录无自动清理**：大量构建会占用大量磁盘空间
+    - 建议：增加 TTL 自动清理机制，或在构建成功后清理
