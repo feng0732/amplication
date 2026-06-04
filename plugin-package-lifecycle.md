@@ -1051,16 +1051,45 @@ async function getPlugin(packageName, customPath) {
 > **错误信息**：`Cannot find module '{path}'`
 > **影响范围**：单个插件加载失败，整个构建流程中止
 
-**失败点 3：插件导出异常（DSG 容器）**
-[`getPluginFuncGenerator()`](packages/data-service-generator/src/register-plugin.ts#L68-L71)
+**失败点 3：缺少默认导出抛出 TypeError（DSG 容器）**
+[`getPluginFuncGenerator()`](packages/data-service-generator/src/register-plugin.ts#L62-L77)
+
+**按执行顺序分析**：
 ```typescript
+// 步骤1: 动态导入插件模块
+const func = await getPlugin(packageName, ...);
+// func 是 Module Namespace Object，形如:
+// - 有 default 导出: { default: PluginClass, [Symbol.toStringTag]: "Module" }
+// - 无 default 导出: { [Symbol.toStringTag]: "Module" } ← 没有 default 属性
+
+++index;
+
+// 步骤2: 如果没有 default，先 yield 一个 EmptyPlugin
+// 注意：这里只是 yield，代码会继续向下执行，不会 return 或 break！
 if (!func.hasOwnProperty("default")) yield EmptyPlugin;
 
-func.default.prototype.pluginName = packageName;
+// 步骤3: 访问 func.default.prototype
+// 关键 Bug 点：如果没有 default 导出，func.default 是 undefined！
+// 访问 undefined.prototype 立即抛出 TypeError！
+func.default.prototype.pluginName = packageName;  // ← 在这里崩溃！
 yield func.default;
 ```
-> **触发条件**：插件模块没有 `default` 导出（即 `export default class Plugin`）
-> **影响**：返回空插件 `EmptyPlugin`，不会报错但插件不会生效
+
+**catch 块捕获并重新抛出**：
+```typescript
+catch (error) {
+  await context.logger.error(`Failed to import plugin: ${error.message}`);
+  logger.error(error);
+  throw error;  // ← 重新抛出，整个构建失败
+}
+```
+
+> **触发条件**：插件模块没有 `export default` 导出
+> **错误类型**：`TypeError: Cannot read properties of undefined (reading 'prototype')`
+> **错误日志**：`Failed to import plugin: Cannot read properties of undefined (reading 'prototype')`
+> **影响范围**：整个构建流程中止
+
+> **重要澄清**：之前的理解错误！`if (!func.hasOwnProperty("default")) yield EmptyPlugin;` 只是先 yield 一个空插件，但代码**不会停止**，会继续执行到第 70 行访问 `func.default.prototype` 时抛出 TypeError。实际上 EmptyPlugin 不会被使用，因为异常会在之后立即抛出。
 
 ---
 
@@ -1070,7 +1099,7 @@ yield func.default;
 |---------|---------|--------|
 | git-sync-manager 抛出 `Can't find plugin` | 目录名与 pluginId 不一致 | Git 仓库路径是否为 `plugins/{pluginId}` |
 | DSG 抛出 `Cannot find module` | 插件构建产物缺失 | 目录下是否有 `package.json` 和 `dist/index.js` |
-| 插件不生效但无报错 | 缺少 default 导出 | 插件代码是否有 `export default class Plugin` |
+| DSG 抛出 `TypeError: Cannot read properties of undefined (reading 'prototype')` | 缺少 `export default` 导出 | 插件代码是否有 `export default class Plugin` |
 | 始终下载到默认分支代码 | 版本号包含 "dev" | `pluginVersion` 是否包含 "dev" 字符串 |
 | 不同插件互相覆盖 | 不同 Git 引用目录冲突 | 检查 `pluginsByGitRef` 分组逻辑 |
 
