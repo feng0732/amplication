@@ -403,9 +403,10 @@ private async downloadPrivatePlugins(logger, build, user, privatePlugins) {
     DOWNLOAD_PRIVATE_PLUGINS_STEP_NAME,    // "DOWNLOAD_PRIVATE_PLUGINS"
     DOWNLOAD_PRIVATE_PLUGINS_STEP_MESSAGE, // "Downloading private plugins"
     // ↑ actionService.run() 内部：
-    //   1. createStep() → 在 DB 创建 ActionStep (status=Running)
+    //   1. createStep() → 动态创建 ActionStep DOWNLOAD_PRIVATE_PLUGINS (Running)
     //   2. 执行 stepFunction
-    //   3. complete() → 标记 Success 或 Failed
+    //   3. leaveStepOpenAfterSuccessfulExecution=true → 不自动 complete
+    //      Step 保持 Running，等待 Kafka 回调关闭
     async (step) => {
       // 1. 获取每个插件的具体版本号
       const pluginVersions = await this.getPrivatePluginsWithVersion(...);
@@ -427,7 +428,8 @@ private async downloadPrivatePlugins(logger, build, user, privatePlugins) {
         KAFKA_TOPICS.DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC,
         downloadPrivatePluginsRequest
       );
-    }
+    },
+    true  // ← leaveStepOpenAfterSuccessfulExecution=true，不自动 complete
   );
 }
 ```
@@ -467,7 +469,22 @@ public async onDownloadPrivatePluginSuccess(response): Promise<void> {
 }
 ```
 
-> **注意**：代码中 `generate()` 在 `actionService.complete()` 之前执行。`generate()` 调用 `actionService.run()` 时传入 `leaveStepOpenAfterSuccessfulExecution=true`（见 [build.service.ts#L616](packages/amplication-server/src/core/build/build.service.ts#L616)），这意味着 `GENERATE_APPLICATION` Step 创建后不会自动标记 Success，而是保持 Running 状态，等待 DSG 容器异步完成后的 Kafka 回调来关闭。
+> **关键细节**：
+>
+> 1. **三个异步 Step 都使用 `leaveStepOpen=true`**：
+>    - DOWNLOAD_PRIVATE_PLUGINS（第 735 行）也传入了 `true`，发送 Kafka 后保持 Running 等待回调关闭
+>    - GENERATE_APPLICATION（第 616 行）也传入了 `true`，发送 Kafka 后保持 Running 等待回调关闭
+>    - PUSH_TO_GIT_PROVIDER（第 1340 行）也传入了 `true`，发送 Kafka 后保持 Running 等待回调关闭
+>
+> 2. **DOWNLOAD_PRIVATE_PLUGINS 的独有特性**：
+>    - 成功回调中**先启动下一步（generate），后 complete 自己**
+>    - 顺序：① `generate()` → ② `actionService.complete(DOWNLOAD_PRIVATE_PLUGINS, Success)`
+>    - 这意味着 GENERATE_APPLICATION Step 创建时，DOWNLOAD_PRIVATE_PLUGINS Step 仍处于 Running 状态
+>
+> 3. **GENERATE_APPLICATION 的回调顺序不同**：
+>    - 先 complete 自己（GENERATE_APPLICATION → Success）
+>    - 再触发下一步（saveToGitProvider）
+>    - 因此 PUSH_TO_GIT_PROVIDER Step 创建时，GENERATE_APPLICATION Step 已经是 Success 状态
 
 **失败回调**：[packages/amplication-server/src/core/build/build.service.ts](packages/amplication-server/src/core/build/build.service.ts#L1044-L1081)
 
@@ -832,12 +849,12 @@ async run(actionId, stepName, message, stepFunction, leaveStepOpenAfterSuccessfu
 }
 ```
 
-| ActionStep | 创建时机 | 创建者 | 自动完成？ |
-|-----------|---------|--------|----------|
-| ADD_TO_QUEUE | `Build.create()` | `createInitialStepData()` | 创建即 Success |
-| DOWNLOAD_PRIVATE_PLUGINS | `downloadPrivatePlugins()` | `actionService.run()` | 否（异步回调关闭） |
-| GENERATE_APPLICATION | `generate()` | `actionService.run()` | 否（`leaveStepOpen=true`，DSG 回调关闭） |
-| PUSH_TO_GIT_PROVIDER | `saveToGitProvider()` | `actionService.run()` | 否（异步回调关闭） |
+| ActionStep | 创建时机 | leaveStepOpen | 由谁 complete | 特殊行为 |
+|-----------|---------|---------------|-------------|---------|
+| ADD_TO_QUEUE | `Build.create()` | false | 自身（创建即 Success） | 同步完成 |
+| DOWNLOAD_PRIVATE_PLUGINS | `downloadPrivatePlugins()` | true | `onDownloadPrivatePluginSuccess()`/`Failure()` | **先启动下一步，再 complete 自己**<br>回调中顺序：① `generate()` → ② `complete(Success)` |
+| GENERATE_APPLICATION | `generate()` | true | `onCodeGenerationSuccess()`/`Failure()` | 先 complete 自己，再触发下一步（saveToGitProvider） |
+| PUSH_TO_GIT_PROVIDER | `saveToGitProvider()` | true | Git Sync Manager Kafka 回调 | 最后一步，无后续 |
 
 ---
 
