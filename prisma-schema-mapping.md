@@ -21,24 +21,24 @@ Amplication 中存在两条方向相反、彼此独立的转换流水线：
 
 **正向生成（代码构建）：**
 
-- [create-prisma-schema-module.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-module.ts) — 对外模块入口，封装参数并调用内层
-- [create-prisma-schema.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema.ts) — schema 组装（datasource / generator / model / enum）
-- [create-prisma-schema-fields.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts) — 字段级类型映射与关系字段处理
-- [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/constants.ts) — 默认 datasource 与 generator 配置
-- [create-server.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/create-server.ts) — 服务器代码生成总调度（L128-L129 调用 Prisma schema 生成）
-- [prisma.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) — 静态模板：NestJS `PrismaService`（继承 PrismaClient）
-- [prisma.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) — 静态模板：全局 PrismaModule
+- [create-prisma-schema-module.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema-module.ts) — 对外模块入口，封装参数并调用内层
+- [create-prisma-schema.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema.ts) — schema 组装（datasource / generator / model / enum）
+- [create-prisma-schema-fields.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts) — 字段级类型映射与关系字段处理
+- [constants.ts](packages/data-service-generator/src/server/prisma/constants.ts) — 默认 datasource 与 generator 配置
+- [create-server.ts](packages/data-service-generator/src/server/create-server.ts) — 服务器代码生成总调度（L128-L129 调用 Prisma schema 生成）
+- [prisma.service.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) — 静态模板：NestJS `PrismaService`（继承 PrismaClient）
+- [prisma.module.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) — 静态模板：全局 PrismaModule
 
 **反向导入（平台运行时）：**
 
-- [prismaSchemaParser.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) — Prisma schema → Entity/Field 的七步规范化管线
-- [dbSchemaImport.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) — 用户导入流程调度（Kafka 异步处理）
+- [prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) — Prisma schema → Entity/Field 的七步规范化管线
+- [dbSchemaImport.service.ts](packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) — 用户导入流程调度（Kafka 异步处理）
 
 **共享类型定义（仅正向生成使用）：**
 
-- [code-gen-types.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/code-gen-types.ts) — Entity / EntityField / LookupResolvedProperties 等
-- [models.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/models.ts) — EnumDataType 枚举值定义（L991-L1011）
-- [dto-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/dsg-utils/src/lib/dto-util.ts) — `createEnumName()` 命名规则
+- [code-gen-types.ts](libs/util/code-gen-types/src/code-gen-types.ts) — Entity / EntityField / LookupResolvedProperties 等
+- [models.ts](libs/util/code-gen-types/src/models.ts) — EnumDataType 枚举值定义（L991-L1011）
+- [dto-util.ts](libs/util/dsg-utils/src/lib/dto-util.ts) — `createEnumName()` 命名规则
 
 ---
 
@@ -46,7 +46,7 @@ Amplication 中存在两条方向相反、彼此独立的转换流水线：
 
 ### 2.1 数据类型枚举
 
-Amplication 内部使用 `EnumDataType` 表示 **19 种**字段数据类型（定义见 [models.ts#L991-L1011](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/models.ts#L991-L1011)）：
+Amplication 内部使用 `EnumDataType` 表示 **19 种**字段数据类型（定义见 [models.ts#L991-L1011](libs/util/code-gen-types/src/models.ts#L991-L1011)）：
 
 ```
 Boolean, CreatedAt, DateTime, DecimalNumber, Email, File,
@@ -55,7 +55,7 @@ MultiSelectOptionSet, OptionSet, Password, Roles,
 SingleLineText, UpdatedAt, Username, WholeNumber
 ```
 
-> 说明：19 个枚举值在 [create-prisma-schema-fields.ts#L77-L524](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L77-L524) 的 `createPrismaSchemaFieldsHandlers` 分发表中逐一对应处理，无遗漏。
+> 说明：19 个枚举值在 [create-prisma-schema-fields.ts#L77-L524](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L77-L524) 的 `createPrismaSchemaFieldsHandlers` 分发表中逐一对应处理，无遗漏。
 
 ### 2.2 标量字段完整映射表
 
@@ -85,7 +85,7 @@ SingleLineText, UpdatedAt, Username, WholeNumber
 | `CreatedAt` | `DateTime` | `@default(now())` |
 | `UpdatedAt` | `DateTime` | `@updatedAt` |
 
-**Id 子类型映射**（[create-prisma-schema-fields.ts#L33-L49](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L33-L49)）：
+**Id 子类型映射**（[create-prisma-schema-fields.ts#L33-L49](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L33-L49)）：
 
 | Id.idType | Prisma 标量类型 | 默认函数 |
 |-----------|----------------|----------|
@@ -108,11 +108,11 @@ SingleLineText, UpdatedAt, Username, WholeNumber
 
 ### 3.1 关系字段（Lookup）核心处理
 
-Lookup 类型的完整转换逻辑位于 [create-prisma-schema-fields.ts#L280-L366](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L280-L366)。
+Lookup 类型的完整转换逻辑位于 [create-prisma-schema-fields.ts#L280-L366](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L280-L366)。
 
 #### 3.1.1 Lookup 字段属性结构
 
-Lookup 的 `properties` 结构见 [lookup.json](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/schemas/lookup.json)，解析后的形态为：
+Lookup 的 `properties` 结构见 [lookup.json](libs/util/code-gen-types/src/schemas/lookup.json)，解析后的形态为：
 
 ```typescript
 // code-gen-types.ts#L98-L106
@@ -146,9 +146,9 @@ customerId BigInt
 
 当同一对实体之间存在**多条关系路径**时，必须显式指定关系名避免歧义。
 
-判断是否需要命名：`hasAnotherRelation`（[create-prisma-schema-fields.ts#L292-L297](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L292-L297)）—— 只要当前 entity 中存在另一个指向同一 relatedEntity 的 Lookup 字段，就需要命名。
+判断是否需要命名：`hasAnotherRelation`（[create-prisma-schema-fields.ts#L292-L297](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L292-L297)）—— 只要当前 entity 中存在另一个指向同一 relatedEntity 的 Lookup 字段，就需要命名。
 
-命名算法：`createRelationName()`（[create-prisma-schema-fields.ts#L538-L583](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L538-L583)），优先级递减：
+命名算法：`createRelationName()`（[create-prisma-schema-fields.ts#L538-L583](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L538-L583)），优先级递减：
 
 1. 若字段名与对方实体名（单/复数）完全对应 → `"{Remote}On{Local}"`（按字母序拼接）
 2. 若某一端字段名全局唯一 → 直接使用该字段名
@@ -156,14 +156,14 @@ customerId BigInt
 
 ### 3.3 枚举字段（OptionSet / MultiSelectOptionSet）
 
-**命名规则**：`createEnumName(field, entity)` = `"Enum" + PascalCase(entity.name) + PascalCase(field.name)`，见 [dto-util.ts#L152-L154](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/dsg-utils/src/lib/dto-util.ts#L152-L154)。
+**命名规则**：`createEnumName(field, entity)` = `"Enum" + PascalCase(entity.name) + PascalCase(field.name)`，见 [dto-util.ts#L152-L154](libs/util/dsg-utils/src/lib/dto-util.ts#L152-L154)。
 
 | 类型 | Prisma 输出 |
 |------|------------|
 | `OptionSet` | `Enum{Entity}{Field}` 对象字段（单值） |
 | `MultiSelectOptionSet` | `Enum{Entity}{Field}[]` 对象字段（数组 + 列表） |
 
-枚举定义生成：在 `createPrismaSchemaInternal` 中通过 `getEnumFields(entity)` 汇总，调用 [createPrismaEnum()](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema.ts#L76-L85) 产出 Prisma `enum` 块。
+枚举定义生成：在 `createPrismaSchemaInternal` 中通过 `getEnumFields(entity)` 汇总，调用 [createPrismaEnum()](packages/data-service-generator/src/server/prisma/create-prisma-schema.ts#L76-L85) 产出 Prisma `enum` 块。
 
 ---
 
@@ -171,7 +171,7 @@ customerId BigInt
 
 ### 4.1 组装流程（Entity → Prisma 文件）
 
-完整流程见 [createPrismaSchemaInternal()](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema.ts#L30-L74)：
+完整流程见 [createPrismaSchemaInternal()](packages/data-service-generator/src/server/prisma/create-prisma-schema.ts#L30-L74)：
 
 ```
 1. 计算 fieldNamesCount（统计字段名出现频次，用于关系命名决策）
@@ -185,11 +185,11 @@ customerId BigInt
 7. 写入 ModuleMap，路径 = "{serverDirectories.baseDirectory}/prisma/schema.prisma"
 ```
 
-调用入口见 [create-server.ts#L128-L129](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/create-server.ts#L128-L129)。
+调用入口见 [create-server.ts#L128-L129](packages/data-service-generator/src/server/create-server.ts#L128-L129)。
 
 ### 4.2 默认 Datasource 与 Generator
 
-见 [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/constants.ts)：
+见 [constants.ts](packages/data-service-generator/src/server/prisma/constants.ts)：
 
 ```prisma
 datasource db {
@@ -241,9 +241,9 @@ Amplication 的代码生成器**不直接调用 `prisma generate`**，而是通�
 
 ### 5.2 环节二：静态模板 —— PrismaService 与 PrismaModule
 
-两个静态文件在 [create-server.ts#L48-L52](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/create-server.ts#L48-L52) 随 `readStaticModules()` 整体拷贝到目标项目：
+两个静态文件在 [create-server.ts#L48-L52](packages/data-service-generator/src/server/create-server.ts#L48-L52) 随 `readStaticModules()` 整体拷贝到目标项目：
 
-**[prisma.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts)**
+**[prisma.service.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts)**
 
 ```typescript
 import { Injectable, OnModuleInit, INestApplication } from "@nestjs/common";
@@ -259,7 +259,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit {
 
 `PrismaService` 通过**继承** `@prisma/client` 暴露的 `PrismaClient` 类，获得所有 model 的 CRUD 访问器（如 `this.prisma.customer.findMany()`）。`@prisma/client` 是在用户执行 `prisma generate` 时才生成到 `node_modules` 中的包。
 
-**[prisma.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts)**
+**[prisma.module.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts)**
 
 ```typescript
 import { Global, Module } from "@nestjs/common";
@@ -309,7 +309,7 @@ export class CustomerService extends CustomerServiceBase {
 
 ### 5.4 环节四：`prisma generate` 的触发时机
 
-`prisma generate` 命令通过 [package.json](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/package-json/package.json) 暴露给开发者：
+`prisma generate` 命令通过 [package.json](packages/data-service-generator/src/server/package-json/package.json) 暴露给开发者：
 
 ```json
 {
@@ -361,7 +361,7 @@ src/{entity}/base/{Entity}ServiceBase → 调用 this.prisma.{entity}.{operation
 
 ### 6.1 迁移脚本注入
 
-代码生成器在生成的服务项目 `package.json` 中注入以下 Prisma 迁移脚本（见 [package.json](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/package-json/package.json)）：
+代码生成器在生成的服务项目 `package.json` 中注入以下 Prisma 迁移脚本（见 [package.json](packages/data-service-generator/src/server/package-json/package.json)）：
 
 | Script | 命令 | 用途 |
 |--------|------|------|
@@ -375,7 +375,7 @@ src/{entity}/base/{Entity}ServiceBase → 调用 this.prisma.{entity}.{operation
 
 ### 6.2 Prisma Schema 反向导入（Import 流程）
 
-当用户上传已有 Prisma schema 时，平台通过 `PrismaSchemaParserService` 执行反向解析（[prismaSchemaParser.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts)）。
+当用户上传已有 Prisma schema 时，平台通过 `PrismaSchemaParserService` 执行反向解析（[prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts)）。
 
 #### 6.2.1 七步准备管线（prepareOperations）
 
@@ -494,19 +494,19 @@ export type EntityField = Omit<
 
 | 关注点 | 文件路径 |
 |--------|---------|
-| Prisma schema 生成入口 | [create-prisma-schema-module.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-module.ts) |
-| Model/Enum 组装 | [create-prisma-schema.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema.ts) |
-| 字段类型映射与关系 | [create-prisma-schema-fields.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts) |
-| Datasource/Generator 默认值 | [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/constants.ts) |
-| 服务器代码生成总调度（调用入口） | [create-server.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/create-server.ts) |
-| PrismaService 静态模板 | [prisma.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) |
-| PrismaModule 静态模板 | [prisma.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) |
-| 枚举命名规则 | [dto-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/dsg-utils/src/lib/dto-util.ts) |
-| EnumDataType 定义（19 个值） | [models.ts#L991-L1011](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/models.ts#L991-L1011) |
-| Entity/EntityField/Relation 类型 | [code-gen-types.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/code-gen-types.ts) |
-| Lookup 属性 JSON Schema | [lookup.json](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/libs/util/code-gen-types/src/schemas/lookup.json) |
-| 生成服务的迁移脚本与 Prisma 依赖 | [package.json](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/package-json/package.json) |
-| Prisma Schema 反向解析管线 | [prismaSchemaParser.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) |
-| Schema Import 调度 | [dbSchemaImport.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) |
-| 主平台参考 schema | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/amplication-prisma-db/prisma/schema.prisma) |
-| 单元测试（字段映射验证） | [create-prisma-schema.spec.ts](file:///d:/fz/0601/solo-dogfeeding/code/43-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema.spec.ts) |
+| Prisma schema 生成入口 | [create-prisma-schema-module.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema-module.ts) |
+| Model/Enum 组装 | [create-prisma-schema.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema.ts) |
+| 字段类型映射与关系 | [create-prisma-schema-fields.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts) |
+| Datasource/Generator 默认值 | [constants.ts](packages/data-service-generator/src/server/prisma/constants.ts) |
+| 服务器代码生成总调度（调用入口） | [create-server.ts](packages/data-service-generator/src/server/create-server.ts) |
+| PrismaService 静态模板 | [prisma.service.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) |
+| PrismaModule 静态模板 | [prisma.module.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) |
+| 枚举命名规则 | [dto-util.ts](libs/util/dsg-utils/src/lib/dto-util.ts) |
+| EnumDataType 定义（19 个值） | [models.ts#L991-L1011](libs/util/code-gen-types/src/models.ts#L991-L1011) |
+| Entity/EntityField/Relation 类型 | [code-gen-types.ts](libs/util/code-gen-types/src/code-gen-types.ts) |
+| Lookup 属性 JSON Schema | [lookup.json](libs/util/code-gen-types/src/schemas/lookup.json) |
+| 生成服务的迁移脚本与 Prisma 依赖 | [package.json](packages/data-service-generator/src/server/package-json/package.json) |
+| Prisma Schema 反向解析管线 | [prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) |
+| Schema Import 调度 | [dbSchemaImport.service.ts](packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) |
+| 主平台参考 schema | [schema.prisma](packages/amplication-prisma-db/prisma/schema.prisma) |
+| 单元测试（字段映射验证） | [create-prisma-schema.spec.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema.spec.ts) |
