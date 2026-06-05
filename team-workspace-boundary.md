@@ -377,13 +377,74 @@ async updateGitRepository(
 
 ---
 
-##### （五）风险场景总结
+##### （五）数据库外键影响：两种操作的实际风险差异
+
+Prima Schema 中 Resource 与 GitRepository 的关系定义（`packages/amplication-prisma-db/prisma/schema.prisma`）：
+
+```prisma
+model Resource {
+  // ...
+  gitRepositoryId String?
+  gitRepository   GitRepository? @relation(
+    fields: [gitRepositoryId],
+    references: [id],
+    onDelete: NoAction   // ⚠️ 关键：外键删除行为为 NoAction
+  )
+}
+
+model GitRepository {
+  // ...
+  resources Resource[]   // 反向关联：一个仓库可关联多个 Resource
+}
+```
+
+**`onDelete: NoAction` 的含义**：当尝试删除某条 GitRepository 记录时，若数据库中存在任意 Resource 的 `gitRepositoryId` 指向该仓库，数据库会直接抛出外键约束错误，**阻断删除操作**。但该约束**只影响 DELETE，不影响 UPDATE**。
+
+这导致 `deleteGitRepository` 和 `updateGitRepository` 两种操作的实际跨工作区风险存在显著差异：
+
+---
+
+###### 5.1 deleteGitRepository：外键 NoAction 部分阻断，但仍有风险
+
+数据库外键提供了**非预期的间接保护**，但仅在目标仓库有关联 Resource 时生效：
+
+| 目标仓库状态 | 外键作用 | 攻击结果 |
+|------------|---------|---------|
+| 被 1 个或多个 Resource 关联（`Resource.gitRepositoryId = repo_B`） | `onDelete: NoAction` 生效，数据库拒绝删除 | ❌ 攻击被外键阻断 |
+| 未关联任何 Resource（所有 Resource 已 disconnect 或仓库刚创建尚未分配） | 无外键约束 | ✅ 跨 workspace 删除成功 |
+
+对比"正常"的 `disconnectResourceGitRepository` 方法（`git.provider.service.ts` L459-L530）：它会先 `disconnect` 所有关联的 Resource，再检查 `countResourcesConnected.length === 0` 时才执行 `delete`。而 `deleteGitRepository` **绕过了整个前置 disconnect 流程**，直接执行删除。
+
+因此，当目标仓库没有任何 Resource 关联时（例如在 `disconnectResourceGitRepository` 执行到 L521 判断之前的窗口期，或者仓库创建后还未分配给任何 Resource），攻击者可以直接跨 workspace 删除。
+
+---
+
+###### 5.2 updateGitRepository：外键不影响 UPDATE，跨 workspace 修改始终生效
+
+**数据库外键 `onDelete: NoAction` 只约束 DELETE 操作，完全不约束 UPDATE。** 因此跨 workspace 的更新攻击**不受任何数据库层保护**，始终可以成功。
+
+可被跨 workspace 修改的字段（GitRepository 模型定义）：
+
+| 字段 | 说明 | 影响 |
+|-----|------|-----|
+| `name` | 仓库名称 | 修改后前端展示的仓库名错乱，影响后续 Git 操作 |
+| `groupName` | 仓库分组/组织名 | 影响 Git 客户端定位仓库路径 |
+| `baseBranchName` | 默认分支名 | 影响后续 build、sync、pull request 等操作的目标分支 |
+
+由于这些字段直接参与 Git 操作路径构造，被恶意修改后可能导致：
+- build 任务找不到正确的仓库/分支
+- PR 合并到错误分支
+- 已有的仓库连接看起来"消失"了（name/groupName 匹配不上）
+
+---
+
+##### （六）风险场景完整总结
 
 假设：
 - **Workspace A**：ID = `ws_A`，用户 `User_A` 是 Owner（permissions = `["*"]`），Team = Admins
 - **Workspace B**：ID = `ws_B`，其中有一个 GitRepository，ID = `repo_B`
 
-攻击路径：
+**攻击路径（delete 与 update 前 4 步完全相同）**：
 
 ```
 User_A 已登录 ws_A，JWT 中含 workspace=ws_A, permissions=["*"]
@@ -398,16 +459,21 @@ User_A 构造 GraphQL Mutation，传入 gitRepositoryId=repo_B
        → canAccessWorkspace = true  ✅ 绕过
           │
           ▼
-阶段二：validatePermissions(["git.repo.disconnect"], ["*"])
+阶段二：validatePermissions(required, ["*"])
        → user.permissions 含 "*"
        → 返回 true                    ✅ 绕过
           │
           ▼
-服务层：prisma.gitRepository.delete({ where: { id: repo_B } })
-       → repo_B 被删除               ❌ 跨 workspace 攻击成功
+服务层操作分歧：
+  ├─► deleteGitRepository：
+  │     ├─► repo_B 有关联 Resource？── NoAction 外键 ──► 数据库报错 ❌（意外保护）
+  │     └─► repo_B 无关联 Resource？────────────────────► 删除成功 ✅❌
+  │
+  └─► updateGitRepository：
+        外键不影响 UPDATE ───────────────────────────────► 字段修改成功 ✅❌
 ```
 
-updateGitRepository 的攻击路径完全相同，危害是可以修改其他 workspace 的仓库设置（baseBranchName、name、groupName 等字段）。
+**结论**：`updateGitRepository` 的跨工作区风险高于 `deleteGitRepository`，因为它完全不受数据库外键保护。
 
 ---
 
