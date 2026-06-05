@@ -180,7 +180,7 @@ async deleteTeam(@Args() args: FindOneArgs): Promise<Team | null> { ... }
 };
 ```
 
-GitRepository 的跨工作区访问实际上在 **Resolver 层通过权限要求** 间接保障：使用 `GitRepositoryId` 的操作（如 `deleteGitRepository`、`updateGitRepository`）都需要 `"git.repo.disconnect"` 或 `"git.repo.settings.edit"` 权限，这些权限本身是 workspace 级别的，用户在另一 workspace 中不具备。
+GitRepositoryId 是整个 VALIDATION_FUNCTIONS 中**最值得关注的例外**：验证函数只检查 ID 存在性，不通过 `gitOrganization → workspace` 追溯归属；而使用该参数类型的两个核心操作（`deleteGitRepository`、`updateGitRepository`）在服务层也缺失 workspace 校验，**存在跨工作区访问风险**。详见 4.2.3 节完整链路分析。
 
 #### 4.2.3 深度分析：GitRepositoryId 跨工作区风险链路
 
@@ -243,7 +243,7 @@ async deleteGitRepository(
 
 ###### Step 2: GqlAuthGuard 守卫 → PermissionsService.validateAccess
 
-进入 [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/41-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts)，依次调用：
+进入 `packages/amplication-server/src/guards/gql-auth.guard.ts`，依次调用：
 - `validateAccess()` → 阶段一（工作区隔离验证）
 - `validatePermissions()` → 阶段二（权限匹配验证）
 
