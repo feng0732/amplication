@@ -685,16 +685,29 @@ async emitMessage(topic, message, schemaIds) {
   const kafkaMessage = await this.serializer.serialize(message, schemaIds);
   return await new Promise((resolve, reject) => {
     this.kafkaClient.emit(topic, kafkaMessage).subscribe({
-      error: (err) => reject(err),   // Kafka broker 不可达 / 发送异常
-      next: () => resolve(),          // kafkajs producer.send() Promise resolve 回调
+      error: (err) => reject(err),
+      next: () => resolve(),
     });
   });
 }
 ```
 
-**边界 1：emitMessage 的 `next` 回调含义由 kafkajs 的 producer.send() 决定。** 本项目未显式配置 producer `acks` 参数（见 [createNestjsKafkaConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts)），使用 kafkajs 默认值 `acks=-1`（即 `all`），表示所有 ISR（in-sync replicas）副本都写入后才返回确认。因此 `next` 回调表示 broker 集群已持久化该消息，而非仅进入 producer 本地缓冲区。
+**边界 1：对 `next` 回调含义的保守推断（多层不确定性叠加）。**
 
-真实的消息丢失窗口：若 `next` 回调 resolve 后，所有 ISR 副本同时在刷盘前崩溃（极罕见），消息可能丢失。对于常规的单 broker 临时不可达场景，若 `next` 已 resolve，消息已落盘持久化。
+本项目对 Kafka 生产者的配置极其有限：
+- [createNestjsKafkaConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts) 只配置了 `client`（brokers、clientId、ssl、sasl）和 `consumer`（groupId、sessionTimeout 等），**未显式指定任何 producer 级别参数**（`acks`、`retry`、`idempotent` 等均缺失）。
+- 因此生产者参数全部依赖下游依赖的默认值。
+
+基于现有代码与依赖惯例，可做以下分层推断（每层推断都有其不确定性边界）：
+
+| 层级 | 可确认事实（基于代码/文档） | 不确定性边界 |
+|---|---|---|
+| **L1 NestJS → kafkajs 映射** | `ClientKafka.emit()` 返回 Observable，其 `next` 回调在内部 `kafkajs.producer.send()` 的 Promise resolve 时触发，`error` 在 reject 时触发。该映射关系可由 [KafkaProducer.service.spec.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.spec.ts) 中 `emit.mockReturnValue(of(null))` 的测试写法佐证。 | NestJS 内部实现可能随版本变化；项目未锁定 NestJS / kafkajs 的精确子版本。 |
+| **L2 kafkajs 默认 acks** | kafkajs 官方文档声明 producer.send() 的 `acks` 默认值为 `-1`（即 `all`），含义为"all in-sync replicas must acknowledge"。 | 该默认值是 kafkajs 库层面的约定，若运行时环境通过其他方式（如自定义 transport、broker 端动态覆盖）修改了语义，生产者代码侧无法感知。 |
+| **L3 acks=-1 的实际含义** | acks=-1 表示生产者在收到**当前 ISR 集合中所有副本**的确认后才认为发送成功。但此处"确认"仅表示副本将消息写入了**操作系统页缓存（page cache）**，并不等价于写入物理磁盘。是否落盘由 broker 端 `flush.ms` / `flush.messages` 等参数控制，生产者侧完全不可见。 | 如果在生产者等待确认期间，ISR 集合发生变化（follower 掉队被踢出 ISR），或者 `min.insync.replicas`（broker 端 Topic 配置）导致 `NOT_ENOUGH_REPLICAS` 错误，生产者会抛异常，由 `error` 回调接收。本项目未显式配置 `min.insync.replicas`，该值由运维侧 broker 配置决定。 |
+| **L4 物理持久化边界** | 即使 acks=-1 确认返回，也**无法从生产者侧断言**数据已写入所有 ISR 副本的物理磁盘。极端情况（如所有 ISR 副本所在机器同时掉电且 OS page cache 未刷盘）下，数据仍可能丢失。 | 此类极端场景属于 Kafka 架构层面的可靠性边界，不依赖于本项目代码。 |
+
+综上，保守表述为：**`next` 回调 resolve，仅能说明 kafkajs producer.send() Promise 已 resolve；基于默认 acks=-1 的惯例，可合理推断当前 ISR 集合中的副本已将消息写入页缓存，但不能对物理磁盘持久化或极端故障场景下的数据完整性做出任何代码层面的保证。**
 
 **saveToGitProvider 中对 emitMessage 的异常处理：
 
@@ -718,8 +731,8 @@ return this.actionService.run(build.actionId, PUSH_TO_GIT_STEP_NAME, ..., async 
 
 | 失败场景 | 后果 | 用户感知 |
 |---|---|---|
-| emitMessage 抛异常（Kafka 不可达） | 仅打印 logger.error，PUSH_TO_GIT 步骤保持 Running，build.gitStatus 保持 Waiting | ❌ Build 状态永不结束，前端轮询永远 Running，直到 5h 后被 isBuildStale 标记 Failed |
-| emitMessage 成功但 broker 未持久化 | 消息丢失，同上 | 同上 |
+| emitMessage 抛异常（Kafka 不可达、broker 拒绝等） | 仅打印 logger.error，PUSH_TO_GIT 步骤保持 Running，build.gitStatus 保持 Waiting | ❌ Build 状态永不结束，前端轮询永远 Running，直到 5h 后被 isBuildStale 标记 Failed |
+| emitMessage 的 next 回调 resolve 后，消息在后续环节丢失（如 ISR 全部掉电未刷盘、consumer 处理前消息过期被清理等） | 消息丢失，同上 | 同上 |
 | git-sync-manager 消费后处理异常 | CREATE_PR_FAILURE_TOPIC 正常发出，走 onCreatePRFailure | ✅ 正常失败反馈 |
 
 **边界 3：ActionService.run() 的异常传播逻辑：
