@@ -686,13 +686,15 @@ async emitMessage(topic, message, schemaIds) {
   return await new Promise((resolve, reject) => {
     this.kafkaClient.emit(topic, kafkaMessage).subscribe({
       error: (err) => reject(err),   // Kafka broker 不可达 / 发送异常
-      next: () => resolve(),          // 仅表示消息已被 producer 缓冲
+      next: () => resolve(),          // kafkajs producer.send() Promise resolve 回调
     });
   });
 }
 ```
 
-**边界 1：emitMessage 的 `next` 回调仅确认消息进入 producer 缓冲区，不保证 broker 已持久化。此时若 broker 宕机，消息会丢失。
+**边界 1：emitMessage 的 `next` 回调含义由 kafkajs 的 producer.send() 决定。** 本项目未显式配置 producer `acks` 参数（见 [createNestjsKafkaConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts)），使用 kafkajs 默认值 `acks=-1`（即 `all`），表示所有 ISR（in-sync replicas）副本都写入后才返回确认。因此 `next` 回调表示 broker 集群已持久化该消息，而非仅进入 producer 本地缓冲区。
+
+真实的消息丢失窗口：若 `next` 回调 resolve 后，所有 ISR 副本同时在刷盘前崩溃（极罕见），消息可能丢失。对于常规的单 broker 临时不可达场景，若 `next` 已 resolve，消息已落盘持久化。
 
 **saveToGitProvider 中对 emitMessage 的异常处理：
 
@@ -832,12 +834,15 @@ githubLastSync?: Date;
 query getResources($where: ...) {
   resources(...) {
     id
-    githubLastSync          // 前端只请求了 githubLastSync，没有请求 githubLastMessage
+    githubLastSync
     gitRepository { ... }
     builds(orderBy: { createdAt: Desc }, take: 1) {
       id
-      status          // 最后一个 build 的状态
-      gitStatus     // ❌ 列表页不包含 gitStatus
+      version
+      createdAt
+      status
+      codeGeneratorVersion
+      // 注意：GET_RESOURCES 查询不包含 githubLastMessage，也不包含 builds[].gitStatus
     }
   }
 }
@@ -1009,9 +1014,9 @@ async calcBuildStatus(buildId) {
 
 | 场景 | build.status DB 值 | 前端展示 | 恢复方式 |
 |---|---|---|---|
-| Kafka CREATE_PR_REQ 发送失败（被 catch 被吞掉） | Running | 永久 Running 5 秒轮询 → 5h 后 isBuildStale 自动标记 Failed |
-| git-sync-manager 处理中崩溃，还没回传结果 | Running | Running 同上 |
-| CREATE_PR_SUCCESS_TOPIC/Kafka 消息送达但 onCreatePRSuccess 内部异常 | Running（成功回调 catch 降级为 Failed 并落库） | Failed 下次查询展示 Failed | ✅ 正常失败反馈 |
+| Kafka CREATE_PR_REQ 发送失败（被 catch 吞掉） | Running | 永久 Running 5 秒轮询 → 5h 后 isBuildStale 自动标记 Failed |
+| git-sync-manager 处理中崩溃，还没回传结果 | Running | Running | 同上 |
+| CREATE_PR_SUCCESS_TOPIC 消息送达但 onCreatePRSuccess 内部异常 | Failed（catch 分支显式调用 `updateBuildStatuses(Failed)` 并落库，见 [build.service.ts:L905-L909](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/build/build.service.ts#L905-L909)） | Failed 下次查询直接展示 | ✅ 正常失败反馈，无需额外恢复 |
 | 前端长时间不查询不刷新 | Running/Unknown | calcBuildStatus 重算 |
 
 
