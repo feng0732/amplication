@@ -182,6 +182,235 @@ async deleteTeam(@Args() args: FindOneArgs): Promise<Team | null> { ... }
 
 GitRepository 的跨工作区访问实际上在 **Resolver 层通过权限要求** 间接保障：使用 `GitRepositoryId` 的操作（如 `deleteGitRepository`、`updateGitRepository`）都需要 `"git.repo.disconnect"` 或 `"git.repo.settings.edit"` 权限，这些权限本身是 workspace 级别的，用户在另一 workspace 中不具备。
 
+#### 4.2.3 深度分析：GitRepositoryId 跨工作区风险链路
+
+下面沿着**仓库删除**和**仓库设置更新**两条调用链路，逐层分析 GitRepository 如何绑定到 workspace、哪里缺失了绑定检查。
+
+---
+
+##### （一）数据库层：GitRepository 与 Workspace 的绑定方式
+
+Prisma Schema 定义（相对路径 `packages/amplication-prisma-db/prisma/schema.prisma`）：
+
+```prisma
+model GitOrganization {
+  id            String          @id @default(cuid())
+  // ...
+  workspaceId   String                              // ✅ 直接字段
+  workspace     Workspace       @relation(fields: [workspaceId], ...)
+  gitRepositories GitRepository[]
+}
+
+model GitRepository {
+  id                String          @id @default(cuid())
+  // ...
+  gitOrganizationId String                              // ⚠️ 无 workspaceId，仅有此间接关联字段
+  gitOrganization   GitOrganization @relation(fields: [gitOrganizationId], ...)
+  resources         Resource[]
+}
+```
+
+**绑定链**：`GitRepository.id → GitRepository.gitOrganizationId → GitOrganization.workspaceId → Workspace.id`
+
+GitRepository 本身没有 `workspaceId` 字段，必须通过 GitOrganization 间接追溯。
+
+---
+
+##### （二）链路一：deleteGitRepository（删除仓库）
+
+完整调用链：**Resolver → GqlAuthGuard → PermissionsService → GitProviderService**
+
+###### Step 1: Resolver 层（`packages/amplication-server/src/core/git/git.resolver.ts` L94-L104）
+
+```typescript
+@Mutation(() => Resource)
+@AuthorizeContext(
+  AuthorizableOriginParameter.GitRepositoryId,   // ← 参数类型
+  "gitRepositoryId",                             // ← 参数取值路径
+  "git.repo.disconnect"                          // ← 所需权限
+)
+async deleteGitRepository(
+  @Args() args: DeleteGitRepositoryArgs          // ← { gitRepositoryId: string }
+): Promise<boolean> {
+  return this.gitService.deleteGitRepository(args);
+}
+```
+
+装饰器声明：
+- 待验证参数类型：`GitRepositoryId`
+- 参数在请求中的位置：`args.gitRepositoryId`
+- 需要权限：`"git.repo.disconnect"`（GitRepositoryPermissions 中定义，见 `libs/util/roles-types/src/lib/roles-permissions.types.ts` L33-L38）
+
+###### Step 2: GqlAuthGuard 守卫 → PermissionsService.validateAccess
+
+进入 [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/41-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts)，依次调用：
+- `validateAccess()` → 阶段一（工作区隔离验证）
+- `validatePermissions()` → 阶段二（权限匹配验证）
+
+###### Step 3: 阶段一 — VALIDATION_FUNCTIONS[GitRepositoryId]（**⚠️ 缺失 workspace 检查**）
+
+代码见 `packages/amplication-server/src/core/permissions/validation-functions.ts` L66-L77：
+
+```typescript
+[AuthorizableOriginParameter.GitRepositoryId]: async (
+  prisma: PrismaService,
+  originId: string,     // 即 gitRepositoryId
+  workspaceId: string   // 当前用户的 workspaceId
+) => {
+  const matching = await prisma.gitRepository.count({
+    where: {
+      id: originId,
+      // ⚠️ 关键缺失点：这里没有 join gitOrganization 校验 workspaceId
+      // 正确写法应类似：
+      // gitOrganization: { workspaceId: workspaceId }
+    },
+  });
+  return { canAccessWorkspace: matching === 1 };
+};
+```
+
+**结论（阶段一）**：只要传入任意一个存在的 GitRepository ID，无论属于哪个 workspace，`canAccessWorkspace` 都会返回 `true`。**此处完全缺失 workspace 归属验证。**
+
+作为对比，同文件中 `GitOrganizationId` 的验证函数（L51-L65）是正确的：
+```typescript
+where: {
+  id: originId,
+  workspace: { id: workspaceId },  // ✅ 有 workspace 归属检查
+}
+```
+
+###### Step 4: 阶段二 — validatePermissions
+
+代码见 `packages/amplication-server/src/core/permissions/permissions.service.ts` L49-L87，按以下顺序检查：
+1. requiredPermissions 为空？→ 通过
+2. user.permissions 含 `"*"`？→ 通过（Owner / Admins 团队成员）
+3. user.permissions（从 Team 级 Role 收集）是否包含 `"git.repo.disconnect"`？→ 通过
+4. 资源级 TeamAssignment 权限？→ GitRepository 本身不是 Resource，不走此分支
+
+**说明**：阶段二只校验**当前用户在自己 workspace 中是否拥有该权限字符串**，不校验目标 GitRepository 与当前 workspace 的关系。
+
+###### Step 5: 服务层 — GitProviderService.deleteGitRepository（**⚠️ 再次缺失 workspace 检查**）
+
+代码见 `packages/amplication-server/src/core/git/git.provider.service.ts` L433-L451：
+
+```typescript
+async deleteGitRepository(args: DeleteGitRepositoryArgs): Promise<boolean> {
+  const gitRepository = await this.prisma.gitRepository.findUnique({
+    where: {
+      id: args.gitRepositoryId,
+      // ⚠️ 缺失点：没有过滤 gitOrganization.workspaceId
+    },
+  });
+
+  if (isEmpty(gitRepository)) {
+    throw new AmplicationError(INVALID_GIT_REPOSITORY_ID);
+  }
+
+  await this.prisma.gitRepository.delete({
+    where: {
+      id: args.gitRepositoryId,
+      // ⚠️ 缺失点：同样没有 workspace 归属过滤
+    },
+  });
+
+  return true;
+}
+```
+
+**结论（服务层）**：只要通过了前两阶段的守卫，服务层直接按 ID 删除，**完全没有再次验证目标仓库属于当前 workspace**。
+
+---
+
+##### （三）链路二：updateGitRepository（更新仓库设置）
+
+完整调用链与删除相同，以下仅列出各层差异：
+
+###### Step 1: Resolver 层（`packages/amplication-server/src/core/git/git.resolver.ts` L106-L116）
+
+```typescript
+@Mutation(() => GitRepository)
+@AuthorizeContext(
+  AuthorizableOriginParameter.GitRepositoryId,   // ← 同样的参数类型
+  "where.id",                                    // ← 参数取值路径不同
+  "git.repo.settings.edit"                       // ← 所需权限不同
+)
+async updateGitRepository(
+  @Args() args: UpdateGitRepositoryArgs          // ← { where: { id }, data: {...} }
+): Promise<GitRepository> {
+  return this.gitService.updateGitRepository(args);
+}
+```
+
+###### Step 2-4: Guard + PermissionsService
+
+与 deleteGitRepository **完全相同**：
+- 阶段一调用同一个 `VALIDATION_FUNCTIONS[GitRepositoryId]` → **缺失 workspace 检查**
+- 阶段二检查权限 `"git.repo.settings.edit"` → 仅检查用户自己 workspace 中是否有该权限
+
+###### Step 5: 服务层 — GitProviderService.updateGitRepository（**⚠️ 完全透传，无任何校验**）
+
+代码见 `packages/amplication-server/src/core/git/git.provider.service.ts` L453-L457：
+
+```typescript
+async updateGitRepository(
+  args: UpdateGitRepositoryArgs
+): Promise<GitRepository> {
+  return this.prisma.gitRepository.update(args);  // ⚠️ 直接透传给 Prisma，无任何校验
+}
+```
+
+**结论**：服务层没有任何 workspace 归属校验，直接将 Prisma 的 `args`（含 `where` 和 `data`）透传执行 `update`。**风险比 delete 更高**，因为可以修改任意 workspace 的仓库设置。
+
+---
+
+##### （四）对比：哪些操作做对了 Workspace 绑定
+
+在同一个 `GitProviderService` 中，以下操作**正确地**做了 workspace 一致性校验：
+
+| 方法 | 相对路径 & 行号 | 校验方式 |
+|-----|---------------|---------|
+| `connectResourceToNewRemoteGitRepository` | `git.provider.service.ts` L283-L319 | 显式查 resource.project.workspaceId 与 gitOrganization.workspace.id 是否相等 |
+| `validateGitOrganization` | `git.provider.service.ts` L333-L381 | 通过嵌套 `workspace.projects.resources.some` 查询，确保 gitOrganization 与 resource 属于同一 workspace |
+| `VALIDATION_FUNCTIONS[GitOrganizationId]` | `validation-functions.ts` L51-L65 | 直接检查 `workspace.id === workspaceId` |
+
+**但 deleteGitRepository 和 updateGitRepository 都没有复用上述校验逻辑。**
+
+---
+
+##### （五）风险场景总结
+
+假设：
+- **Workspace A**：ID = `ws_A`，用户 `User_A` 是 Owner（permissions = `["*"]`），Team = Admins
+- **Workspace B**：ID = `ws_B`，其中有一个 GitRepository，ID = `repo_B`
+
+攻击路径：
+
+```
+User_A 已登录 ws_A，JWT 中含 workspace=ws_A, permissions=["*"]
+          │
+          ▼
+User_A 构造 GraphQL Mutation，传入 gitRepositoryId=repo_B
+          │
+          ▼
+阶段一：VALIDATION_FUNCTIONS[GitRepositoryId](repo_B, ws_A)
+       prisma.gitRepository.count({ where: { id: repo_B } })
+       → 返回 1（repo_B 确实存在）
+       → canAccessWorkspace = true  ✅ 绕过
+          │
+          ▼
+阶段二：validatePermissions(["git.repo.disconnect"], ["*"])
+       → user.permissions 含 "*"
+       → 返回 true                    ✅ 绕过
+          │
+          ▼
+服务层：prisma.gitRepository.delete({ where: { id: repo_B } })
+       → repo_B 被删除               ❌ 跨 workspace 攻击成功
+```
+
+updateGitRepository 的攻击路径完全相同，危害是可以修改其他 workspace 的仓库设置（baseBranchName、name、groupName 等字段）。
+
+---
+
 ### 4.3 阶段二：权限匹配验证
 
 通过 `packages/amplication-server/src/core/permissions/permissions.service.ts` 的 `validatePermissions` 方法（L49-L87）：
@@ -286,13 +515,13 @@ if (resource.project.workspaceId !== gitOrganization.workspace.id) {
 }
 ```
 
-### 5.3 请求守卫层：VALIDATION_FUNCTIONS 全覆盖 + 两个例外
+### 5.3 请求守卫层：VALIDATION_FUNCTIONS 全覆盖 + 三个例外
 
 如 4.2 节所述，`AuthorizableOriginParameter` 枚举中定义的 26 种资源类型全部对应了验证函数，其中：
 - **23 种**：按标准模式追溯 workspace 归属
 - **1 种（None）**：直接放行（用于无需绑定资源的操作）
-- **1 种（GitRepositoryId）**：只验证 ID 存在性，不验证 workspace 归属（间接靠权限要求保障）
-- **1 种（ApiTokenId）**：按用户所有权验证（userId 匹配）
+- **1 种（GitRepositoryId）**：只验证 ID 存在性，**不验证 workspace 归属** ⚠️ — 服务层 `deleteGitRepository` 和 `updateGitRepository` 也缺失校验，存在跨工作区风险（详见 4.2.3 节深度分析）
+- **1 种（ApiTokenId）**：按用户所有权验证（userId 匹配）— 由于一个 User 只属于一个 Workspace，天然保证了 workspace 隔离
 
 ### 5.4 数据查询层：WorkspaceId 注入
 
@@ -376,10 +605,11 @@ project: {
 | 功能 | 相对路径 |
 |-----|---------|
 | 核心模型目录 | `packages/amplication-server/src/models/` |
+| Prisma 数据库 Schema（含 GitRepository/GitOrganization 表结构） | `packages/amplication-prisma-db/prisma/schema.prisma` |
 | 用户权限计算 | `packages/amplication-server/src/core/user/user.service.ts` |
 | 授权守卫 | `packages/amplication-server/src/guards/gql-auth.guard.ts` |
 | 权限服务（含两阶段校验） | `packages/amplication-server/src/core/permissions/permissions.service.ts` |
-| 资源归属验证函数（含例外情况） | `packages/amplication-server/src/core/permissions/validation-functions.ts` |
+| 资源归属验证函数（含 GitRepositoryId 等例外情况） | `packages/amplication-server/src/core/permissions/validation-functions.ts` |
 | 授权装饰器 | `packages/amplication-server/src/decorators/authorizeContext.decorator.ts` |
 | 团队服务 | `packages/amplication-server/src/core/team/team.service.ts` |
 | 团队 Resolver（装饰器使用示例） | `packages/amplication-server/src/core/team/team.resolver.ts` |
@@ -387,6 +617,8 @@ project: {
 | 默认团队/角色配置 | `packages/amplication-server/src/core/workspace/constants.ts` |
 | 可授权参数枚举 | `packages/amplication-server/src/enums/AuthorizableOriginParameter.ts` |
 | 认证服务（含 Token 生成、工作区切换） | `packages/amplication-server/src/core/auth/auth.service.ts` |
-| Git 服务（含 workspace 一致性检查） | `packages/amplication-server/src/core/git/git.provider.service.ts` |
-| Git Resolver（装饰器使用示例） | `packages/amplication-server/src/core/git/git.resolver.ts` |
+| Git 服务（含 deleteGitRepository、updateGitRepository、connectResourceToNewRemoteGitRepository） | `packages/amplication-server/src/core/git/git.provider.service.ts` |
+| Git Resolver（deleteGitRepository、updateGitRepository 装饰器声明） | `packages/amplication-server/src/core/git/git.resolver.ts` |
+| Git 相关 DTO（DeleteGitRepositoryArgs、UpdateGitRepositoryArgs） | `packages/amplication-server/src/core/git/dto/` |
 | 项目服务（含查询层 workspace 校验） | `packages/amplication-server/src/core/project/project.service.ts` |
+| 权限字符串类型定义（含 git.repo.* 权限） | `libs/util/roles-types/src/lib/roles-permissions.types.ts` |
