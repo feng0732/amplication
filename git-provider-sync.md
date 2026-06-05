@@ -667,3 +667,351 @@ isBuildStale(build: Build): boolean {
 | `Success` | 步骤成功 |
 | `Failed` | 步骤失败 |
 | `Skipped` | 步骤跳过 |
+
+---
+
+## 七、失败反馈边界分析
+
+### 7.1 创建 PR 请求失败的边界情况
+
+#### 7.1.1 Kafka 消息发送失败边界
+
+**KafkaProducerService.emitMessage() 的实现：
+
+[KafkaProducer.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts)
+
+```typescript
+async emitMessage(topic, message, schemaIds) {
+  const kafkaMessage = await this.serializer.serialize(message, schemaIds);
+  return await new Promise((resolve, reject) => {
+    this.kafkaClient.emit(topic, kafkaMessage).subscribe({
+      error: (err) => reject(err),   // Kafka broker 不可达 / 发送异常
+      next: () => resolve(),          // 仅表示消息已被 producer 缓冲
+    });
+  });
+}
+```
+
+**边界 1：emitMessage 的 `next` 回调仅确认消息进入 producer 缓冲区，不保证 broker 已持久化。此时若 broker 宕机，消息会丢失。
+
+**saveToGitProvider 中对 emitMessage 的异常处理：
+
+代码位置：[build.service.ts:L1285-L1342](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/build/build.service.ts#L1285-L1342)
+
+```typescript
+return this.actionService.run(build.actionId, PUSH_TO_GIT_STEP_NAME, ..., async (step) => {
+  try {
+    await this.actionService.logInfo(step, PUSH_TO_GIT_STEP_START_LOG);
+    // ... 构造 createPullRequestEvent
+    await this.kafkaProducerService.emitMessage(
+      KAFKA_TOPICS.CREATE_PR_REQUEST_TOPIC,
+      createPullRequestEvent
+    );
+  } catch (error) {
+    // ❌ 边界 2：这里只打印日志，但不标记步骤失败，不更新 build.gitStatus
+    logger.error("Failed to emit Create Pull Request Message.", error);
+  }
+}, true);  // true = leaveStepOpenAfterSuccessfulExecution
+```
+
+| 失败场景 | 后果 | 用户感知 |
+|---|---|---|
+| emitMessage 抛异常（Kafka 不可达） | 仅打印 logger.error，PUSH_TO_GIT 步骤保持 Running，build.gitStatus 保持 Waiting | ❌ Build 状态永不结束，前端轮询永远 Running，直到 5h 后被 isBuildStale 标记 Failed |
+| emitMessage 成功但 broker 未持久化 | 消息丢失，同上 | 同上 |
+| git-sync-manager 消费后处理异常 | CREATE_PR_FAILURE_TOPIC 正常发出，走 onCreatePRFailure | ✅ 正常失败反馈 |
+
+**边界 3：ActionService.run() 的异常传播逻辑：
+
+[action.service.ts:L275-L295](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/action/action.service.ts#L275-L295)
+
+```typescript
+async run<T>(actionId, stepName, message, stepFunction, leaveStepOpenAfterSuccessfulExecution) {
+  const step = await this.createStep(actionId, stepName, message);
+  try {
+    const result = await stepFunction(step);
+    if (!leaveStepOpenAfterSuccessfulExecution) {
+      await this.complete(step, EnumActionStepStatus.Success);
+    }
+    return result;
+  } catch (error) {
+    this.logger.error(error.message, error);
+    await this.log(step, EnumActionLogLevel.Error, error.message);
+    await this.complete(step, EnumActionStepStatus.Failed);
+    throw error;
+  }
+}
+```
+
+由于 saveToGitProvider 中 stepFunction 内部的 try/catch 吞掉了 emitMessage 异常，run() 不会走到 catch 分支。
+
+#### 7.1.2 长任务心跳机制
+
+git-sync-manager 中使用 KafkaPacemaker 防止 consumer 防止 rebalance：
+
+[pacemaker.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/pacemaker/pacemaker.service.ts)
+
+```typescript
+static async wrapLongRunningMethod<T>(kafkaContext, fn, timeout = 3000) {
+  const heartbeat = kafkaContext.getHeartbeat();
+  // 每 3s 发送一次心跳，防止 consumer 被认为挂起
+  while (!isFnDone) {
+    await Promise.race([fnPromise, sleep(timeout)]);
+    try {
+      await heartbeat();
+    } catch (error) {
+      // swallow the error - heartbeat 失败不影响业务执行
+    }
+  }
+}
+```
+
+边界：心跳失败被静默吞掉，若长时间心跳全部失败，consumer group rebalance，消息可能被重复消费，但不会触发重复创建 PR。
+
+#### 7.1.3 NoChangesOnPullRequest 特殊处理
+
+[pull-request.controller.ts:L116-L135](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L116-L135)
+
+```typescript
+} catch (error) {
+  if (error instanceof NoChangesOnPullRequest) {
+    await this.log(validArgs.newBuildId, LogLevel.Warn, "Hey there! Looks like your code hasn't changed since the last build...");
+    await this.producerService.emitMessage(KAFKA_TOPICS.CREATE_PR_SUCCESS_TOPIC, {
+      value: { url: error.pullRequestUrl, gitProvider, buildId }
+    });
+    return;
+  }
+  // 其他错误走 FAILURE
+}
+```
+
+边界：无变更场景作为 SUCCESS 回传，build.status 被标记 Completed，但 diffStat 为 undefined。
+
+---
+
+### 7.2 前端读取同步消息路径
+
+#### 7.2.1 后端写入路径
+
+reportSyncMessage() 实际更新的字段：
+
+[resource.service.ts:L1585-L1609](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1585-L1609)
+
+```typescript
+async reportSyncMessage(resourceId, message) {
+  return this.prisma.resource.update({
+    where: { id: resourceId },
+    data: {
+      githubLastMessage: message,    // 同步消息文本
+      githubLastSync: new Date(), // 同步时间戳
+    }
+  });
+}
+```
+
+Resource GraphQL 模型暴露字段：
+
+[Resource.ts:L71-L79](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/models/Resource.ts#L71-L79)
+
+```typescript
+@Field(() => String, { nullable: true })
+githubLastMessage?: string;
+
+@Field(() => Date, { nullable: true })
+githubLastSync?: Date;
+```
+
+注意：字段命名为 githubLast* 但实际用于所有 Git Provider（不限于 GitHub）。
+
+#### 7.2.2 前端查询路径
+
+**资源列表查询 GET_RESOURCES：**
+
+[resourcesQueries.ts:L57-L141](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/Workspaces/queries/resourcesQueries.ts#L57-L141)
+
+```graphql
+query getResources($where: ...) {
+  resources(...) {
+    id
+    githubLastSync          // 前端只请求了 githubLastSync，没有请求 githubLastMessage
+    gitRepository { ... }
+    builds(orderBy: { createdAt: Desc }, take: 1) {
+      id
+      status          // 最后一个 build 的状态
+      gitStatus     // ❌ 列表页不包含 gitStatus
+    }
+  }
+}
+```
+
+**单个资源查询 GET_RESOURCE：
+
+[resourcesQueries.ts:L48-L55](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/Workspaces/queries/resourcesQueries.ts#L48-L55)
+
+```graphql
+query getResource($id: String!) {
+  resource(where: { id: $id }) {
+    ...ResourceFields  // 包含 githubLastSync + githubLastMessage
+  }
+}
+```
+
+**ResourceGitStatusPanel 组件展示：
+
+[ResourceGitStatusPanel.tsx:L36-L90](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/Resource/git/ResourceGitStatusPanel.tsx#L36-L90)
+
+```tsx
+const lastSync = resource?.githubLastSync
+  ? new Date(resource.githubLastSync)
+  : null;
+const lastSyncDate = lastSync ? format(lastSync, DATE_FORMAT) : "Never";
+// ❌ 仅展示 Last sync 时间，不展示 githubLastMessage 内容
+```
+
+#### 7.2.3 Build 详情轮询
+
+前端通过 useBuildWatchStatus hook 每 5 秒轮询一次：
+
+[useBuildWatchStatus.tsx:L7-L48](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/VersionControl/useBuildWatchStatus.tsx#L7-L48)
+
+```typescript
+const POLL_INTERVAL = 5000;
+
+const useBuildWatchStatus = (build) => {
+  const { data, startPolling, stopPolling, refetch } = useQuery(GET_BUILD, {
+    variables: { buildId: build?.id },
+    skip: !shouldReload(build),
+  });
+
+  useEffect(() => {
+    if (!shouldReload(data?.build)) {
+      stopPolling();
+    } else {
+      startPolling(POLL_INTERVAL);
+    }
+    data && commitUtils.updateBuildStatus(data.build);
+  }, [data, ...]);
+
+  // Build 完成（非 Running 状态才停止轮询
+  function shouldReload(build) {
+    return build?.status === models.EnumBuildStatus.Running;
+  }
+```
+
+GET_BUILD 查询字段包含 action.steps.logs：
+
+[useBuildWatchStatus.tsx:L56-L97](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/VersionControl/useBuildWatchStatus.tsx#L56-L97)
+
+```graphql
+query build($buildId: String!) {
+  build(where: { id: $buildId }) {
+    id
+    status
+    action {
+      steps {
+        name
+        status
+        logs {
+          message    // 步骤日志（含错误信息）
+          level
+        }
+      }
+    }
+  }
+}
+```
+
+ActionLog 组件渲染步骤日志：
+
+[ActionLog.tsx:L47-L206](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-client/src/VersionControl/ActionLog.tsx#L47-L206)
+
+```tsx
+// 根据 step.status 判断整体 Action 状态
+// step.logs 渲染每一步的日志（红色 Error 级别显示红色）
+```
+
+| 信息获取路径 | 包含错误信息 | 展示位置 |
+|---|---|---|
+| Resource.githubLastMessage | "Error: xxx" | ❌ 后端写入，但 ResourceGitStatusPanel 不展示 |
+| Build.action.steps.logs | 步骤详细日志 | BuildPage 日志面板 |
+| Build.status / Build.gitStatus | Completed/Failed 状态码 | BuildPage 顶部、Commit 列表 |
+
+---
+
+### 7.3 状态刷新机制
+
+#### 7.3.1 后端动态计算 Build 状态
+
+BuildResolver.status ResolveField：
+
+[build.resolver.ts:L78-L88](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/build/build.resolver.ts#L78-L88)
+
+```typescript
+@ResolveField()
+status(@Parent() build: Build): Promise<EnumBuildStatus> {
+  if (this.service.isBuildStale(build)) {
+    return this.service.calcBuildStatus(build.id);  // 每次查询都重新计算
+  }
+  if (build.status === EnumBuildStatus.Unknown) {
+    return this.service.calcBuildStatus(build.id);
+  }
+  return Promise.resolve(EnumBuildStatus[build.status]);
+}
+```
+
+isBuildStale 判断超时：
+
+[build.service.ts:L1547-L1561](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/build/build.service.ts#L1547-L1561)
+
+```typescript
+isBuildStale(build) {
+  if (build.status === EnumBuildStatus.Running) {
+    const stalePeriod = 5 * 60 * 60 * 1000; // 5 小时
+    if (Date.now() - build.createdAt.getTime() > stalePeriod) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+calcBuildStatus 根据 steps 计算最终状态：
+
+[build.service.ts:L1563-L1618](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/packages/amplication-server/src/core/build/build.service.ts#L1563-L1618)
+
+```typescript
+async calcBuildStatus(buildId) {
+  const build = await this.prisma.build.findUnique({ include: ACTION_INCLUDE });
+
+  if (this.isBuildStale(build)) {
+    await this.updateBuildStatuses(buildId, EnumBuildStatus.Failed, EnumBuildGitStatus.Failed);
+    return EnumBuildStatus.Failed;
+  }
+
+  if (build.status !== EnumBuildStatus.Unknown)
+    return build.status as EnumBuildStatus;
+
+  // 重新计算：所有 steps 状态聚合
+  if (steps.every(step => step.status === Success) return Completed
+  if (steps.some(step => step.status === Failed)) return Failed
+  // 兜底：Unknown 全部置为 Failed
+}
+```
+
+#### 7.3.2 前端状态刷新触发
+
+| 刷新机制 | 触发时机 | 覆盖场景 |
+|---|---|---|
+| useBuildWatchStatus 轮询（5s） | BuildPage 打开时 | Running 状态期间每 5 秒查询一次 build 查询时触发后端 calcBuildStatus 动态计算 |
+| 普通 useQuery refetch | 页面切换/返回时 | 返回 BuildPage/Commit 列表查询 builds.status ResolveField 动态计算 |
+| isBuildStale 兜底 | 每次 status 时判断 | Running 超过 5h 小时标记 Failed 并落库 |
+
+#### 7.3.3 状态不一致边界场景
+
+| 场景 | build.status DB 值 | 前端展示 | 恢复方式 |
+|---|---|---|---|
+| Kafka CREATE_PR_REQ 发送失败（被 catch 被吞掉） | Running | 永久 Running 5 秒轮询 → 5h 后 isBuildStale 自动标记 Failed |
+| git-sync-manager 处理中崩溃，还没回传结果 | Running | Running 同上 |
+| CREATE_PR_SUCCESS_TOPIC/Kafka 消息送达但 onCreatePRSuccess 内部异常 | Running（成功回调 catch 降级为 Failed 并落库） | Failed 下次查询展示 Failed | ✅ 正常失败反馈 |
+| 前端长时间不查询不刷新 | Running/Unknown | calcBuildStatus 重算 |
+
+
