@@ -662,7 +662,138 @@ LimitationDialog → Dialog → 第一层守卫:
   按钮仍可继续点击（仅由 commitChangesLoading 控制 disabled，错误时 loading=false）
 ```
 
-#### 6.5.3 Billing 错误在其它消费点的降级处理
+#### 6.5.3 bypassAllowed、Later 按钮与 bypassLimitations 完整映射链路
+
+Billing 错误涉及 **三个概念**，分布在服务端和前端不同层面，容易混淆。以下是它们的完整映射关系：
+
+| 概念 | 类型 | 定义位置 | 含义 |
+|------|------|---------|------|
+| **bypassAllowed** | extensions 字段（服务端→客户端） | [BillingLimitationError.ts#L8](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/errors/BillingLimitationError.ts#L8) <br/> → [GqlResolverExceptions.filter.ts#L64-L69](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/filters/GqlResolverExceptions.filter.ts#L64-L69) <br/> → [GraphQLBillingError.ts#L11-L13](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/errors/graphql/graphql-billing-limitation-error.ts#L11-L13) | 服务端声明的"该限制是否允许被绕过"。BillingLimitationError 构造函数默认值 `= true`，所有当前抛出的 Billing 限制均声明为可绕过 |
+| **allowBypassLimitation** | LimitationDialog 组件 prop（控制 Later 按钮显隐） | [LimitationDialog.tsx#L14-L17](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/LimitationDialog/LimitationDialog.tsx#L14-L17) + [LimitationDialog.tsx#L62-L70](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/LimitationDialog/LimitationDialog.tsx#L62-L70) | `true` 时在弹窗上显示"Later"按钮，用户可选择先跳过限制 |
+| **bypassLimitations（前端计算值）** | boolean（useCommits 中 useMemo） | [useCommits.ts#L212-L217](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/hooks/useCommits.ts#L212-L217) | `currentWorkspace.subscription.subscriptionPlan !== EnumSubscriptionPlan.Pro` <br/> 即"用户当前不是 Pro 付费用户"时为 `true`。该值被作为 `allowBypassLimitation` 传给 LimitationDialog，也作为 `bypassLimitationsRef` 的初始值 |
+| **bypassLimitations（mutation 参数）** | GraphQL 变量（客户端→服务端） | [CommitCreateInput.ts#L24-L30](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/resource/dto/CommitCreateInput.ts#L24-L30) | CommitButton 通过 `bypassLimitationsRef.current` 传给 `commitChanges(data)`，再由 `useMutation COMMIT_CHANGES` 作为变量 `data.bypassLimitations` 提交给服务端。描述为："It will bypass the limitations of the plan (if any). It will only work for limitation that support commit bypass." |
+| **bypassLimitations（服务端参数）** | billing.service 方法参数 | [billing.service.types.ts#L9-L15](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/billing/billing.service.types.ts#L9-L15) | 接收到客户端传来的 `bypassLimitations=true` 时，服务端在校验函数开头直接 `return`，跳过全部套餐限制检查 |
+
+##### 6.5.3.1 服务端 bypass 判定逻辑
+
+[billing.service.ts#L311-L405](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/billing/billing.service.ts#L311-L405) 的 `validateSubscriptionPlanLimitationsForWorkspace` 是核心校验函数：
+
+```typescript
+async validateSubscriptionPlanLimitationsForWorkspace({
+  workspaceId, currentUser, repositories,
+  bypassLimitations = false,   // ← 来自 CommitCreateInput.bypassLimitations
+}: ValidateSubscriptionPlanLimitationsArgs): Promise<void> {
+  if (this.isBillingEnabled) {
+    // 两个放行条件，任一满足则跳过全部限制检查：
+    // 1. 客户端显式传入 bypassLimitations=true（用户点击了 Later 按钮）
+    // 2. 订阅拥有 IgnoreValidationCodeGeneration 高级特性（Enterprise 等）
+    const isIgnoreValidationCodeGeneration = await this.getBooleanEntitlement(
+      workspaceId, BillingFeature.IgnoreValidationCodeGeneration
+    );
+    if (bypassLimitations || isIgnoreValidationCodeGeneration.hasAccess) {
+      return;   // ✅ 直接放行，不做任何限制检查
+    }
+
+    // 否则依次检查各 entitlement，不满足则 throw BillingLimitationError
+    const servicesEntitlement = await this.getMeteredEntitlement(workspaceId, BillingFeature.Services);
+    if (!servicesEntitlement.hasAccess) {
+      throw new BillingLimitationError(
+        "Your workspace exceeds its resource limitation.",
+        BillingFeature.Services
+        // 注意：BillingLimitationError 构造函数第 3 个参数 bypassAllowed 未显式传入
+        // 因此使用默认值 = true — 即"该限制允许被绕过"
+      );
+    }
+    // ... 继续检查 TeamMembers、企业 Git Provider、自定义 Git Base Branch 等
+  }
+}
+```
+
+**关键发现**：服务端所有当前 `throw new BillingLimitationError(message, feature)` 的调用都使用默认构造，第三个参数 `bypassAllowed` 采用默认值 `true`。因此 extensions 中返回的 `bypassAllowed` 当前恒为 `true`。
+
+##### 6.5.3.2 前端 Later 按钮与 bypassLimitationsRef 的交互
+
+CommitButton 中的交互流程（[CommitButton.tsx#L73](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L73) 与 [CommitButton.tsx#L189-L198](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L189-L198)）：
+
+```tsx
+// 初始值为 useCommits 返回的 bypassLimitations（= 非 Pro 用户为 true）
+const bypassLimitationsRef = useRef(bypassLimitations);
+
+// LimitationDialog 的 Later 按钮点击回调
+onBypass={() => {
+  bypassLimitationsRef.current = true;    // 设置 ref，下次 commit 将带 bypassLimitations: true
+  trackEvent({ eventName: AnalyticsEventNames.UpgradeLaterClick, ... });
+  setOpenLimitationDialog(false);         // 关闭弹窗
+}}
+```
+
+`bypassLimitationsRef.current` 在下次用户点击按钮时被提交到 [CommitButton.tsx#L97-L103](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L97-L103)：
+
+```tsx
+commitChanges({
+  message: commitMessage,
+  project: { connect: { id: currentProject?.id } },
+  bypassLimitations: bypassLimitationsRef.current ?? false,  // ← ref 的值作为参数
+  commitStrategy: strategy,
+  resourceTypeGroup,
+});
+```
+
+##### 6.5.3.3 重要不一致：前端用 `!== Pro` 决定按钮显隐，而非服务端的 `bypassAllowed`
+
+LimitationDialog 显示 Later 按钮的条件是 `allowBypassLimitation={bypassLimitations}`（[CommitButton.tsx#L169](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L169)），而 `bypassLimitations` 的计算逻辑是：
+
+```typescript
+// useCommits.ts
+const bypassLimitations = useMemo(() => {
+  return (
+    currentWorkspace?.subscription?.subscriptionPlan !==
+    EnumSubscriptionPlan.Pro
+  );
+}, [currentWorkspace]);
+```
+
+**⚠️ 不一致点**：前端"是否显示 Later 按钮"的依据是**订阅计划是否为 Pro**，而不是服务端在 extensions 中返回的 `bypassAllowed` 字段。当前所有 Billing 限制 `bypassAllowed` 默认均为 `true`，因此不会出问题，但语义上存在偏差：
+- 如果未来某个限制 `bypassAllowed=false`（不允许绕过），前端仍会对非 Pro 用户显示 Later 按钮，用户点击后服务端仍会拒绝
+- 对 Pro 用户，即使某个限制允许绕过，前端也不会显示 Later 按钮（因为 Pro 用户 `bypassLimitations=false`，而 Pro 用户本来就不受这些限制，实际无影响）
+
+##### 6.5.3.4 Later 按钮完整重试流程图
+
+```
+【首次提交】
+用户点击"Generate the code"
+        │
+        ▼
+bypassLimitationsRef.current = 初始值（非 Pro = true, Pro = false）
+        │
+        ▼
+commitChanges({ bypassLimitations: ref.current })
+        │
+        ▼
+服务端 validateSubscriptionPlanLimitationsForWorkspace:
+  bypassLimitations = true  → 直接 return（放行）✅
+  bypassLimitations = false → 检查 entitlements，不满足则 throw BillingLimitationError
+                                  extensions.bypassAllowed = true（默认）
+        │
+        ▼
+【若 Billing 错误被正确显示（当前实际不可见，见 P1 Bug）】
+用户看到 LimitationDialog：
+  • Upgrade 按钮（始终显示）
+  • Later 按钮（仅当 allowBypassLimitation = bypassLimitations = 非 Pro 时显示）
+        │
+        ├─ 用户点 Upgrade ─► history.push('/{workspace}/purchase') 跳转付费页
+        ├─ 用户点 Dismiss ─► bypassLimitationsRef.current = false（仍受限，下次提交仍失败）
+        └─ 用户点 Later   ─► bypassLimitationsRef.current = true（下次提交带 bypassLimitations: true）
+                                   │
+                                   ▼
+                            用户再次点击"Generate the code"
+                            commitChanges({ bypassLimitations: true })
+                                   │
+                                   ▼
+                            服务端 if (bypassLimitations) return; ✅ 直接放行
+```
+
+#### 6.5.4 Billing 错误在其它消费点的降级处理
 
 `PublishTemplatesChangesButton.tsx` 等其它使用 `useCommits` 的组件并未处理 billing 分支，它们直接：
 
@@ -673,7 +804,7 @@ const errorMessage = formatError(commitChangesError);
 <Snackbar open={Boolean(errorMessage)} message={errorMessage} />
 ```
 
-即即使返回的是 `BILLING_LIMITATION_ERROR`，也会退化为普通 Snackbar 文本提示 `"LimitationError: ..."`，没有升级引导弹窗。
+即即使返回的是 `BILLING_LIMITATION_ERROR`，也会退化为普通 Snackbar 文本提示 `"LimitationError: ..."`，没有升级引导弹窗，自然也没有 Later 按钮和 bypass 重试能力。
 
 ---
 
@@ -715,6 +846,8 @@ const errorMessage = formatError(commitChangesError);
 | **minimumValue < maximumValue** | [formikValidateJsonSchema.ts#L52-L62](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/util/formikValidateJsonSchema.ts#L52-L62) 跨字段自定义 | [entity.service.ts#L151-L152](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L151-L152) `NUMBER_WITH_INVALID_MINIMUM_VALUE` | ✅ 逻辑相同（错误文案略有差异：`greater than, or equal to,` vs `greater than or equal to,`） |
 | **错误提示字段绑定** <br/> Formik `<ErrorMessage name>` | [NameField.tsx#L43-L46](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L43-L46) <br/> [TopicNameField.tsx#L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/TopicNameField.tsx#L32-L35) <br/> 均硬编码 `name="name"` | — | ⚠️ 前端 Bug：当表单字段名不是 `"name"` 时错误提示不显示，但校验仍阻止提交 |
 | **Billing 弹窗 isOpen 状态同步** <br/> 错误出现时自动打开弹窗 | `useCommits` hook 中 `onError` → `setOpenLimitationDialog(true)` | — | ❌ 状态未消费（三元互斥 + 双重守卫导致 **完全无提示**：`CommitButton` 解构 hook 时忽略该状态，本地 state 永远 `false`；三元表达式进入第一个分支时 Snackbar 完全不渲染（互斥）；同时 LimitationDialog 的 Dialog 外层守卫又因 isOpen=false 返回 null（见 §6.5.2.1-6.5.2.3 完整分析） |
+| **Billing bypassAllowed 与 Later 按钮显隐映射** <br/> 服务端 extensions.bypassAllowed 控制前端是否显示"Later"按钮 | 前端用 `subscriptionPlan !== Pro` 计算的 `bypassLimitations` 作为 `allowBypassLimitation` 传给 LimitationDialog；服务端返回的 `extensions.bypassAllowed` 未被读取 | 服务端 BillingLimitationError 构造函数默认 `bypassAllowed = true`（所有限制恒可绕过） | ⚠️ **语义不一致**：前端"显示 Later 按钮"依据订阅类型，而非服务端声明的 bypassAllowed。若未来出现 `bypassAllowed=false` 的限制，前端仍会对非 Pro 用户显示 Later 按钮，用户点击后服务端仍会拒绝 |
+| **bypassLimitations 参数放行逻辑** <br/> 前端传 `bypassLimitations=true` 时服务端是否真正跳过限制检查 | `CommitButton` → `commitChanges({ bypassLimitations: ref.current })` → mutation 变量 `data.bypassLimitations` | [billing.service.ts#L323-L325](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/billing/billing.service.ts#L323-L325) <br/> `if (bypassLimitations || isIgnoreValidationCodeGeneration.hasAccess) { return; }` 直接跳过全部 entitlement 检查 | ✅ 一致：前端传 `true` → 服务端立即 return 放行（或高级订阅本身具备 IgnoreValidationCodeGeneration 特性时也自动放行） |
 
 > **设计提示**：前端注释 `/** @todo share code with server */`（[NameField.tsx#L6](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L6)）明确指出 NAME_REGEX 等规则未来应抽成共享库以避免前后端漂移。
 
@@ -745,6 +878,11 @@ const errorMessage = formatError(commitChangesError);
 | 前端 Billing 弹窗按钮 | [CommitButton.tsx](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx)（⚠️ isOpen 永远 false，状态未同步） |
 | 设计系统 - Dialog 基础组件 | [Dialog.tsx](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/Dialog/Dialog.tsx)（isOpen 双重守卫） |
 | 设计系统 - LimitationDialog 组件 | [LimitationDialog.tsx](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/LimitationDialog/LimitationDialog.tsx) |
+| 服务端 Billing 校验核心 | [billing.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/billing/billing.service.ts)（validateSubscriptionPlanLimitationsForWorkspace） |
+| 服务端 Billing 校验参数类型 | [billing.service.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/billing/billing.service.types.ts) |
+| Billing 错误（业务类） | [BillingLimitationError.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/errors/BillingLimitationError.ts)（含 bypassAllowed 默认值） |
+| Billing 错误（GraphQL 类） | [GraphQLBillingError.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/errors/graphql/graphql-billing-limitation-error.ts)（透传 bypassAllowed 到 extensions） |
+| Commit DTO（含 bypassLimitations 参数） | [CommitCreateInput.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/resource/dto/CommitCreateInput.ts) |
 | 前端通用错误展示组件 | [ErrorMessage.tsx](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/ErrorMessage.tsx) |
 
 ---
@@ -758,3 +896,4 @@ const errorMessage = formatError(commitChangesError);
 | P3 | **NameField 错误绑定硬编码**：`<ErrorMessage name="name" />` 写死为字符串，不随 props 动态变化 | [NameField.tsx#L43-L46](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L43-L46) | 表单字段名不是 `"name"` 时，校验仍阻止提交但错误提示不显示在字段下方 |
 | P4 | **TopicNameField 错误绑定硬编码**：同上 | [TopicNameField.tsx#L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/TopicNameField.tsx#L32-L35) | 同上 |
 | P5 | **前端缺失保留字校验**：60+ 关键字（`class`、`auth`、`field` 等）在前端无即时校验，仅服务端拦截 | [reservedNames.ts](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/entity/reservedNames.ts) | 用户输入保留字后必须等到服务端返回才知道失败，且更新 entity 时才会抛出 `ReservedNameError`（创建时服务端自动加 `Model`/`Field` 后缀静默修复） |
+| P6 | **Billing bypassAllowed 语义不一致**：前端"是否显示 Later 按钮"由 `subscriptionPlan !== Pro` 本地计算，而非读取服务端返回的 `extensions.bypassAllowed`。所有当前 BillingLimitationError 的 `bypassAllowed` 默认均为 `true`，暂无实害 | [useCommits.ts#L212-L217](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/hooks/useCommits.ts#L212-L217) + [BillingLimitationError.ts#L8](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/errors/BillingLimitationError.ts#L8) | 若未来出现 `bypassAllowed=false`（不允许绕过）的限制，前端仍会对非 Pro 用户显示 Later 按钮，用户点击后再次提交仍被服务端拒绝 |
