@@ -277,21 +277,32 @@ OutdatedVersionAlertService.create() → raiseNotifications()
 
 ## 三、成员（User/Member）事件路径
 
-**场景**：用户登录或切换工作区时，在 Novu 中创建/删除订阅者，为后续通知做准备。
+**场景**：前端请求 `currentWorkspace` GraphQL Query 时，同步检查通知权限并在 Novu 中创建/删除订阅者，为后续通知做准备。
 
 ### 完整路径图
 
 ```
-用户登录 / 切换工作区
+前端打开工作区页面
     │
-    ▼ (Auth 流程中调用)
+    ▼ 调用 GraphQL Query
+WorkspaceResolver.currentWorkspace(currentUser)
+                                    [workspace.resolver.ts#L79-L92]
+    │  执行顺序:
+    │  ① analytics.trackWithContext(WorkspaceSelected)
+    │  ② setLastActivity(userId)
+    │  ③ setNotificationRegistry(user) ← 调用通知注册
+    │
+    ▼
 UserService.setNotificationRegistry(user)     [user.service.ts#L175-L202]
     │
-    ▼
-检查 BillingFeature.Notification 权限 → canShowUserNotification
+    ├─ 生成 externalId = encryptString(user.id)
+    ├─ 调用 BillingService.getBooleanEntitlement(
+    │      user.workspace.id, BillingFeature.Notification)
+    │      → canShowUserNotification = hasAccess
     │
-    ▼
-发送 USER_ACTION_TOPIC Kafka 消息
+    └─ 发送 USER_ACTION_TOPIC Kafka 消息:
+          action = UserActionType.CURRENT_WORKSPACE
+          enableUser = canShowUserNotification
     │
     ▼
 notification-service AppController.subscribeNotification()
@@ -305,24 +316,53 @@ subscribeUser() 中间件处理                    [subscribeUser.ts]
 
 ### 关键代码位置
 
-1. **消息发送**：[user.service.ts#L175-L202](packages/amplication-server/src/core/user/user.service.ts#L175-L202)
+1. **GraphQL 触发入口（唯一调用点）**：[workspace.resolver.ts#L79-L92](packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
+
+   `setNotificationRegistry` 在全仓库中**只被这一处调用**，不存在于 Auth 登录流程或其他位置。
 
    ```typescript
-   this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_ACTION_TOPIC, <UserAction.KafkaEvent>{
-     value: {
-       userId, externalId: encryptString(user.id),
-       firstName, lastName, email,
-       action: UserActionType.CURRENT_WORKSPACE,
-       enableUser: canShowUserNotification,
-     },
-   })
+   @Query(() => Workspace, { nullable: true })
+   async currentWorkspace(@UserEntity() currentUser: User): Promise<Workspace | null> {
+     await this.analytics.trackWithContext({ event: EnumEventType.WorkspaceSelected });
+     await this.userService.setLastActivity(currentUser.id);
+     const externalId = await this.userService.setNotificationRegistry(currentUser);  // ← 唯一调用
+     return { ...currentUser.workspace, externalId };
+   }
    ```
 
-2. **订阅处理**：[subscribeUser.ts](packages/notification-service/src/notification-packages/subscribeUser.ts)
+2. **消息发送（setNotificationRegistry 实现）**：[user.service.ts#L175-L202](packages/amplication-server/src/core/user/user.service.ts#L175-L202)
 
-3. **消息 Schema / Action 类型**：[user-action/value.ts](libs/schema-registry/src/lib/user-action/value.ts)
+   ```typescript
+   async setNotificationRegistry(user: User) {
+     const externalId = encryptString(user.id);
+     const booleanEntityUserNotification =
+       await this.billingService.getBooleanEntitlement(
+         user.workspace.id,
+         BillingFeature.Notification          // feature-notifications
+       );
+     const canShowUserNotification = booleanEntityUserNotification?.hasAccess;
 
-### UserActionType 枚举
+     this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_ACTION_TOPIC, <UserAction.KafkaEvent>{
+       key: {},
+       value: {
+         userId: user.account.id,
+         externalId,
+         firstName: user.account.firstName,
+         lastName: user.account.lastName,
+         email: user.account.email,
+         action: UserAction.UserActionType.CURRENT_WORKSPACE,  // ← 固定值
+         enableUser: canShowUserNotification,                  // ← 由权限决定
+       },
+     });
+     return externalId;
+   }
+   ```
+
+3. **订阅处理**：[subscribeUser.ts](packages/notification-service/src/notification-packages/subscribeUser.ts)
+
+4. **消息 Schema / Action 类型**：[user-action/value.ts](libs/schema-registry/src/lib/user-action/value.ts)
+
+### UserActionType 枚举与实际使用的对应关系
 
 ```typescript
 enum UserActionType {
@@ -330,11 +370,13 @@ enum UserActionType {
   LOGIN = "login",
   UPDATE = "update",
   DELETE = "delete",
-  CURRENT_WORKSPACE = "currentWorkspace", // 实际使用的类型
+  CURRENT_WORKSPACE = "currentWorkspace", // ← setNotificationRegistry 固定使用此值
 }
 ```
 
-> **注意**：当前代码中 `setNotificationRegistry` 固定使用 `CURRENT_WORKSPACE` action 类型，而 subscribeUser 中间件并未区分 action 类型，仅根据 `enableUser` 布尔值判断创建或删除订阅者。
+> **关键点**：
+> - `CURRENT_WORKSPACE` 不是"用户切换工作区"的语义，而是对应 `currentWorkspace` 这个 GraphQL Query 的命名。每次调用该 Query（如前端打开工作区页面、刷新页面等）都会触发一次通知注册同步。
+> - subscribeUser 中间件**并不区分** action 类型，仅根据 `enableUser` 布尔值判断创建或删除 Novu 订阅者。
 
 ### Stigg Webhook → 订阅更新 → 通知权限变化 的完整链路
 
@@ -353,17 +395,36 @@ SubscriptionController.updateStatus()     [subscription.controller.ts#L20-L32]
 SubscriptionService.handleUpdateSubscriptionStatusEvent()
                                             [subscription.service.ts#L261-L332]
     │
-    ├─ 事件类型: subscription.created / .updated / .expired / .canceled
-    │     → prisma.subscription.upsert()  写入/更新 DB 订阅记录
-    │     → subscription.created/.updated 额外触发:
-    │           updateProjectLicensed(workspaceId)
-    │           updateServiceLicensed(workspaceId)
+    ├═══════════════════════════════════════════════════════════════╗
+    │ 分支 A: subscription.*（4 种事件）                               ║
+    │   "subscription.created" / "subscription.updated"              ║
+    │   "subscription.expired" / "subscription.canceled"             ║
+    │                                                                 ║
+    │   switch 内执行:                                                 ║
+    │   → prisma.subscription.upsert()  ← 所有 4 种事件都执行        ║
+    │       create: id, workspaceId, status, subscriptionPlan        ║
+    │       update: 仅 status                                          ║
+    │                                                                 ║
+    │   switch 后追加执行（仅部分事件）:                                ║
+    │   → subscription.created: trackUpgradeCompletedEvent()          ║
+    │   → subscription.created/.updated:                              ║
+    │         updateProjectLicensed(workspaceId)                      ║
+    │         updateServiceLicensed(workspaceId)                      ║
+    │   → subscription.expired/.canceled: ❌ 不更新 licensed 字段    ║
+    ├═══════════════════════════════════════════════════════════════╣
+    │ 分支 B: promotionalEntitlement.*（4 种事件）                     ║
+    │   "promotionalEntitlement.granted" / ".updated"                ║
+    │   "promotionalEntitlement.revoked" / ".expired"                ║
+    │                                                                 ║
+    │   switch 内执行:                                                 ║
+    │   → ❌ 不写 subscription 表                                     ║
+    │   → ✅ 所有 4 种事件都执行:                                     ║
+    │         updateProjectLicensed(workspaceId)                      ║
+    │         updateServiceLicensed(workspaceId)                      ║
+    ┚═══════════════════════════════════════════════════════════════╝
     │
-    └─ 事件类型: promotionalEntitlement.granted / .updated / .revoked / .expired
-          → 不写 subscription 表
-          → 直接触发 updateProjectLicensed() / updateServiceLicensed()
-    │
-    │ （注意：此处不会立即发送任何 Kafka 通知消息）
+    │ ⚠  重要: 以上所有分支都不会立即发送任何 Kafka 通知消息
+    │    Stigg Webhook 只写 DB，不直接触发 Novu 同步
     │
     ▼ （用户下次刷新前端页面或访问工作区）
 WorkspaceResolver.currentWorkspace()      [workspace.resolver.ts#L79-L92]
@@ -374,7 +435,7 @@ UserService.setNotificationRegistry(user)  [user.service.ts#L175-L202]
     ▼
 BillingService.getBooleanEntitlement(workspaceId, BillingFeature.Notification)
                                             [billing.service.ts#L212-L227]
-    │  从 Stigg SDK 实时拉取布尔权限
+    │  从 Stigg SDK 实时拉取布尔权限（不是读 DB 的 subscription 表）
     │  BillingFeature.Notification = "feature-notifications"
     ▼
   hasAccess = true / false → canShowUserNotification
@@ -410,36 +471,52 @@ subscribeUser() 中间件                    [subscribeUser.ts]
    }
    ```
 
-2. **订阅状态事件处理**：[subscription.service.ts#L261-L332](packages/amplication-server/src/core/subscription/subscription.service.ts#L261-L332)
+2. **订阅状态事件处理（handleUpdateSubscriptionStatusEvent）**：[subscription.service.ts#L261-L332](packages/amplication-server/src/core/subscription/subscription.service.ts#L261-L332)
 
-   处理的 Webhook 事件类型：
-   | 事件类型 | 处理动作 |
-   |---------|---------|
-   | `subscription.created` | DB upsert subscription + trackUpgradeCompletedEvent + 更新 Project/Service 许可 |
-   | `subscription.updated` | DB upsert subscription（仅更新 status）+ 更新 Project/Service 许可 |
-   | `subscription.expired` | DB upsert subscription（仅更新 status） |
-   | `subscription.canceled` | DB upsert subscription（仅更新 status） |
-   | `promotionalEntitlement.granted` | 直接更新 Project/Service 许可 |
-   | `promotionalEntitlement.updated` | 直接更新 Project/Service 许可 |
-   | `promotionalEntitlement.revoked` | 直接更新 Project/Service 许可 |
-   | `promotionalEntitlement.expired` | 直接更新 Project/Service 许可 |
+   两个分支的 DB 影响对比：
 
-3. **Notification Billing Feature 定义**：[billing-feature.types.ts#L21](libs/util/billing-types/src/lib/billing-feature.types.ts#L21)
+   | 事件类型 | 分支 | subscription 表 upsert | 写 subscriptionPlan | 写 subscription.status | 更新 Project/Service licensed | 其他副作用 |
+   |---------|------|----------------------|-------------------|----------------------|---------------------------|-----------|
+   | `subscription.created` | A | ✅ | ✅（首次创建） | ✅ | ✅ | trackUpgradeCompletedEvent |
+   | `subscription.updated` | A | ✅（update） | ❌（仅首次创建时写） | ✅ | ✅ | - |
+   | `subscription.expired` | A | ✅（update） | ❌ | ✅ | ❌ | - |
+   | `subscription.canceled` | A | ✅（update） | ❌ | ✅ | ❌ | - |
+   | `promotionalEntitlement.granted` | B | ❌（不写表） | - | - | ✅ | - |
+   | `promotionalEntitlement.updated` | B | ❌（不写表） | - | - | ✅ | - |
+   | `promotionalEntitlement.revoked` | B | ❌（不写表） | - | - | ✅ | - |
+   | `promotionalEntitlement.expired` | B | ❌（不写表） | - | - | ✅ | - |
+
+   > **代码逻辑要点**：
+   > - 分支 A（subscription.*）的 upsert 和分支 B（promotionalEntitlement.*）的 licensed 更新都在 **switch case 内**完成
+   > - subscription.created/.updated 的 **licensed 更新**在 **switch 之后**的 `if` 条件中执行（L320-L331）
+   > - subscription.expired/.canceled **故意不触发** licensed 更新
+   > - promotionalEntitlement.* **完全不涉及** subscription 表写入
+
+3. **updateProjectLicensed / updateServiceLicensed 具体作用**：
+   - [subscription.service.ts#L103-L174](packages/amplication-server/src/core/subscription/subscription.service.ts#L103-L174)
+   - 逻辑：根据 Stigg 返回的 metered entitlement 限额（BillingFeature.Projects / Services），按创建时间升序对 workspace 下的 project/service 排序，限额内的设 `licensed: true`，超出限额的设 `licensed: false`
+   - **与 Notification 权限无关**：licensed 字段控制的是项目/服务是否"有许可证"，而 Notification 权限来自 BillingFeature.Notification 的布尔 entitlement，通过 Stigg SDK 实时查询
+
+4. **Notification Billing Feature 定义**：[billing-feature.types.ts#L21](libs/util/billing-types/src/lib/billing-feature.types.ts#L21)
    ```typescript
    Notification = "feature-notifications"
    ```
 
-4. **用户侧触发点（权限拉取 + Kafka 发送）**：
-   - GraphQL 入口：[workspace.resolver.ts#L79-L92](packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
+5. **用户侧触发点（权限拉取 + Kafka 发送）**：
+   - GraphQL 入口（唯一调用点）：[workspace.resolver.ts#L79-L92](packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
    - 权限检查 + Kafka 发送：[user.service.ts#L175-L202](packages/amplication-server/src/core/user/user.service.ts#L175-L202)
 
 #### 设计要点与注意事项
 
-- **延迟同步（非实时）**：Stigg Webhook 只负责更新数据库订阅状态，**不会立即向 Kafka 发消息**。必须等到用户下次请求 `currentWorkspace`（通常是前端刷新或打开工作区）时，才会通过 `setNotificationRegistry()` 重新拉取 Stigg 权限并同步 Novu 订阅者状态。
-- **两层权限检查**：
-  1. DB 层：`subscription` 表记录工作区当前的订阅计划和状态
-  2. 实时层：`BillingService.getBooleanEntitlement()` 通过 Stigg SDK 实时查询 Feature 权限（feature-notifications），这才是 `enableUser` 的最终依据
-- **许可同步副作用**：`updateProjectLicensed()` 和 `updateServiceLicensed()` 会根据 Stigg 返回的 metered entitlement（Projects / Services 使用限额）更新项目和服务的 `licensed` 布尔字段，这与通知功能无关，但同样由 Stigg Webhook 驱动。
+- **延迟同步（非实时）**：Stigg Webhook 只负责写入数据库，**不会立即向 Kafka 发消息**。必须等到用户下次请求 `currentWorkspace`（通常是前端刷新或打开工作区页面）时，才会通过 `setNotificationRegistry()` 重新拉取 Stigg 权限并同步 Novu 订阅者状态。
+
+- **通知权限判断不读本地 subscription 表**：`setNotificationRegistry` 中调用 `BillingService.getBooleanEntitlement(workspaceId, BillingFeature.Notification)` 是通过 **Stigg SDK 实时查询**（不是读 DB 的 subscription 表）。DB 的 subscription 表仅用于其他业务逻辑（如页面展示订阅状态），Notification 的 enableUser 完全由 Stigg 实时返回的 hasAccess 决定。
+
+- **subscription.expired / canceled 不刷新 licensed 的意图**：设计上认为订阅过期/取消后，无需立即回收已授权项目/服务的 licensed 标记，仅在订阅 created/updated（付费升级/降级）或促销权益变化时刷新限额。
+
+- **promotionalEntitlement 不写 subscription 表的意图**：促销权益（试用、赠送额度等）是临时的、叠加在主订阅之上的权益，不需要持久化到 subscription 表，只需要反映在 project/service 的 licensed 限额上即可。
+
+- **licensed 字段与 Notification 无关**：`updateProjectLicensed()` 和 `updateServiceLicensed()` 更新的是项目和服务的 `licensed` 布尔字段，用于控制代码生成等功能是否可用，与通知功能的开关（BillingFeature.Notification）是两条独立的权限链路。
 
 ### 关于"成员邀请"的说明
 
@@ -497,12 +574,12 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 | 事件类型 | 触发源头 | 发送方 Service | Kafka Topic | Notification 中间件 | Novu 调用方法 | Novu eventName |
 |---------|---------|---------------|-------------|---------------------|--------------|----------------|
-| 用户订阅（含订阅权限变化） | 用户登录/切换工作区 **或** Stigg Webhook 更新订阅后用户访问工作区 | UserService | `user-action.internal.1` | subscribeUser | createSubscriber / deleteSubscriber | - |
+| 用户订阅（含订阅权限变化） | 前端调用 `currentWorkspace` GraphQL Query（Stigg Webhook 会更新 DB，但需等用户下次访问工作区才会同步 Novu） | UserService | `user-action.internal.1` | subscribeUser | createSubscriber / deleteSubscriber | - |
 | 构建完成 | DSG 代码生成成功回调 | BuildService | `user-build.internal.1` | buildCompleted | triggerNotificationToSubscriber | `build-completed` |
 | 插件过期告警 | Plugin Repository 发布新版本 → ResourceVersion.create | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
 | 模板过期告警 | ServiceTemplate 发布新版本 → ResourceVersion.create | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
 | 功能公告 | 管理员手动调用接口 | UserService | `user-announcement.internal.1` | featureAnnouncement | triggerNotificationToSubscriber | 动态（模板标识符） |
-| Stigg 订阅 Webhook（不直接发通知） | Stigg 支付系统推送 | SubscriptionService | **不直接发 Kafka** | 仅更新 DB，等用户下次访问 currentWorkspace 时通过 USER_ACTION_TOPIC 同步 | - | - |
+| Stigg 订阅 Webhook（不直接发通知） | Stigg 支付系统推送 | SubscriptionService | **不直接发 Kafka** | 分支 A（subscription.*）：写 subscription 表；分支 B（promotionalEntitlement.*）：只更新 project/service.licensed；均不直接触发 Novu 同步 | - | - |
 | Preview 生成完成（预留，未实现） | 无 | 无发送方 | `user-preview-generation-completed.internal.1` | 无对应中间件 | - | - |
 
 ---
@@ -533,9 +610,9 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 订阅/权限变化的同步采用 **Webhook 写 DB + 用户请求时拉取权限** 的两段式设计，而非 Webhook 直接推送通知：
 
-1. **写路径（Webhook → DB）**：Stigg Webhook 触发时，`handleUpdateSubscriptionStatusEvent()` 只做两件事：
-   - 写入/更新 `subscription` 表（记录计划和状态）
-   - 更新 `project` / `resource` 表的 `licensed` 字段（按使用限额标记许可状态）
+1. **写路径（Webhook → DB）**：Stigg Webhook 触发时，`handleUpdateSubscriptionStatusEvent()` 按事件类型分流：
+   - `subscription.created/updated/expired/canceled` 写入或更新 `subscription` 表，其中 created/updated 才会刷新 project/resource 的 `licensed` 字段
+   - `promotionalEntitlement.*` 不写 `subscription` 表，只刷新 project/resource 的 `licensed` 字段
    
 2. **读路径（用户请求 → 实时权限 → Novu 同步）**：用户每次请求 `currentWorkspace` 时：
    - 调 `BillingService.getBooleanEntitlement(workspaceId, BillingFeature.Notification)` 从 Stigg SDK 实时拉取布尔权限
