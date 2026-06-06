@@ -307,7 +307,312 @@ const attributes = createAttributes([
 
 ---
 
-## 六、关键代码索引
+## 六、插件扩展点（Plugin Hooks）
+
+Amplication 的代码生成引擎在每一个关键生成环节都暴露了 **Before/After** 双阶段插件钩子，允许第三方插件在默认行为执行前后介入、修改输入参数或替换输出模块。
+
+### 6.1 插件系统架构
+
+插件系统的核心组件：
+
+| 组件 | 位置 | 作用 |
+|------|------|------|
+| `pluginWrapper` | [plugin-wrapper.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts) | 每个生成函数的执行包装器，负责调度 Before/After 钩子 |
+| `registerPlugins` | [register-plugin.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/register-plugin.ts) | 动态加载插件 npm 包，组装成 `PluginMap` |
+| `EventNames` | [plugins.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugins.types.ts#L77-L124) | 全部 47 个可挂钩事件名的枚举 |
+| `Events` 类型 | [plugin-events.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugin-events.types.ts) | 每个事件对应的参数类型约束 |
+| `AmplicationPlugin` | [plugins.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugins.types.ts#L126-L129) | 插件必须实现的接口（含 `register()` 方法） |
+
+#### 插件执行流水线
+
+`pluginWrapper` 的执行顺序（[plugin-wrapper.ts L59-L99](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L59-L99)）：
+
+```
+1. context.utils.skipDefaultBehavior = false
+2. ── beforePlugins pipe ──→ 依次执行所有 Before 钩子，eventParams 可被逐步修改
+3. ── defaultBehavior ──→    调用原始 DSG 生成函数（可被 skipDefaultBehavior 跳过）
+4. ── afterPlugins pipe ──→ 依次执行所有 After 钩子，可修改/新增/替换输出 ModuleMap
+5. ── 写入 context.modules
+```
+
+关键机制：
+- **Before 钩子链式传递**：使用 `beforeEventsPipe` 通过 reduce 将每个插件的返回值作为下一个插件的输入（[plugin-wrapper.ts L17-L23](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L17-L23)）
+- **跳过默认行为**：Before 钩子可设置 `context.utils.skipDefaultBehavior = true`，此时默认函数完全不执行（[plugin-wrapper.ts L40-L51](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L40-L51)）
+- **After 钩子合并**：After 钩子可返回新的 `ModuleMap`，最终 `for...of` 遍历 upsert 到 `context.modules`（[plugin-wrapper.ts L95-L97](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L95-L97)）
+
+### 6.2 与 GraphQL 契约直接相关的插件事件
+
+以下是直接影响 GraphQL 类型、Resolver 和访问控制的关键插件点：
+
+#### GraphQL 类型层（DTOs）
+
+| EventName | 参数类型 | 可介入时机 | 影响范围 |
+|-----------|---------|------------|---------|
+| `CreateDTOs` | `CreateDTOsParams` | Before + After | 所有 Entity 相关 DTO（Entity/CreateInput/WhereInput 等）的生成，可修改 DTO 类结构、字段列表、装饰器 |
+| `CreatePrismaSchema` | `CreatePrismaSchemaParams` | Before + After | Prisma Schema，会间接影响生成的所有 DTO 类型（因为 DTO 字段数据来源于 Entity→Prisma） |
+
+#### Resolver 层
+
+| EventName | 参数类型 | 可介入时机 | 影响范围 |
+|-----------|---------|------------|---------|
+| `CreateEntityResolverBase` | `CreateEntityResolverBaseParams` | Before + After | Resolver 基类（默认 CRUD + 关联方法），可增删方法、修改装饰器、改返回类型 |
+| `CreateEntityResolver` | `CreateEntityResolverParams` | Before + After | Resolver 可编辑子类（继承基类），可添加自定义方法 |
+| `CreateEntityResolverToManyRelationMethods` | `CreateEntityResolverToManyRelationMethodsParams` | Before + After | 一对多关联的 find/connect/disconnect 方法 |
+| `CreateEntityResolverToOneRelationMethods` | `CreateEntityResolverToOneRelationMethodsParams` | Before + After | 一对一关联的 get 方法 |
+| `CreateEntityService` / `CreateEntityServiceBase` | 对应 Params | Before + After | Service 层（Resolver 调用的后端逻辑），修改 Service 会联动 Resolver 的调用签名 |
+
+#### 访问控制层
+
+| EventName | 参数类型 | 可介入时机 | 影响范围 |
+|-----------|---------|------------|---------|
+| `CreateServerAuth` | `CreateServerAuthParams` | Before + After | JWT/Auth 模块生成，影响登录态校验 |
+| `CreateSeed` | `CreateSeedParams` | Before + After | 种子数据（含默认用户角色），间接影响 ACL 的可用角色 |
+
+#### 全局层
+
+| EventName | 参数类型 | 可介入时机 | 影响范围 |
+|-----------|---------|------------|---------|
+| `CreateServerAppModule` | `CreateServerAppModuleParams` | Before + After | AppModule 的 imports，可注入新的 GraphQL Module |
+| `CreateServer` | `CreateServerParams` | Before + After | 整个服务端生成总入口，可完全替换行为 |
+| `LoadStaticFiles` | `LoadStaticFilesParams` | Before + After | 静态资源文件，可注入额外的拦截器或公共类型 |
+
+### 6.3 插件对 GraphQL 契约的典型影响方式
+
+插件通过介入这些事件可以：
+
+1. **新增自定义 GraphQL 类型**：在 `CreateDTOs` 的 After 钩子中往 `dtos` Map 追加新的 `NamedClassDeclaration`，并更新 `dtoNameToPath` 映射
+2. **替换 Resolver 方法**：在 `CreateEntityResolverBase` 的 After 钩子中用 TS AST 遍历 `classDeclaration.body.body`，找到目标方法后替换 `ClassMethod` 节点
+3. **添加字段装饰器**：在 `CreateDTOs` 的 Before 钩子修改传入的 Entity 字段数组，或在 After 钩子直接操作 AST 为 ClassProperty 追加 Decorator
+4. **绕过默认 ACL**：在 `CreateEntityResolverBase` 的 After 钩子中删除 `@UseRoles` 装饰器或替换拦截器
+5. **新增 Resolver 方法**：在 After 钩子中 push 新的 `ClassMethod`（带 `@Query`/`@Mutation` 装饰器）到 Resolver 基类
+
+---
+
+## 七、自定义 DTO 与自定义模块接入流程
+
+除了基于 Entity 的标准 CRUD，Amplication 还支持完全自定义的「模块」（`ModuleContainer` + `ModuleAction` + `ModuleDto`），用于实现业务自定义的 GraphQL Query/Mutation。
+
+### 7.1 数据结构总览
+
+三个核心类型定义于 [models.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/models.ts)：
+
+| 类型 | 关键字段 | 作用 |
+|------|---------|------|
+| `ModuleContainer` | `name`、`enabled`、`entityId?` | 模块容器；`entityId === undefined` 即为自定义模块 |
+| `ModuleAction` | `name`、`enabled`、`actionType`、`gqlOperation`、`inputType`、`outputType`、`restVerb`、`restInputSource` | 模块内的动作（GraphQL Query/Mutation），含输入输出类型定义 |
+| `ModuleDto` | `name`、`dtoType`、`properties?`、`members?`、`decorators?`、`enabled` | 自定义 DTO；`dtoType` 分 `Custom`（类）和 `CustomEnum`（枚举） |
+| `ModuleDtoProperty` | `name`、`isOptional`、`isArray`、`propertyTypes[]` | 自定义 DTO 的属性，`propertyTypes` 是 `PropertyTypeDef[]` 支持联合类型 |
+
+`PropertyTypeDef` 支持 6 种类型源（`EnumModuleDtoPropertyType`）：
+
+```
+Primitive  → 基础类型（String/Number/Boolean/Date/Json）
+Dto        → 引用另一个 ModuleDto（嵌套对象）
+Entity     → 引用系统 Entity（使用其 ObjectType）
+Enum       → 引用系统 Entity 的字段枚举
+CustomEnum → 引用另一个自定义 Enum DTO
+NotFound   → 占位
+```
+
+### 7.2 在 prepare-context 中的组装
+
+在 [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/prepare-context.ts#L384-L486) 的 `prepareModuleActionsAndDtos()` 中完成两件事：
+
+#### （1）按 ModuleContainer 维度分组
+
+将扁平的 `moduleActions` 和 `moduleDtos` 组装成 `moduleActionsAndDtoMap`（以 `moduleContainer.name` 为 key）。
+
+#### （2）根据 Action 引用自动为 DTO 注入 GraphQL 装饰器
+
+遍历每个 `ModuleAction`，根据其 `inputType` 和 `outputType` 递归地给被引用的 `ModuleDto` 追加 `decorators`：
+
+- **作为 Action 的输入类型** → 顶层 DTO 添加 `ArgsType` 装饰器，其嵌套属性 DTO 添加 `InputType` 装饰器（递归）
+- **作为 Action 的输出类型** → 顶层 DTO 添加 `ObjectType` 装饰器，其嵌套属性 DTO 也添加 `ObjectType` 装饰器（递归）
+
+装饰器去重通过 `EnumModuleDtoDecoratorType` 枚举判断（`ArgsType`/`InputType`/`ObjectType`）。
+
+### 7.3 自定义 DTO 的代码生成
+
+自定义 DTO 由 [create-custom-dtos.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/custom-types/create-custom-dtos.ts) 的 `createCustomDtos()` 生成，过滤条件是：
+
+```ts
+dto.dtoType === EnumModuleDtoType.Custom || dto.dtoType === EnumModuleDtoType.CustomEnum
+```
+
+#### 类 DTO（Custom）
+
+由 `createDto()` 生成（[create-custom-dtos.ts L97-L141](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/custom-types/create-custom-dtos.ts#L97-L141)），每个 `ModuleDto.decorators` 会转成以下 GraphQL 装饰器：
+
+| 装饰器类型 | 生成结果 |
+|-----------|---------|
+| `ArgsType` | `@ArgsType()` |
+| `InputType` | `@InputType("${name}Input")` |
+| `ObjectType` | `@ObjectType("${name}Object")` |
+
+每个属性由 `createProperty()` 生成（[create-custom-dtos.ts L163-L208](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/custom-types/create-custom-dtos.ts#L163-L208)），同时添加：
+
+- **GraphQL 端**：`createGraphQLFieldDecorator(property)`（仅当 `generateGraphQL` 为 true）
+- **REST 端**：`createApiPropertyDecorator(property)`（仅当 `generateRestApi` 为 true）
+- **类型转译**：`createTypeDecorator(property)`（用于 `class-transformer` 的嵌套对象反序列化）
+
+#### 枚举 DTO（CustomEnum）
+
+由 `createEnumDTO()` 生成 TS 原生枚举（`builders.tsEnumDeclaration`），每个成员是 `builders.tsEnumMember(identifier, stringLiteral(value))`。
+
+### 7.4 自定义模块的 Resolver 生成
+
+自定义模块（`moduleContainer.entityId === undefined`）由 [create-custom-module.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/create-custom-module.ts) 的 `createCustomModulesModules()` 处理，生成 4 类文件：
+
+| 文件类型 | 生成函数 | 是否受开关控制 |
+|---------|---------|--------------|
+| Service | `createServiceModules()` | 始终生成 |
+| Controller (REST) | `createCustomModuleControllerModules()` | 仅当 `generateRestApi` |
+| Resolver (GraphQL) | `createCustomModuleResolverModules()` | 仅当 `generateGraphQL` |
+| Module (NestJS Module) | `createCustomModule()` | 始终生成 |
+
+#### 自定义 Resolver 详解
+
+模板 [custom-resolver/resolver.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/resolver.template.ts) 是一个空壳（仅含构造函数注入 service），所有方法由 `createResolverCustomActionMethods()` 动态注入（[create-resolver-custom-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/create-resolver-custom-actions.ts)）。
+
+每个 `ModuleAction` 生成一个方法：
+
+```ts
+// 伪代码
+@graphql.Query(/* 或 @graphql.Mutation */)
+async {actionName}(@Args() args: {inputType}): Promise<{outputType}> {
+  return this.service.{actionName}(args);
+}
+```
+
+关键细节：
+- 装饰器由 [create-graphql-operation-decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/create-graphql-operation-decorator.ts) 根据 `action.gqlOperation`（Query/Mutation）生成
+- `action.inputType.type !== Dto`（即原始类型）时，`@Args()` 不传递参数名；否则使用标准嵌套 Args 形式
+- **自定义 Resolver 默认不生成 ACL 装饰器**（与 Entity Resolver 不同）——没有 `@UseRoles`、没有 `AclFilterResponseInterceptor`、没有 `AclValidateRequestInterceptor`，这是目前自定义模块的一个重要边界
+
+---
+
+## 八、公开权限（Public）与字段级过滤的边界
+
+### 8.1 ACL 运行时的两层拦截器
+
+最终运行时的权限控制由两个 NestJS Interceptor 完成，它们位于生成的服务端代码中（以 `data-service-generator-catalog` 为例）：
+
+#### AclFilterResponseInterceptor —— 响应过滤（读操作）
+
+代码：[aclFilterResponse.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/interceptors/aclFilterResponse.interceptor.ts)
+
+执行流程：
+1. 从 Reflector 读取当前方法挂载的 `roles` 元数据（由 `@UseRoles` 写入，包含 `role`、`action`、`possession`、`resource`）
+2. 通过 `rolesBuilder.permission(...)` 从 `grants.json` 查询权限对象
+3. 对响应数据调用 `permission.filter(data)` 进行字段级过滤
+4. 数组响应 → 逐个元素过滤；单个对象 → 直接过滤
+
+`permission.filter()` 是 `accesscontrol` 库的原生方法，会根据 attributes glob（如 `"*,!password,!secret"`）删除对象上不被允许的字段。
+
+#### AclValidateRequestInterceptor —— 请求校验（写操作）
+
+代码：[aclValidateRequest.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/interceptors/aclValidateRequest.interceptor.ts)
+
+执行流程：
+1. 同样读取 Reflector 中的 `roles` 元数据
+2. 根据上下文类型获取输入数据：
+   - HTTP (REST)：`context.switchToHttp().getRequest().body`
+   - GraphQL：`context.getArgByIndex(1).data`（第二个参数是 `@Args()` 解析后的对象）
+3. 调用 `abacUtil.getInvalidAttributes(permission, inputData)` 找出无权字段
+4. 若有 `invalidAttributes.length > 0`，抛出 `ForbiddenException("Insufficient privileges to complete the operation")`
+
+字段比对工具 [abac.util.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/auth/abac.util.ts) 的核心逻辑：
+
+```ts
+const filteredData = permission.filter(structuredClone(data));
+return Object.keys(data).filter((key) => !(key in filteredData));
+```
+
+> **注意**：`structuredClone` 是必要的，因为 GraphQL 请求传入的对象原型为 `null`，而 `accesscontrol` 库的 `filter()` 对无原型对象处理异常。
+
+### 8.2 Public 权限的精确边界
+
+`setEndpointPermissions()` 对 Public 权限的处理（[set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts#L16-L54)）是**有选择性**的：
+
+| Action 类型 | 移除的拦截器 | 保留的拦截器 | 移除的装饰器 | 新增的装饰器 |
+|------------|-------------|-------------|------------|------------|
+| Search / View（读） | `AclFilterResponseInterceptor` | （无） | `@UseRoles()` | `@Public()` |
+| Create / Update（写） | `AclValidateRequestInterceptor` | （无） | `@UseRoles()` | `@Public()` |
+| Delete | （不区分，代码中未做分类处理 → 不会移除任何拦截器，仅移除 `@UseRoles`，新增 `@Public`） | — | — | — |
+
+**关键边界一：Public 权限不代表"完全无 ACL"**
+
+代码中只针对 Search/View/Create/Update 四种 Action 做了拦截器移除。**Delete Action 的两个拦截器不会被移除**，但由于 `@UseRoles` 已被删除且加了 `@Public()`，若没有额外的 Guard 处理，运行时 `permissionsRoles` 可能为 `undefined`，拦截器内部访问 `permissionsRoles.role` 会抛出 TypeError——这是一个潜在的边界问题。
+
+**关键边界二：Public 读操作绕过字段级过滤**
+
+一旦 Search/View 被设为 Public，`AclFilterResponseInterceptor` 被移除，即使 grants.json 中对某些角色有字段限制，公开请求也会**直接返回完整 Entity DTO**（包括 id、createdAt 等所有字段）。这意味着 Public = 对 Entity 的所有字段全开放读取。
+
+**关键边界三：密码字段的双重保险**
+
+密码字段已经在 Entity DTO（输出类型）层面被 `isPasswordField()` 完全排除（[create-entity-dto.ts L14](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/create-entity-dto.ts#L14)），即使 Public 权限开放读取，密码字段也不会出现在 GraphQL Schema 中，是"类型层 + ACL 层"双重保障。
+
+### 8.3 Granular 字段级权限的精确算法
+
+在 `createGrants()` 中处理 Granular 权限时，字段级控制通过 `roleToFields` 和负向 glob 匹配实现（[create-grants.ts L55-L121](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/create-grants.ts#L55-L121)）：
+
+#### 步骤一：收集每个角色有权访问的字段
+
+```
+permissionFields.forEach(field →
+  field.permissionRoles.forEach(role →
+    roleToFields[role.resourceRole.name].add(field.field.name)
+  )
+)
+```
+
+`EntityPermissionField` 数据结构（[models.ts L741-L749](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/models.ts#L741-L749)）：
+```
+EntityPermissionField
+├── field: EntityField              // 指向具体字段
+├── permissionRoles: EntityPermissionRole[]  // 哪些角色可以访问该字段
+└── fieldPermanentId / permissionId // 关联键
+```
+
+#### 步骤二：对每个角色做差集
+
+对于当前 Entity 的 `allEntityFields`，不在 `roleToFields[role]` 集合中的字段即为 `forbiddenFields`。
+
+#### 步骤三：生成负向 attributes
+
+```ts
+createAttributes(["*", ...forbiddenFields.map(f => `!${f}`)])
+```
+
+最终写入 grants.json 的效果：
+
+```json
+{
+  "admin": {
+    "User": {
+      "read:any": ["*"],
+      "update:any": ["*", "!password", "!secretField"]
+    }
+  },
+  "viewer": {
+    "User": {
+      "read:any": ["*", "!password", "!email"],
+      "update:any": []
+    }
+  }
+}
+```
+
+**边界细节**：
+- 如果某个角色的 `forbiddenFields` 包含了 Entity 的全部字段 → attributes 为 `["*", "!field1", "!field2", ...]`，实际效果等于禁止访问
+- 密码字段等敏感字段即使未在 Granular 权限中显式排除，也不会出现在输出 DTO 中（类型层保障）
+- 关联字段（Lookup）的粒度权限仅作用于"外键字段本身"，不级联影响关联 Entity 的内部字段
+
+---
+
+## 九、关键代码索引
+
+### 9.1 核心生成流程
 
 | 关注点 | 核心文件 |
 |--------|---------|
@@ -315,14 +620,55 @@ const attributes = createAttributes([
 | 上下文准备（解析实体、组装 Actions） | [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/prepare-context.ts) |
 | 服务端代码生成总入口 | [create-server.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/create-server.ts) |
 | 实体模块生成（Service/Controller/Resolver） | [create-resource.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/create-resource.ts) |
+| 核心数据结构（Entity/Field/Module/Permission 等） | [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts)、[code-gen-types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/code-gen-types.ts)、[models.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/models.ts) |
+
+### 9.2 GraphQL 类型 / DTO 生成
+
+| 关注点 | 核心文件 |
+|--------|---------|
 | DTO 总生成入口 | [create-dtos.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts) |
 | 字段属性 → TS/GraphQL 类型/装饰器 | [create-field-class-property.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/create-field-class-property.ts) |
 | GraphQL `@Field()` 装饰器生成 | [create-graphql-field-decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/graphql-field-decorator/create-graphql-field-decorator.ts) |
 | Entity ObjectType DTO | [create-entity-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/create-entity-dto.ts) |
-| Resolver 生成 | [create-resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts) |
-| Resolver 基类模板 | [resolver.base.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/resolver.base.template.ts) |
-| 自定义 GraphQL 操作装饰器 | [create-graphql-operation-decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-graphql-operation-decorator.ts) |
-| ACL grants.json 生成 | [create-grants.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/create-grants.ts) |
-| 端点权限装饰器注入 | [set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts) |
-| 代码生成输入类型 | [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts) |
-| 核心类型（Entity/Field/Permission） | [code-gen-types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/code-gen-types.ts)、[models.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/models.ts) |
+| 自定义 DTO（Custom / CustomEnum） | [create-custom-dtos.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/custom-types/create-custom-dtos.ts) |
+
+### 9.3 Resolver 生成
+
+| 关注点 | 核心文件 |
+|--------|---------|
+| Entity Resolver 生成 | [create-resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts) |
+| Entity Resolver 基类模板 | [resolver.base.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/resolver.base.template.ts) |
+| Entity Resolver 自定义动作 | [create-resolver-custom-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver-custom-actions.ts) |
+| GraphQL Query/Mutation 装饰器生成 | [create-graphql-operation-decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-graphql-operation-decorator.ts) |
+| 自定义模块 Resolver 生成 | [custom-resolver/create-resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/create-resolver.ts) |
+| 自定义模块 Resolver 模板 | [custom-resolver/resolver.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/resolver.template.ts) |
+| 自定义模块 Resolver 动作方法 | [custom-resolver/create-resolver-custom-actions.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-resolver/create-resolver-custom-actions.ts) |
+
+### 9.4 访问控制（ACL）
+
+| 关注点 | 核心文件 |
+|--------|---------|
+| grants.json 生成 | [create-grants.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/create-grants.ts) |
+| 端点权限装饰器注入（Public / UseRoles） | [set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts) |
+| 响应字段级过滤拦截器（运行时） | [aclFilterResponse.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/interceptors/aclFilterResponse.interceptor.ts) |
+| 请求字段级校验拦截器（运行时） | [aclValidateRequest.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/interceptors/aclValidateRequest.interceptor.ts) |
+| ABAC 字段级权限比对工具（运行时） | [abac.util.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator-catalog/src/auth/abac.util.ts) |
+
+### 9.5 插件扩展点
+
+| 关注点 | 核心文件 |
+|--------|---------|
+| 插件执行包装器（Before/After 调度） | [plugin-wrapper.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts) |
+| 插件加载与注册 | [register-plugin.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/register-plugin.ts) |
+| EventNames 枚举（全部 47 个事件） | [plugins.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugins.types.ts) |
+| Events 类型映射（事件 → 参数类型） | [plugin-events.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugin-events.types.ts) |
+| 各事件详细参数类型 | [plugin-events-params.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugin-events-params.types.ts) |
+
+### 9.6 自定义模块
+
+| 关注点 | 核心文件 |
+|--------|---------|
+| 自定义模块总生成入口 | [create-custom-module.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/create-custom-module.ts) |
+| 自定义 Service 生成 | [custom-service/create-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-service/create-service.ts) |
+| 自定义 Controller 生成 | [custom-controller/create-controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-controller/create-controller.ts) |
+| 自定义 NestJS Module 生成 | [custom-module/create-module.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/custom-module/custom-module/create-module.ts) |
