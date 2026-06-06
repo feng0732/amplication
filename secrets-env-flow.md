@@ -17,7 +17,7 @@
 
 ---
 
-## 2. 密钥作用域 (Secrets Scope)
+## 2. 密钥作用域与消费者划分 (Secrets Scope)
 
 ### 2.1 核心数据结构
 
@@ -88,11 +88,104 @@ const secretsManagerModule = await createSecretsManager({
 
 这意味着：**默认情况下 `EnumSecretsNameKey` 会是一个空枚举**。所有具体的密钥声明（包括 JWT_SECRET_KEY、DB 密码等）都必须由插件通过 `CreateServerSecretsManager` 事件的 `before` 钩子注入。这是"核心框架无业务假设"的设计体现。
 
-### 2.4 作用域的三层边界
+### 2.4 运行时消费者的三级划分
+
+通过追踪 `packages/gpt-gateway` 中的所有配置读取调用，可以明确划分出三种消费者：
+
+#### 第一级：通过 SecretsManagerService 读取（真正的密钥）
+
+这类消费者只读取被纳入 `EnumSecretsNameKey` 的值，走完整的 `SecretsManagerService.getSecret<T>()` 链路。
+
+| 消费者 | 读取的密钥 | 代码位置 |
+|--------|----------|---------|
+| `jwtSecretFactory` | `JWT_SECRET_KEY` | `packages/gpt-gateway/src/auth/jwt/jwtSecretFactory.ts#L1-L19` |
+| `AuthModule` 中 `JwtModule.registerAsync` | `JWT_SECRET_KEY` | `packages/gpt-gateway/src/auth/auth.module.ts#L24-L44` |
+
+典型模式（`jwtSecretFactory`）：
+
+```typescript
+useFactory: async (secretsService: SecretsManagerService): Promise<string> => {
+  const secret = await secretsService.getSecret<string>(
+    EnumSecretsNameKey.JwtSecretKey
+  );
+  if (secret) return secret;
+  throw new Error("jwtSecretFactory missing secret");
+},
+inject: [SecretsManagerService],
+```
+
+**特征**：
+- 依赖注入 `SecretsManagerService`
+- 使用 `EnumSecretsNameKey.XXX` 作为类型安全的 key
+- 异步调用（即使底层是同步的）
+- 对"必须存在"的密钥做 null → 抛错处理
+
+#### 第二级：直接通过 ConfigService.get() 读取（普通配置，非密钥）
+
+这类消费者不经过 SecretsManager，直接注入 NestJS `ConfigService` 读取。它们读取的通常是：
+- 非敏感配置（端口号、开关、路径）
+- 数值/布尔类型的参数（需要 `=== "true"` 转换的）
+- 非核心模块的配置（Kafka、静态文件服务等）
+
+| 消费者 | 读取的变量 | 代码位置 |
+|--------|----------|---------|
+| `generateKafkaClientOptions` | `KAFKA_BROKERS`, `KAFKA_ENABLE_SSL`, `KAFKA_CLIENT_ID`, `KAFKA_GROUP_ID` | `packages/gpt-gateway/src/kafka/generateKafkaClientOptions.ts#L7-L22` |
+| `PasswordService` 构造函数 | `BCRYPT_SALT` | `packages/gpt-gateway/src/auth/password.service.ts#L20-L23` |
+| `AuthModule` 中 `JwtModule.registerAsync` | `JWT_EXPIRATION` | `packages/gpt-gateway/src/auth/auth.module.ts#L32` |
+| `ServeStaticOptionsService` | `SERVE_STATIC_ROOT_PATH` | `packages/gpt-gateway/src/serveStaticOptions.service.ts#L25-L28` |
+| `AppModule` 中 GraphQL 配置 | `GRAPHQL_SCHEMA_DEST`, `GRAPHQL_DEBUG`, `GRAPHQL_PLAYGROUND_ENABLED`, `GRAPHQL_INTROSPECTION_ENABLED` | `packages/gpt-gateway/src/app.module.ts#L50-L56` |
+
+典型模式（Kafka）：
+
+```typescript
+const kafkaBrokersString = configService.get("KAFKA_BROKERS");
+const kafkaEnableSSL = configService.get("KAFKA_ENABLE_SSL") === "true";
+if (!kafkaBrokersString) {
+  throw new Error("KAFKA_BROKERS environment variable must be defined");
+}
+```
+
+**特征**：
+- 依赖注入 `ConfigService`
+- 使用裸字符串作为 key（如 `"KAFKA_BROKERS"`），无类型安全
+- 同步调用
+- **不经过 `EnumSecretsNameKey`**，因此这些变量也不会出现在 .env 的 secrets 枚举中
+
+**重要的边界划分规则**（在 `auth.module.ts#L24-L44` 中同时可见两种方式）：
+
+```typescript
+useFactory: async (secretsService, configService) => {
+  // 真正的密钥 → 走 SecretsManagerService
+  const secret = await secretsService.getSecret<string>(EnumSecretsNameKey.JwtSecretKey);
+  // 普通配置 → 走 ConfigService 直读
+  const expiresIn = configService.get(JWT_EXPIRATION);
+  ...
+},
+inject: [SecretsManagerService, ConfigService],
+```
+
+JWT 过期时间（`JWT_EXPIRATION`）虽然和 JWT 有关，但它只是一个时间长度字符串，不属于敏感密钥，所以直接走 ConfigService。两者读取方式在消费端被明确区分，避免了"所有配置都当作 secrets"的过度设计。
+
+#### 第三级：绕过 NestJS 容器，直接读 process.env
+
+这类读取发生在 NestJS 容器初始化**之前**，无法依赖注入，只能直接访问 Node.js 的 `process.env`。
+
+当前仅有一处：
+
+```typescript
+// packages/gpt-gateway/src/main.ts#L19
+const { PORT = 3000 } = process.env;
+```
+
+`main.ts` 是应用入口，`NestFactory.create(AppModule)` 还没执行时就需要知道端口号，因此必须绕过 DI 容器。这是唯一的例外。
+
+### 2.5 作用域的三层边界
 
 **第一层：枚举定义层 —— 编译期白名单**
 
 `EnumSecretsNameKey` 是类型安全的"门禁"。只有被纳入枚举的 key 才能被 `SecretsManagerService.getSecret<T>()` 合法读取。未声明的 key 在 TypeScript 编译阶段就会报错，避免拼写错误或越权访问。
+
+注意：这个门禁只对第一级消费者（走 SecretsManagerService 的）有效。第二级、第三级消费者直接用裸字符串读 ConfigService/process.env，不受枚举约束。
 
 **第二层：Module 导出层 —— NestJS DI 容器边界**
 
@@ -107,6 +200,8 @@ export class SecretsManagerModule {}
 ```
 
 只有显式 `imports: [SecretsManagerModule]` 的业务模块，其 provider/factory 才能注入 `SecretsManagerService`。典型如 `packages/gpt-gateway/src/auth/auth.module.ts#L21` 中 `AuthModule` 的导入声明。
+
+而 `ConfigModule.forRoot({ isGlobal: true })` 是全局模块，任何模块无需显式 import 就能注入 `ConfigService`。这也是为什么第二级消费者（普通配置）随处可见，而第一级消费者（密钥）必须在特定模块内使用。
 
 **第三层：运行时取值层 —— 环境变量边界**
 
@@ -156,8 +251,15 @@ generateCode()                          [src/generate-code.ts]
             │    ├─► createPrismaSchemaModule()
             │    ├─► createDotEnvModule({ envVariables: ENV_VARIABLES })
             │    └─► createDockerComposeFile() ...
+            │
+            │    └─► createServerInternal() 末尾手动 mergeMany 所有子模块返回值
+            │
             └─► createAdminModules()            // Admin UI 端
                  └─► createDotEnvModule()
+
+            └─► modules.merge(createServer() 返回值)    // [create-data-service.ts#L75]
+            └─► modules.merge(createAdminModules() 返回值)
+            └─► return modules;                        // 最终产物
 ```
 
 ### 3.2 DsgContext —— 单例全局上下文
@@ -169,7 +271,7 @@ class DsgContext implements types.DsgContext {
   public appInfo!: types.AppInfo;
   public entities: types.Entity[] = [];
   public plugins: types.PluginMap = {};     // 事件名 → before/after 钩子数组
-  public modules: types.ModuleMap;           // 已生成的文件集合
+  public modules: types.ModuleMap;           // 插件间共享的已生成文件集合
   public serverDirectories!: serverDirectories;
   public clientDirectories!: clientDirectories;
   public utils: ContextUtil = {
@@ -189,9 +291,10 @@ class DsgContext implements types.DsgContext {
 ```
 
 与 secrets/env 相关的关键字段：
-- `appInfo.settings`：资源级配置字典，是 `.env` 中 `${resourceId}` 等占位符替换的数据源
+- `appInfo.settings`（类型：`ServiceSettings`）：资源级配置字典，是 `.env` 中 `${resourceId}` 等占位符替换的数据源
 - `plugins`：所有插件钩子的注册表，结构见 `PluginMap` 类型
 - `serverDirectories.baseDirectory` / `clientDirectories.baseDirectory`：决定 `.env` 文件的输出位置
+- `modules`：插件跨事件共享已生成文件的渠道（详见 3.5 节）
 
 ### 3.3 插件注册 —— 事件钩子的装配
 
@@ -209,7 +312,7 @@ const registerPlugins = async (pluginList, pluginInstallationPath?) => {
 
       const { before, after } = plugin[eventKey as keyof Events] || {};
 
-      // before 和 after 必须是函数才会被收集
+      // before 和 after 必须是函数才会被收集（用 Object.prototype.toString 判定）
       functionsObject.includes(Object.prototype.toString.call(before)) &&
         pluginContext[eventKey].before.push(before);
       functionsObject.includes(Object.prototype.toString.call(after)) &&
@@ -233,60 +336,155 @@ export type PluginMap = {
 };
 ```
 
-### 3.4 pluginWrapper —— 洋葱模型的执行引擎
+### 3.4 pluginWrapper —— 洋葱模型的执行引擎（完整细节）
 
-`packages/data-service-generator/src/plugin-wrapper.ts#L59-L117` 是每一个代码生成函数的通用包装器，形成 **before 管道 → 默认行为 → after 管道** 的三层结构：
+`packages/data-service-generator/src/plugin-wrapper.ts#L59-L117` 是每一个代码生成函数的通用包装器。逐段拆解如下：
+
+#### 3.4.1 入口与控制标志重置
 
 ```typescript
-const pluginWrapper = async (func, event, args) => {
+const pluginWrapper: PluginWrapper = async (
+  func,
+  event,
+  args
+): Promise<ModuleMap> => {
   const context = DsgContext.getInstance;
 
-  // 每次执行前重置控制标志
-  context.utils.skipDefaultBehavior = false;
-  context.utils.abort = false;
+  try {
+    // 每次执行前重置控制标志
+    context.utils.skipDefaultBehavior = false;
+    context.utils.abort = false;
+```
 
-  // 无插件注册 → 直接执行默认行为
-  if (!context.plugins.hasOwnProperty(event)) {
-    return await func(args);
-  }
+每次事件触发前都会把 `skipDefaultBehavior` 和 `abort` 重置为 `false`。这意味着一个插件在 `CreateServerSecretsManager` 的 before 钩子里设置的 `skipDefaultBehavior = true`，只会影响当前事件，不会"渗漏"到后续的 `CreateServerDotEnv` 等事件。
 
-  const beforePlugins = context.plugins[event]?.before || [];
-  const afterPlugins = context.plugins[event]?.after || [];
+#### 3.4.2 无插件分支 —— 快路径
 
-  // 第一阶段：before 管道 —— 插件可修改 eventParams
-  // reduce + await 确保按注册顺序串行执行，前一个的输出作为后一个的输入
-  const updatedEventParams = beforePlugins
-    ? await beforeEventsPipe(...beforePlugins)(context, args)
-    : args;
+```typescript
+    if (!context.plugins.hasOwnProperty(event)) {
+      return await func(args);   // ★ 直接返回，跳过所有后续步骤
+    }
+```
 
-  // 第二阶段：默认行为（可被 skipDefaultBehavior 跳过）
-  const defaultBehaviorModules = await defaultBehavior(
-    context, func, updatedEventParams
-  );
+当某个事件没有任何插件注册钩子时，会走这个快路径。**它跳过的内容包括：**
 
-  // 第三阶段：after 管道 —— 插件可修改生成的 ModuleMap
-  const finalModules = afterPlugins
-    ? await afterEventsPipe(...afterPlugins)(context, args, defaultBehaviorModules)
-    : defaultBehaviorModules;
+1. 不执行 before 管道（当然也没有插件需要执行）
+2. 不经过 `defaultBehavior()` 包装 —— 意味着即使某插件（当然没有插件）想设置 `skipDefaultBehavior` 也不会起作用
+3. 不执行 after 管道
+4. **不执行 upsert 到 `context.modules`**（见 3.5 节）
 
-  // ★ 所有产物自动 upsert 到 context.modules，供后续步骤访问
-  for (const module of finalModules.modules()) {
-    context.modules.replace(module, module);
-  }
+但这不会造成模块丢失，因为：
+- `createServerInternal()` 末尾（`create-server.ts#L144-L167`）会用 `moduleMap.mergeMany([...所有子函数返回值...])` 手动收集
+- `create-data-service.ts#L75` 再 `await modules.merge(await createServer())` 把 Server 端全部产物合并到最终输出
 
-  return finalModules;
+无插件分支是性能优化 + 逻辑简化：绝大多数事件在无插件时不需要进入复杂管道。
+
+#### 3.4.3 before 管道
+
+```typescript
+    const beforePlugins = context.plugins[event]?.before || [];
+    const afterPlugins = context.plugins[event]?.after || [];
+
+    const updatedEventParams = beforePlugins
+      ? await beforeEventsPipe(...beforePlugins)(context, args)
+      : args;
+```
+
+`beforeEventsPipe` 的实现（同文件 `L17-L23`）：
+
+```typescript
+const beforeEventsPipe =
+  (...fns: PluginBeforeEvent<EventParams>[]) =>
+  (context: DsgContext, eventParams: EventParams) =>
+    fns.reduce(
+      async (res, fn) => fn(context, await res),
+      Promise.resolve(eventParams)
+    );
+```
+
+**关键机制**：
+- 使用 `reduce` + `await` 实现串行管道，前一个插件的返回值作为下一个插件的输入
+- `eventParams`（如 `{ secretsNameKey: [] }`）是**可就地修改的对象引用**，插件也可以选择返回新对象
+- 最终输出 `updatedEventParams` 只传给 `defaultBehavior`（见下一节）
+
+#### 3.4.4 默认行为包装
+
+```typescript
+const defaultBehavior = async (
+  context: DsgContext,
+  func: (...args: any) => any,
+  beforeFuncResults: any
+): Promise<ModuleMap> => {
+  if (context.utils.skipDefaultBehavior)
+    return new ModuleMap(DsgContext.getInstance.logger);  // 跳过默认行为，返回空 Map
+
+  return util.types.isAsyncFunction(func)
+    ? await func(beforeFuncResults)
+    : func(beforeFuncResults);
 };
 ```
 
-`beforeEventsPipe` 的实现（同文件 `L17-L23`）展示了参数如何在插件间传递：
+这里接收的是 `updatedEventParams`（经过 before 管道修改后的版本），而不是原始的 `args`。插件如果在 before 钩子里设置了 `skipDefaultBehavior = true`，默认行为就会被跳过，返回一个空的 `ModuleMap`。
+
+#### 3.4.5 after 管道 —— 关键细节：收到的是原始 args
 
 ```typescript
-const beforeEventsPipe = (...fns) => (context, eventParams) =>
-  fns.reduce(
-    async (res, fn) => fn(context, await res),  // 每个插件收到的是上一个插件返回的 eventParams
-    Promise.resolve(eventParams)
-  );
+    const finalModules = afterPlugins
+      ? await afterEventsPipe(...afterPlugins)(
+          context,
+          args,                   // ★ 注意：这里是原始 args，不是 updatedEventParams
+          defaultBehaviorModules
+        )
+      : defaultBehaviorModules;
 ```
+
+`afterEventsPipe` 的实现（同文件 `L25-L31`）：
+
+```typescript
+const afterEventsPipe =
+  (...fns: PluginAfterEvent<EventParams>[]) =>
+  (context: DsgContext, eventParams: EventParams, modules: ModuleMap) =>
+    fns.reduce(
+      async (res, fn) => fn(context, eventParams, await res),
+      Promise.resolve(modules)
+    );
+```
+
+**这是一个极易被忽略的细节：after 钩子收到的 `eventParams` 是**原始的 `args`**，不是 before 管道输出的 `updatedEventParams`**。
+
+实践中的影响（以 `CreateServerSecretsManager` 为例）：
+- before 钩子向 `eventParams.secretsNameKey[]` push 了 `{ name: "JwtSecretKey", ... }`
+- 因为 `eventParams` 是对象引用，`push` 操作会修改原始对象
+- 所以 after 钩子拿到的 `eventParams.secretsNameKey` **仍然包含** before 插件追加的内容
+- 但如果某个 before 插件选择返回了**新对象**（`return { ...eventParams, extra: "xxx" }`）而不是就地修改，则 after 钩子**看不到**那些新增字段
+
+**推荐实践**：before 钩子应就地修改 `eventParams`，不要返回新对象，这样 after 钩子才能观察到完整的修改。
+
+after 管道的模块流转：`defaultBehaviorModules` → 第一个 after 插件的 `res` → 该插件返回值 → 第二个 after 插件的 `res` → ... → `finalModules`。每个 after 插件都可以自由修改或完全替换 ModuleMap 内容。
+
+#### 3.4.6 Upsert 到 context.modules —— 插件间共享文件
+
+```typescript
+    // Upsert all the final modules into the context.modules
+    // ModuleMap.merge is not used because it would log a warning for each module
+    for (const module of finalModules.modules()) {
+      context.modules.replace(module, module);
+    }
+
+    return finalModules;
+```
+
+**这一步只有在"有插件注册"的分支才会执行**（无插件分支 L70-L72 已经 return 了）。
+
+它的目的是**让后续事件的插件可以访问当前事件生成的文件**。例如：
+1. `CreateServerSecretsManager` 事件生成了 `secretsNameKey.enum.ts`
+2. Upsert 到 `context.modules`
+3. 后续的 `CreateServerAuth` 事件的 after 钩子可以通过 `context.modules` 找到 `secretsNameKey.enum.ts`，读取枚举定义来生成正确的 import 语句
+
+**双重保障的输出链路**：
+- 路径 A（有插件时）：`pluginWrapper` upsert 到 `context.modules` + 函数返回值被 `mergeMany` 收集
+- 路径 B（无插件时）：函数返回值被 `mergeMany` 收集
+- 最终：两条路径都汇入 `create-data-service.ts#L75` 的 `modules.merge(createServer())`
 
 ### 3.5 Secrets 与环境变量的插件注入时机
 
@@ -294,7 +492,7 @@ const beforeEventsPipe = (...fns) => (context, eventParams) =>
 |------|---------|------------|---------|
 | `CreateServerSecretsManager` | **before** | 向 `eventParams.secretsNameKey[]` 追加 `{ name, key }`，使其被纳入 `EnumSecretsNameKey` 枚举 | `EventNames` 定义于 `libs/util/code-gen-types/src/plugins.types.ts#L120-L124` |
 | `CreateServerDotEnv` | **before** | 向 `eventParams.envVariables` 追加或覆盖变量条目 | — |
-| `CreateServerDotEnv` | **after** | 修改已生成的 `.env` 文件内容（如追加行、替换值） | — |
+| `CreateServerDotEnv` | **after** | 修改已生成的 `.env` 文件内容（如追加行、替换值）；也可通过 `context.modules` 找到其他已生成的文件协同修改 | — |
 | `CreateAdminDotEnv` | before / after | 同上，针对 Admin UI 端 `.env` | — |
 | `CreateServerAppModule` | after | 修改 `app.module.ts`，如替换 `ConfigModule.forRoot()` 的配置以接入自定义 loader | `packages/data-service-generator/src/server/app-module/create-app-module.ts#L92-L100` |
 
@@ -324,8 +522,8 @@ const beforeEventsPipe = (...fns) => (context, eventParams) =>
     { PORT: "3000" },
   ];
   ```
-- 占位符替换引擎 `packages/data-service-generator/src/utils/text-file-parser.ts#L1-L19`：用正则匹配所有 `${key}`，在 `appInfo.settings` 字典里查找替换值，找不到则保留原样（留给部署时人工填写）
 - 去重逻辑 `create-dotenv.ts#L59-L67`：使用 `Map` 按 key 去重，后入的覆盖先入的。这意味着**插件的 before 钩子注入的变量会覆盖默认 `ENV_VARIABLES` 中的同名变量**，因为 before 管道修改的是传给 `createDotEnvModuleInternal` 的参数
+- 占位符替换引擎（详见第 7 节完整分析）
 
 #### Admin 端
 
@@ -346,20 +544,24 @@ PORT=3001
 VITE_REACT_APP_SERVER_URL=http://localhost:3000
 ```
 
-变量提取由 `packages/data-service-generator/src/utils/dotenv.ts#L21-L33` 完成，按行用 `=` 分割，非常朴素的解析：
+变量提取由 `packages/data-service-generator/src/utils/dotenv.ts#L21-L33` 完成，按行用 `=` 分割：
 
 ```typescript
 function extractVariablesFromCode(code: string): VariableDictionary {
   const arr: VariableDictionary = [];
   code.split("\n").forEach((line) => {
     const content = line.split("=");
-    if (!content || content.length != 2) return;
+    if (!content || content.length != 2) return;  // 非 KEY=VALUE 格式的行被静默丢弃
     const [key, value] = content;
     arr.push({ [key]: value });
   });
   return arr;
 }
 ```
+
+这个解析器很朴素：
+- value 中的 `=` 会导致解析错误（如 `CONNECTION_STR=host=localhost;port=5432` 会被解析成 key=`CONNECTION_STR`，value=`host`）
+- 不支持注释行（`# comment` 会被解析为 key=`# comment`，value 为空字符串，但因为 `length != 2` 被丢弃，结果是注释行被静默跳过——恰好符合预期）
 
 ---
 
@@ -370,13 +572,16 @@ function extractVariablesFromCode(code: string): VariableDictionary {
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  消费层：AuthModule / JwtStrategy / Prisma / Kafka ...   │
-│  依赖方式：@Inject(TOKEN) 拿到字符串值                    │
+│  依赖方式：@Inject(TOKEN) 拿到字符串值（第一级消费者）    │
+│           ConfigService.get(...)（第二级消费者）         │
+│           process.env（第三级消费者）                     │
 │  不感知 secrets 的获取方式                                │
 └────────────────────────────┬─────────────────────────────┘
                              │ NestJS DI
                              ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Factory 层：jwtSecretFactory / JwtModule.registerAsync  │
+│  仅第一级消费者经过此层                                   │
 │  依赖方式：注入 SecretsManagerService，调用 getSecret()   │
 │  决定"必须/可选"语义，处理 null → 抛错或降级             │
 └────────────────────────────┬─────────────────────────────┘
@@ -401,6 +606,12 @@ function extractVariablesFromCode(code: string): VariableDictionary {
 │  默认：dotenv → process.env                               │
 │  ★ 可替换：自定义 load 函数接入 AWS Secrets Manager、     │
 │           HashiCorp Vault、K8s Secrets 等                 │
+└────────────────────────────┬─────────────────────────────┘
+                             │
+                             ▼
+┌──────────────────────────────────────────────────────────┐
+│  进程环境：process.env (Node.js)                          │
+│  第三级消费者直接访问（如 main.ts 的 PORT）                │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -414,7 +625,7 @@ export interface ISecretsManager {
 }
 ```
 
-契约非常精简：只承诺"给我枚举中的某个 key，我 Promise 你一个值或 null"。实现方可以自由选择同步读环境变量、异步调远程 API、带缓存、带轮换等。
+契约非常精简：只承诺"给我枚举中的某个 key，我 Promise 你一个值或 null"。实现方可以自由选择同步读环境变量、异步调远程 API、带缓存、带密钥轮换逻辑等。
 
 ### 4.3 基类实现（不可变层）
 
@@ -502,11 +713,9 @@ JwtModule.registerAsync({
 })
 ```
 
-这里展示了一个重要的**边界划分规则**：
-- 真正的 secrets（如 JWT 签名密钥）通过 `SecretsManagerService` 读取，便于未来替换为外部 provider
-- 普通配置（如 JWT 过期时间）直接走 `ConfigService.get()`，不经过 SecretsManager
-
-两者的读取方式在消费端被明确区分，避免了"所有配置都当作 secrets"的过度设计。
+这里展示了明确的边界划分：
+- 真正的 secrets（JWT 签名密钥）通过 `SecretsManagerService` 读取
+- 普通配置（JWT 过期时间）直接走 `ConfigService.get()`
 
 **步骤 3：业务 Strategy 只拿值 —— 完全不感知来源**
 
@@ -524,7 +733,7 @@ export class JwtStrategy extends JwtStrategyBase {
 }
 ```
 
-`JwtStrategy` 的构造参数只是一个 `string`。它既不知道 `SecretsManagerService` 的存在，也不知道 `.env` 文件的存在。测试时只需：
+`JwtStrategy` 的构造参数只是一个 `string`。测试时只需：
 
 ```typescript
 { provide: JWT_SECRET_KEY_PROVIDER_NAME, useValue: "test-secret" }
@@ -572,13 +781,7 @@ const importModules = [
 export class AppModule {}
 ```
 
-这意味着插件可以通过 `CreateServerAppModule` 的 after 钩子，把生成出的：
-
-```typescript
-ConfigModule.forRoot({ isGlobal: true })
-```
-
-修改为例如：
+插件可以通过 `CreateServerAppModule` 的 after 钩子修改配置，例如：
 
 ```typescript
 ConfigModule.forRoot({
@@ -588,7 +791,7 @@ ConfigModule.forRoot({
 })
 ```
 
-这是系统最深层的扩展点——在 `SecretsManagerService` 之下替换配置源。但**除非有特殊需求（如集中式密钥管理），推荐优先扩展 `SecretsManagerService` 子类**，因为：
+但**除非有集中式密钥管理需求，推荐优先扩展 `SecretsManagerService` 子类**，因为：
 - 改动范围小，只影响 secrets 读取
 - 类型安全（受 `EnumSecretsNameKey` 约束）
 - 不影响普通配置的读取路径
@@ -597,13 +800,13 @@ ConfigModule.forRoot({
 
 | 层级 | 接口 | 是否可被插件/用户替换 | 推荐替换方式 | 对应代码 |
 |------|------|---------------------|------------|---------|
-| Secrets 枚举定义 | `EnumSecretsNameKey` | ✅ | `CreateServerSecretsManager` before 钩子追加 `SecretsNameKey[]` | `create-secrets-manager.ts#L70-L83` |
-| Secrets Manager 接口 | `ISecretsManager` | ⚠️ 不推荐 | 改变契约会破坏所有消费端 | `secretsManager.service.base.template.ts#L4-L6` |
+| Secrets 枚举定义 | `EnumSecretsNameKey` | ✅ | `CreateServerSecretsManager` before 钩子追加 `SecretsNameKey[]` | `packages/data-service-generator/src/server/secrets-manager/create-secrets-manager.ts#L70-L83` |
+| Secrets Manager 接口 | `ISecretsManager` | ⚠️ 不推荐 | 改变契约会破坏所有消费端 | `packages/data-service-generator/src/server/secrets-manager/static/base/secretsManager.service.base.template.ts#L4-L6` |
 | Secrets Manager 基类 | `SecretsManagerServiceBase` | ⚠️ 谨慎 | 一般无需改动，除非需要增加缓存、轮换等通用能力 | 同上 `#L8-L17` |
-| Secrets Manager 实现 | `SecretsManagerService` | ✅ 推荐 | `CreateServerSecretsManager` after 钩子替换整个文件，重写 `getSecret` 接入外部 SDK | `secretsManager.service.template.ts#L1-L10` |
-| Factory Provider | `jwtSecretFactory` 等 | ✅ | 插件可追加自己的 Factory，或通过 `CreateServerAuth` 钩子修改 AuthModule | `jwtSecretFactory.ts` |
-| ConfigModule 配置 | `ConfigModule.forRoot(...)` | ✅ | `CreateServerAppModule` after 钩子修改生成的 app.module.ts AST | `create-app-module.ts#L72-L78` |
-| .env 变量列表 | `CreateServerDotEnvParams.envVariables` | ✅ | `CreateServerDotEnv` before（追加/覆盖变量）或 after（修改文件文本） | `create-dotenv.ts#L28-L48` |
+| Secrets Manager 实现 | `SecretsManagerService` | ✅ 推荐 | `CreateServerSecretsManager` after 钩子替换整个文件，重写 `getSecret` 接入外部 SDK | `packages/data-service-generator/src/server/secrets-manager/static/secretsManager.service.template.ts#L1-L10` |
+| Factory Provider | `jwtSecretFactory` 等 | ✅ | 插件可追加自己的 Factory，或通过 `CreateServerAuth` 钩子修改 AuthModule | `packages/gpt-gateway/src/auth/jwt/jwtSecretFactory.ts` |
+| ConfigModule 配置 | `ConfigModule.forRoot(...)` | ✅ | `CreateServerAppModule` after 钩子修改生成的 app.module.ts AST | `packages/data-service-generator/src/server/app-module/create-app-module.ts#L72-L78` |
+| .env 变量列表 | `CreateServerDotEnvParams.envVariables` | ✅ | `CreateServerDotEnv` before（追加/覆盖变量）或 after（修改文件文本） | `packages/data-service-generator/src/server/create-dotenv.ts#L28-L48` |
 
 ---
 
@@ -641,6 +844,14 @@ ConfigModule.forRoot({
   │      secretsManager.service.ts（空子类）
   │      secretsManager.module.ts
   │
+  ├─ [pluginWrapper after 管道]
+  │    after 钩子收到原始 args（但对象引用已被 before 修改，
+  │    所以 eventParams.secretsNameKey 仍然包含 JwtSecretKey）
+  │
+  ├─ [pluginWrapper upsert]
+  │    所有生成的文件被 upsert 到 context.modules，
+  │    供后续事件（如 CreateServerAuth）的插件访问
+  │
   ├─ [createDotEnvModule] 传入 ENV_VARIABLES
   │
   ├─ [pluginWrapper 执行 before 管道]
@@ -648,13 +859,18 @@ ConfigModule.forRoot({
   │      { JWT_SECRET_KEY: "Change_ME!!!" }
   │      { JWT_EXPIRATION: "2d" }
   │
-  ├─ [createDotEnvModuleInternal] 去重 → 排序 → 占位符替换
+  ├─ [createDotEnvModuleInternal]
+  │    去重 → 排序 → 占位符替换（见第 7 节）
   │    输出 server/.env：
   │      BCRYPT_SALT=10
   │      COMPOSE_PROJECT_NAME=amp_cll5bbdjs093...
   │      JWT_EXPIRATION=2d
   │      JWT_SECRET_KEY=Change_ME!!!
   │      PORT=3000
+  │
+  ├─ [createServerInternal 末尾] mergeMany 收集所有子模块返回值
+  │
+  ├─ [create-data-service.ts] modules.merge(createServer()) 合并到最终输出
   │
   ├─ [createAppModule] 扫描所有 *.module.ts 自动加入 imports
   │    SecretsManagerModule 被自动注册到 AppModule.imports
@@ -666,19 +882,23 @@ ConfigModule.forRoot({
 │                        运行阶段                              │
 └─────────────────────────────────────────────────────────────┘
   │
+  ├─ [Node 启动] main.ts 执行
+  │    const { PORT = 3000 } = process.env;    // 第三级消费者，绕过 DI
+  │
   ├─ [NestJS 启动] AppModule 初始化
   │    ConfigModule.forRoot() 自动加载 server/.env → process.env
   │
   ├─ [AuthModule 初始化]
   │    导入 SecretsManagerModule → SecretsManagerService 可用
   │
-  ├─ [jwtSecretFactory.useFactory 被调用]
+  ├─ [jwtSecretFactory.useFactory 被调用] （第一级消费者）
   │    └─► SecretsManagerService.getSecret<string>(EnumSecretsNameKey.JwtSecretKey)
   │         └─► SecretsManagerServiceBase.getSecret("JWT_SECRET_KEY")
-  │              └─► ConfigService.get("JWT_SECRET_KEY")
+  │              └─► ConfigService.get("JWT_SECRET_KEY")           （ConfigService）
   │                   └─► 返回 process.env.JWT_SECRET_KEY = "Change_ME!!!"
   │
-  ├─ [JwtModule.registerAsync] 拿到 secret 和 expiresIn
+  ├─ [JwtModule.registerAsync]
+  │    第一级消费者读 JWT_SECRET_KEY，第二级消费者读 JWT_EXPIRATION
   │    → JwtModule 内部配置：{ secret: "Change_ME!!!", signOptions: { expiresIn: "2d" } }
   │
   ├─ [JwtStrategy 实例化]
@@ -724,23 +944,177 @@ ConfigModule.forRoot({
 - **排序（`sortAlphabetically`）**：保证多次构建输出稳定。如果每次生成的 `.env` 变量顺序不同，Git 会产生无意义的 diff，影响代码评审和变更追踪
 - **去重（`removeDuplicateKeys`）**：多个插件可能声明同一个变量（如都需要 `DB_URL`），用 `Map` 去重保证后注册的插件覆盖先注册的，形成明确的优先级
 
-### 6.6 为什么保留 `${resourceId}` 等占位符，而不是在构建时完全替换为字面量？
+### 6.6 为什么 after 钩子收到原始 args 而非 updatedEventParams？
 
-`replacePlaceholdersInCode` 的设计是"替换能替换的，保留替换不了的"：
+这是一个需要理解的设计选择，有正反两面：
+
+**正面（设计意图）**：
+- `eventParams` 通常是**对象引用**，before 钩子的就地修改（如 `.push()`）会反映到原始对象上，after 钩子实际上能看到绝大多数修改
+- 避免了"before 插件返回的新对象里包含大量中间态字段，after 钩子意外依赖"的耦合
+- after 钩子的主要职责是**修改 ModuleMap**，不是查看参数
+
+**潜在陷阱**：
+- 如果某个 before 插件返回了全新的对象（`return { ...eventParams, extra }`），after 钩子看不到新增的 `extra` 字段
+- 因此插件约定：before 钩子应就地修改参数，不要返回新对象
+
+---
+
+## 7. 占位符替换机制深度分析
+
+### 7.1 核心实现
+
+`packages/data-service-generator/src/utils/text-file-parser.ts#L1-L19`：
 
 ```typescript
-return code.replace(regex, (matched) => {
-  const key = matched.slice(2, -1);
-  if (mapping.hasOwnProperty(key)) {
-    return mapping[key]?.toString() || "";
-  } else {
-    return matched;   // ★ 找不到就保留原样
-  }
-});
+export function replacePlaceholdersInCode(
+  code: string,
+  mapping: { [key: string]: string | number | boolean | { [key: string]: any } }
+): string {
+  const regexStr = Object.keys(mapping)
+    .map((key) => `\\$\{${key}}`)
+    .join("|");
+
+  const regex = new RegExp(regexStr, "gi");
+
+  return code.replace(regex, (matched) => {
+    const key = matched.slice(2, -1);
+    if (mapping.hasOwnProperty(key)) {
+      return mapping[key]?.toString() || "";
+    } else {
+      return matched;
+    }
+  });
+}
 ```
 
-这形成了两级配置机制：
-1. **构建时替换**：已知的资源级配置（如 `resourceId`、项目名）直接写入 `.env`，减少部署时的配置量
-2. **部署时覆盖**：运维人员拿到生成的 `.env` 后，可以修改那些故意保留的占位符（或直接替换已填入的值），无需重新触发代码生成
+### 7.2 动态正则构建 —— 只替换 mapping 中存在的 key
 
-生成的 `.env` 文件的注释（虽然 DSG 当前未生成注释）本质上是"开发模板 + 生产配置"的中间产物。
+第一步不是用通用的 `/\$\{[^}]+\}/g` 匹配所有 `${...}`，而是**根据 mapping 中的 key 动态构建正则**：
+
+```typescript
+const regexStr = Object.keys(mapping).map(key => `\\$\{${key}}`).join("|");
+```
+
+示例：如果 `mapping = { resourceId: "abc123", name: "myapp" }`，则：
+```
+regexStr = "\$\{resourceId}|\$\{name}"
+regex    = /\$\{resourceId\}|\$\{name}/gi
+```
+
+**关键结果**：mapping 里没有的 key（如 `${DB_PASSWORD}`）**根本不会被正则匹配到**，替换函数不会被调用，这些占位符就原样保留在输出中。
+
+这比"先匹配所有，再判断有没有"的实现更高效，也更语义明确：不需要替换的内容连碰都不碰。
+
+### 7.3 替换逻辑的边界条件
+
+替换回调函数：
+
+```typescript
+(matched) => {
+  const key = matched.slice(2, -1);              // "${resourceId}" → "resourceId"
+  if (mapping.hasOwnProperty(key)) {             // 防御式检查（理论上正则已保证）
+    return mapping[key]?.toString() || "";       // 值 → 字符串
+  } else {
+    return matched;                              // 理论上不会走到这分支
+  }
+}
+```
+
+**边界条件清单**：
+
+| mapping[key] 的值 | 替换结果 | 说明 |
+|-------------------|---------|------|
+| `"abc"` | `"abc"` | 正常字符串 |
+| `123` | `"123"` | 数字被 `toString()` 转为字符串 |
+| `true` | `"true"` | 布尔值被 `toString()` 转为字符串 |
+| `false` | `""`（空字符串） | ⚠️ **陷阱**：`false.toString()` 是 `"true"`？不 —— `false?.toString()` 返回 `"false"`，但 `|| ""` 因为 `"false"` 是 truthy 所以没问题，实际返回 `"false"` |
+| `0` | `"0"` | `0.toString()` 返回 `"0"`，且 `"0"` 是 truthy，所以没问题 |
+| `""`（空字符串） | `""` | `""?.toString()` 是 `""`，`"" || ""` 还是 `""` |
+| `null` | `""`（空字符串） | ⚠️ `null?.toString()` 返回 `undefined`，`undefined || ""` 返回 `""` |
+| `undefined` | `""`（空字符串） | ⚠️ 同上 |
+| `{ nested: "obj" }` | `"[object Object]"` | ⚠️ 对象被 `toString()` 序列化为 `"[object Object]"`，可能不是预期结果 |
+
+关于 `false` 的修正：代码 `mapping[key]?.toString() || ""` 中，`?.` 只在值为 `null/undefined` 时短路返回 `undefined`。对于 `false`、`0`、`""` 这些 falsy 但非空的值，`?.toString()` 会正常执行：
+- `false?.toString()` → `"false"`（truthy）→ 返回 `"false"` ✅
+- `(0)?.toString()` → `"0"`（truthy）→ 返回 `"0"` ✅
+- `("")?.toString()` → `""`（falsy）→ `"" || ""` → `""` ✅（和原值一致）
+
+所以真正会被意外替换为空字符串的只有 `null` 和 `undefined`——这恰好是合理的：配置项不存在就留空。
+
+### 7.4 数据源：appInfo.settings
+
+在 `.env` 生成中，mapping 来自：
+
+```typescript
+// packages/data-service-generator/src/server/create-dotenv.ts#L39
+const serviceSettingsDic: { [key: string]: any } = appInfo.settings;
+```
+
+`appInfo.settings` 的类型是 `ServiceSettings`，定义于 `libs/util/code-gen-types/src/code-gen-types.ts#L33-L43`：
+
+```typescript
+export type AppInfo = {
+  name: string;
+  description: string;
+  version: string;
+  id: string;
+  url: string;
+  settings: ServiceSettings;   // ← 这是 mapping 的来源
+  codeGeneratorVersionOptions: models.CodeGeneratorVersionOptionsInput;
+  // ...
+};
+```
+
+**实际中会包含的典型 key**（基于 `${resourceId}` 在默认 `ENV_VARIABLES` 中的使用推断）：
+- `resourceId`：资源的唯一标识符，用于 `COMPOSE_PROJECT_NAME=amp_${resourceId}`
+- 可能还有 `name`、`version`、`dbConnectionString` 等插件注入的占位符
+
+### 7.5 仅在 .env 生成中使用
+
+当前代码库中，`replacePlaceholdersInCode` 只被两处调用：
+
+| 调用位置 | 被替换的内容 |
+|---------|------------|
+| `packages/data-service-generator/src/server/create-dotenv.ts#L43` | Server 端 `.env` 文件文本 |
+| `packages/data-service-generator/src/admin/create-dotenv.ts#L54` | Admin UI 端 `.env` 文件文本 |
+
+代码文件（`.ts`、`.tsx`、模板文件等）**不经过占位符替换**。代码中的动态内容通过 AST 操作（`recast` + `ast-types` 的 `builders`）直接拼接，而不是字符串替换。
+
+这是一个明确的职责划分：
+- **配置文件**（`.env`）：用占位符替换，简单直接
+- **代码文件**：用 AST 操作，保证语法正确、类型安全
+
+---
+
+## 8. 消费者一览表（完整清单）
+
+基于 `packages/gpt-gateway` 代码库的实际消费者统计：
+
+### 第一级：SecretsManagerService 消费者
+
+| 消费者 | 读取的枚举值 | 必须/可选 | 代码位置 |
+|--------|------------|----------|---------|
+| `jwtSecretFactory` | `EnumSecretsNameKey.JwtSecretKey` | 必须 | `packages/gpt-gateway/src/auth/jwt/jwtSecretFactory.ts#L1-L19` |
+| `AuthModule` `JwtModule.registerAsync` | `EnumSecretsNameKey.JwtSecretKey` | 必须 | `packages/gpt-gateway/src/auth/auth.module.ts#L29-L31` |
+
+### 第二级：ConfigService.get() 消费者
+
+| 消费者 | 读取的变量 | 必须/可选 | 代码位置 |
+|--------|----------|----------|---------|
+| `generateKafkaClientOptions` | `KAFKA_BROKERS` | 必须 | `packages/gpt-gateway/src/kafka/generateKafkaClientOptions.ts#L7` |
+| 同上 | `KAFKA_ENABLE_SSL` | 可选（默认 `false`） | 同上 `#L8` |
+| 同上 | `KAFKA_CLIENT_ID` | 必须 | 同上 `#L9` |
+| 同上 | `KAFKA_GROUP_ID` | 必须 | 同上 `#L10` |
+| `PasswordService` 构造函数 | `BCRYPT_SALT` | 必须 | `packages/gpt-gateway/src/auth/password.service.ts#L20-L22` |
+| `AuthModule` `JwtModule.registerAsync` | `JWT_EXPIRATION` | 必须 | `packages/gpt-gateway/src/auth/auth.module.ts#L32` |
+| `ServeStaticOptionsService` | `SERVE_STATIC_ROOT_PATH` | 可选（默认 undefined 则走内置 swagger 路径） | `packages/gpt-gateway/src/serveStaticOptions.service.ts#L26-L28` |
+| `AppModule` GraphQL 配置 | `GRAPHQL_SCHEMA_DEST` | 可选（有默认值） | `packages/gpt-gateway/src/app.module.ts#L50` |
+| 同上 | `GRAPHQL_DEBUG` | 可选（默认 `false`） | 同上 `#L53` |
+| 同上 | `GRAPHQL_PLAYGROUND_ENABLED` | 可选（默认 `false`） | 同上 `#L54` |
+| 同上 | `GRAPHQL_INTROSPECTION_ENABLED` | 可选（默认 `false`） | 同上 `#L56` |
+
+### 第三级：process.env 直读
+
+| 消费者 | 读取的变量 | 必须/可选 | 代码位置 |
+|--------|----------|----------|---------|
+| `main.ts`（NestJS 启动前） | `PORT` | 可选（默认 `3000`） | `packages/gpt-gateway/src/main.ts#L19` |
