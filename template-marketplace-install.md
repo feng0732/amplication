@@ -501,7 +501,296 @@ await this.analyticsService.trackWithContext({
 
 ---
 
-## 六、关键文件索引
+## 六、模板选中后 Blueprint 切换机制及对表单的影响
+
+### 6.1 切换流程
+
+用户在 [TemplateSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Components/TemplateSelectField.tsx#L15-L30) 下拉框中选择模板后，事件回调 `onChange(templateId)` 触发 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L337-L352) 中的 `handleTemplateChange`：
+
+```typescript
+const handleTemplateChange = useCallback(
+  (templateId: string) => {
+    if (templateId) {
+      // 从已加载的 availableTemplates 中查找模板对象
+      const template = availableTemplates.find(
+        (template) => template.id === templateId
+      );
+
+      if (template) {
+        // 关键：用模板关联的 blueprintId 驱动表单切换
+        handleBlueprintChange(template.blueprintId, templateId);
+      }
+    } else {
+      handleBlueprintChange(undefined, undefined);
+    }
+  },
+  [availableTemplates, handleBlueprintChange]
+);
+```
+
+`handleTemplateChange` 不直接修改表单，而是提取模板的 `blueprintId` 交给 `handleBlueprintChange` 统一处理。这意味着**模板本身不决定表单字段，真正的控制器是 Blueprint**。模板只是 Blueprint 的一个"载体"或"预设包"。
+
+### 6.2 Blueprint 切换对表单状态的重置
+
+`handleBlueprintChange` 定义在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L306-L334)：
+
+```typescript
+const handleBlueprintChange = useCallback(
+  (blueprintId: string, templateId?: string) => {
+    let settingsInitialValue = { properties: {} };
+
+    if (blueprintId) {
+      const blueprint = blueprintsMapById[blueprintId];
+      if (blueprint) {
+        // 根据 Blueprint 定义的属性，生成初始空值对象
+        settingsInitialValue = {
+          properties: blueprint.properties.reduce((acc, property) => {
+            acc[property.key] = "";  // 每个属性默认空字符串
+            return acc;
+          }, {}),
+        };
+      }
+    }
+
+    // 用 Formik 的 enableReinitialize 机制整体重置表单
+    setInitialValueWithSettings({
+      ...initialValue,
+      settings: settingsInitialValue,                 // 重置 Blueprint 级别的设置
+      blueprint: { connect: { id: blueprintId || "" } },
+      templateId: templateId || "",
+    });
+  },
+  [blueprintsMapById, initialValue]
+);
+```
+
+### 6.3 对表单的具体影响
+
+切换 Blueprint（通过模板或直接选 Blueprint）会触发以下连锁变化：
+
+| 变化点 | 影响 | 来源 |
+|--------|------|------|
+| `settings.properties` 重置 | Blueprint 级别的资源设置清空并按新 Blueprint 的属性重建 | `handleBlueprintChange` 中 `settingsInitialValue` |
+| `blueprint.connect.id` 更新 | 表单中 Blueprint 字段更新 | `setInitialValueWithSettings` |
+| `templateId` 联动更新 | 如果是通过模板切换则记录 templateId，直接选 Blueprint 则清空 | `handleBlueprintChange` 第二个参数 |
+| Blueprint 选择框禁用状态 | 选中模板后 BlueprintSelectField 的 `disabled={!!formik.values.templateId}` 生效，防止用户手动改变 Blueprint | [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L424-L431) |
+| 动态渲染 Blueprint 设置面板 | `CreateResourceFormResourceSettings` 根据 `blueprintId` 渲染对应的 `ResourceSettingsFormFields` | [CreateResourceFormResourceSettings.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceFormResourceSettings.tsx#L21-L64) |
+| settings.properties 再次清空 | 切换 Blueprint 时 useEffect 再次兜底清空设置字段（双重保险） | [CreateResourceFormResourceSettings.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceFormResourceSettings.tsx#L30-L35) |
+| 校验 schema 动态变更 | `getValidationSchema(blueprintId)` 根据新 Blueprint 的属性结构重建 JSON Schema | [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L182-L209) |
+
+Blueprint 设置面板的条件渲染逻辑：
+
+```typescript
+// 只有当 blueprint 存在、且定义了 properties，才会渲染配置面板
+return (
+  blueprint &&
+  blueprint.properties &&
+  blueprint.properties.length > 0 && (
+    <div>
+      <Text textStyle={EnumTextStyle.H4}>
+        {blueprint?.name} Configuration
+      </Text>
+      <Panel panelStyle={EnumPanelStyle.Bordered}>
+        <ResourceSettingsFormFields
+          blueprintId={blueprintId}
+          fieldNamePrefix="settings."
+        />
+      </Panel>
+    </div>
+  )
+);
+```
+
+---
+
+## 七、创建成功后自定义属性与资源设置的单独保存机制
+
+模板创建资源的 Mutation（`createResourceFromTemplate`）只接收 `name / description / project / serviceTemplate / gitRepository` 这几个基础字段，**并不包含** `properties`（Catalog 自定义属性）和 `settings`（Blueprint 资源设置）。这两部分数据在创建成功后通过**两次独立的 Mutation** 单独保存。
+
+### 7.1 保存流程总览
+
+在 [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L43-L93) 的 `createResource` 函数中：
+
+```typescript
+const createResource = (
+  data: models.ResourceCreateInput,
+  templateId: string,
+  catalogProperties?: Record<string, any>,   // 全局自定义属性
+  settings?: models.ResourceSettingsUpdateInput  // Blueprint 级资源设置
+) => {
+  if (templateId) {
+    createServiceFromTemplateInternal({
+      variables: {
+        data: {
+          name: data.name,
+          description: data.description,
+          gitRepository: data.gitRepository,
+          project: data.project,
+          serviceTemplate: { id: templateId },
+          // 注意：这里没有传 properties 和 settings！
+        },
+      },
+    })
+      .then(async (result) => {
+        if (result.data?.createResourceFromTemplate) {
+          // ===== 创建成功后，再单独保存扩展属性 =====
+          await saveResourceSettings(
+            result.data.createResourceFromTemplate,
+            catalogProperties,
+            settings
+          );
+          onResourceCreated &&
+            onResourceCreated(result.data.createResourceFromTemplate);
+        }
+      })
+      .catch(console.error);
+  }
+  // ... 普通 Component 分支逻辑相同
+};
+```
+
+### 7.2 saveResourceSettings：并行写入两个独立端点
+
+[useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L95-L127) 中定义了保存逻辑：
+
+```typescript
+const saveResourceSettings = async (
+  resource: models.Resource,
+  catalogProperties?: Record<string, any>,
+  settings?: models.ResourceSettingsUpdateInput
+) => {
+  const promises = [];
+
+  // 第一路：保存 Catalog 自定义属性（全局级）
+  if (catalogProperties && Object.keys(catalogProperties).length > 0) {
+    promises.push(
+      updateResource({
+        variables: {
+          data: { properties: catalogProperties },  // 写到 resource.properties
+          resourceId: resource.id,
+        },
+      })
+    );
+  }
+
+  // 第二路：保存 Blueprint 资源设置（Blueprint 级）
+  if (settings && Object.keys(settings).length > 0) {
+    promises.push(
+      updateResourceSettings({
+        variables: {
+          data: { ...settings },                     // 写到独立的 ResourceSettings entity
+          resourceId: resource.id,
+        },
+      })
+    );
+  }
+
+  return Promise.all(promises);   // 两个请求并行发出
+};
+```
+
+### 7.3 两条保存路径的差异
+
+| 维度 | 自定义属性（catalogProperties） | 资源设置（settings） |
+|------|------------------------------|---------------------|
+| 存储位置 | `Resource.properties`（JSON 字段） | 独立的 `ResourceSettings` entity，通过外键关联 Resource |
+| GraphQL Mutation | `UPDATE_RESOURCE` → `updateResource` | `UPDATE_RESOURCE_SETTINGS` → `updateResourceSettings` |
+| Query 定义位置 | [resourcesQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Workspaces/queries/resourcesQueries.ts#L186-L205) | [resourceSettingsQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ResourceSettings/queries/resourceSettingsQueries.ts#L1-L13) |
+| 触发条件 | `catalogProperties` 不为空对象 | `settings` 不为空对象 |
+| 表单来源 | `CustomPropertiesFormFields`（工作区级全局自定义属性） | `ResourceSettingsFormFields`（当前 Blueprint 定义的属性） |
+| 数据结构 | `Record<string, any>` 扁平键值对 | `ResourceSettingsUpdateInput { properties: Record<string, any> }` 嵌套在 properties 字段下 |
+
+### 7.4 为什么不合并到一次创建请求？
+
+从设计上看，原因有二：
+
+1. **职责分离**：`createResourceFromTemplate` 的后端逻辑只关注模板本身（复制 serviceSettings、拷贝插件、记录版本关联等），不处理可变的自定义属性。
+2. **创建时序**：Resource 必须先存在（拿到 `resource.id`），才能更新其 `properties` 或创建关联的 `ResourceSettings` 记录——后者依赖前者的主键。
+
+---
+
+## 八、禁用 Blueprint 的模板为何前端仍显示及后端拒绝机制
+
+### 8.1 前端显示问题：TemplateSelectField 中的过滤 Bug
+
+在 [TemplateSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Components/TemplateSelectField.tsx#L18-L27) 中：
+
+```typescript
+const options = useMemo(() => {
+  return availableTemplates
+    // ⚠️ Bug：`|| true` 让整个过滤条件永远返回 true
+    .filter((serviceTemplate) => serviceTemplate.blueprint?.enabled || true)
+    .map((serviceTemplate) => ({
+      value: serviceTemplate.id,
+      label: serviceTemplate.name,
+      description: serviceTemplate.description,
+      color: DEFAULT_COLOR,
+    }));
+}, [availableTemplates]);
+```
+
+逻辑解析：
+- 如果 `blueprint?.enabled === true` → `true || true` → **显示**（正确）
+- 如果 `blueprint?.enabled === false` → `false || true` → **显示**（错误，本应过滤掉）
+- 如果 `blueprint` 为 `null/undefined` → `undefined || true` → **显示**（也不符合预期）
+
+因此无论 Blueprint 是否启用，模板都会出现在下拉列表中。
+
+### 8.2 对比：BlueprintSelectField 的正确实现
+
+作为参照，[BlueprintSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Blueprints/BlueprintSelectField.tsx#L19-L30) 对 Blueprint 自身做了正确过滤：
+
+```typescript
+const options = useMemo(() => {
+  return findBlueprintsData?.blueprints
+    .filter((blueprint) => blueprint.enabled)   // ✅ 没有 || true，只保留启用的
+    .map((blueprint) => ({
+      value: useKeyAsValue ? blueprint.key : blueprint.id,
+      label: blueprint.name,
+      enabled: blueprint.enabled,
+      description: blueprint.description,
+      color: blueprint.color || resourceThemeMap[EnumResourceType.Component].color,
+    }));
+}, [findBlueprintsData?.blueprints, useKeyAsValue]);
+```
+
+这就是为什么**直接选 Blueprint 时看不到禁用的，但通过模板选时可以看到**。两边的过滤策略不一致。
+
+### 8.3 后端拒绝机制：Step 3 中的双重校验
+
+即便前端绕过了过滤（或因 Bug 显示了禁用模板），后端在 [serviceTemplate.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L276-L290) 的 `createResourceFromTemplate` Step 3 会做严格校验：
+
+```typescript
+const blueprint = await this.prisma.blueprint.findUnique({
+  where: { id: template.blueprintId },
+});
+
+if (!blueprint) {
+  throw new AmplicationError(`The template is missing a blueprint`);
+}
+
+if (!blueprint.enabled) {
+  throw new AmplicationError(
+    `The selected template is based on a disabled blueprint.`
+  );
+}
+```
+
+后端检查的时序与错误码：
+
+| 校验条件 | 失败时抛出的错误信息 | 发生在 Step |
+|---------|-------------------|------------|
+| 模板在可见范围内（来自 `availableServiceTemplatesForProject` 结果） | `Service template not found` | Step 1 |
+| 模板有已发布的版本 | `Template version not found` | Step 2 |
+| 模板关联的 Blueprint 存在 | `The template is missing a blueprint` | Step 3 |
+| Blueprint 的 `enabled === true` | `The selected template is based on a disabled blueprint.` | Step 3 |
+| Blueprint 的资源类型是 Service 或 Component | `The template is based on a blueprint with an unsupported resource type...` | Step 3 |
+
+这种"前端宽松展示 + 后端严格拒绝"的模式虽然保证了数据安全，但会导致用户体验不佳——选了模板填完表单提交后才被告知无法使用。修复建议是移除 `TemplateSelectField.tsx` 中 filter 里的 `|| true`。
+
+---
+
+## 九、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -513,6 +802,14 @@ await this.analyticsService.trackWithContext({
 | [EnumResourceType.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-server/src/core/resource/dto/EnumResourceType.ts) | 资源类型枚举（含 ServiceTemplate） |
 | [serviceTemplateQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ServiceTemplate/hooks/serviceTemplateQueries.ts) | 前端模板查询 GraphQL |
 | [useAvailableServiceTemplates.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ServiceTemplate/hooks/useAvailableServiceTemplates.ts) | 前端模板查询 Hook |
-| [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts) | 前端创建资源 Hook（模板分支） |
-| [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx) | 创建资源表单 UI |
-| [TemplateSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Components/TemplateSelectField.tsx) | 模板下拉选择组件 |
+| [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts) | 前端创建资源 Hook（模板分支 + saveResourceSettings 逻辑） |
+| [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx) | 创建资源表单 UI（handleTemplateChange / handleBlueprintChange 逻辑） |
+| [TemplateSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Components/TemplateSelectField.tsx) | 模板下拉选择组件（含 blueprint.enabled 过滤 Bug 所在） |
+| [BlueprintSelectField.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Blueprints/BlueprintSelectField.tsx) | Blueprint 下拉选择组件（正确过滤 blueprint.enabled） |
+| [CreateResourceFormResourceSettings.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceFormResourceSettings.tsx) | Blueprint 切换时重置 settings.properties |
+| [ResourceSettingsFormFields.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ResourceSettings/ResourceSettingsFormFields.tsx) | 动态渲染 Blueprint 级资源设置表单字段 |
+| [CustomPropertiesFormFields.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/CustomProperties/CustomPropertiesFormFields.tsx) | 渲染工作区全局自定义属性表单字段 |
+| [useResourceSettings.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ResourceSettings/hooks/useResourceSettings.tsx) | 资源设置查询/更新 Hook |
+| [resourceSettingsQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/ResourceSettings/queries/resourceSettingsQueries.ts) | UPDATE_RESOURCE_SETTINGS Mutation |
+| [resourcesQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Workspaces/queries/resourcesQueries.ts) | UPDATE_RESOURCE Mutation（保存自定义属性用） |
+| [useBlueprints.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Blueprints/hooks/useBlueprints.tsx) | Blueprint 查询 Hook |
