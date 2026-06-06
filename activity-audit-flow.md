@@ -289,8 +289,9 @@ Resolver 中动态解析：[userAction.resolver.ts#L44-L49](file:///d:/fz/0601/s
 │    resourceId: 原始服务 id（movedEntities[0].originalResourceId）     │
 │    metadata: undefined（不使用）                                      │
 │    Step 名称: APPLYING_PROJECT_REDESIGN_CHANGES (Running)            │
-│    初始日志: "Starting to apply project redesign changes"             │
-│    初始 Step 数据见 constants.ts                                      │
+│    初始日志（仅 1 条）: "Starting to apply project redesign changes"  │
+│    （⚠️ movedEntities/newServices 数量仅上报 Segment Analytics，      │
+│     不写入 Activity Log，见 constants.ts 说明）                       │
 └────────────────────┬────────────────────────────────────────────────┘
                      │
                      ▼
@@ -359,21 +360,39 @@ Resolver 中动态解析：[userAction.resolver.ts#L44-L49](file:///d:/fz/0601/s
 
 ### 6.2 初始 Step 数据
 
-定义于 [resource/constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/resource/constants.ts#L14-L26)
+定义于 [resource/constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/resource/constants.ts#L14-L29)
+
+**实际代码（仅 1 条初始日志）**：
 
 ```typescript
-export const REDESIGN_PROJECT_INITIAL_STEP_DATA = {
+export const REDESIGN_PROJECT_INITIAL_STEP_DATA: Prisma.ActionStepCreateWithoutActionInput = {
   name: APPLYING_PROJECT_REDESIGN_CHANGES,
   message: "Applying project redesign changes",
   status: EnumActionStepStatus.Running,
+  completedAt: undefined,
   logs: {
     create: [
-      { message: "Starting to apply project redesign changes", level: Info, meta: {} },
-      { message: `Moving ${movedEntities.length} entities to ${newServices.length} new services`, level: Info },
+      {
+        message: "Starting to apply project redesign changes",
+        level: EnumActionLogLevel.Info,
+        meta: {},
+      },
+      // ⚠️ 注意：常量里只有以上 1 条日志，
+      // "Moving X entities to Y new services" 并不存在于初始日志中，
+      // 该数量信息仅用于 Segment Analytics（见 redesignProject L792-L801），
+      // 实体移动的第一条日志是后续通过 onEmitUserActionLog 发射的
+      // "starting to move entities to resource {resourceId}"
     ],
   },
 };
 ```
+
+**使用方式**：在 [resource.service.ts#L777-L780](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L777-L780) 中传入 `createUserActionByTypeWithInitialStep`，创建 UserAction 时内联创建 Action + Step + 初始 Log。
+
+**创建后立刻进行的操作**：
+1. 创建 `ActionContext` 绑定该 step（后续所有日志通过 Kafka 异步落库）
+2. Segment Analytics 上报 `movedEntities.length` 和 `newServices.length`（此数据不入 Activity Log）
+3. 进入 try 块，发射第一条业务日志：`"Starting data validation"`
 
 ### 6.3 三层关联总结（ProjectRedesign 场景）
 
