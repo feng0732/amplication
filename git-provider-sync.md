@@ -670,11 +670,114 @@ isBuildStale(build: Build): boolean {
 
 ---
 
+## 六（附）：依赖锁定与 Kafka 发送确认语义 —— 代码事实 vs 外部推断
+
+> 本章专门梳理项目代码中**可直接确认的事实**与**对外部库 / Broker 行为的推断**，明确二者的边界，避免将推断误认为代码承诺。
+
+### F.1 项目依赖锁定事实（可从代码/配置直接确认）
+
+#### F.1.1 package.json 声明的版本范围
+
+[package.json:L60](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/package.json#L60) 与 [package.json:L126](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/package.json#L126)：
+
+```json
+"@nestjs/microservices": "^9.3.9",
+"kafkajs": "^2.2.4",
+```
+
+两者均使用 caret 范围（`^`），理论上允许 minor 级升级。
+
+#### F.1.2 package-lock.json 实际锁定的精确版本
+
+[package-lock.json:L9985-L9992](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/package-lock.json#L9985-L9992) 与 [package-lock.json:L42947-L42953](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/package-lock.json#L42947-L42953)：
+
+| 包名 | 锁定版本 | integrity 校验 |
+|---|---|---|
+| `@nestjs/microservices` | **9.4.3** | `sha512-piMw8d3C4ppc5St5AhQEtecMhyeBK2Q1VYk4AL3NKtG6U0fzz/6KLiETpWdKXmazeI/m7qac2upOvwmRzle0aA==` |
+| `kafkajs` | **2.2.4** | `sha512-j/YeapB1vfPT2iOIUn/vxdyKEuhuY2PxMBvf5JWux6iSaukAccrMtXEY/Lb7OvavDhOWME589bpLrEdnVHjfjA==` |
+
+> **事实**：上述两个版本已被 package-lock.json 的 integrity hash 精确锁定，`npm install` 在未修改锁文件的前提下会使用完全相同的版本。
+
+---
+
+### F.2 Kafka 发送确认语义 —— 代码实现事实（项目代码中可直接确认）
+
+以下内容均可在本项目代码仓库中找到直接证据，不依赖任何外部假设。
+
+#### F.2.1 KafkaProducerService.emitMessage() 的代码行为
+
+[KafkaProducer.service.ts:L22-L38](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts#L22-L38)
+
+| 编号 | 代码事实 | 依据 |
+|---|---|---|
+| F-1 | 方法签名为 `async emitMessage(topic, message, schemaIds?): Promise<void>`，返回值类型为 `void`，**不包含任何 Kafka 返回元数据**（offset、partition、timestamp 等均被丢弃）。 | 第 22-26 行参数与返回类型；第 33-35 行 `resolve()` 不传值 |
+| F-2 | 内部通过 RxJS Observable 的 `subscribe` 将 NestJS `ClientKafka.emit()` 的结果适配为 Promise：`next` 回调 → `resolve()`；`error` 回调 → `reject(err)`；`complete` 回调未订阅，不影响 Promise 状态。 | 第 28-37 行 |
+| F-3 | 方法体内**不包含任何重试、超时、补偿、幂等保护**等可靠性增强逻辑。 | 方法体仅包含 serializer + Observable 包装，共 11 行可执行代码 |
+
+#### F.2.2 createNestjsKafkaConfig 的配置事实
+
+[createNestjsKafkaConfig.ts:L8-L34](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts#L8-L34)
+
+| 编号 | 代码事实 | 依据 |
+|---|---|---|
+| F-4 | 仅显式配置了 `options.client`（`brokers`、`clientId`、`ssl`、`sasl`）和 `options.consumer`（`groupId`、`sessionTimeout`、`rebalanceTimeout`、`heartbeatInterval`、`maxBytesPerPartition`）。 | 第 23-33 行 options 对象字面量 |
+| F-5 | **完全未配置任何 producer 级别的参数**，包括但不限于：`acks`、`retry`、`idempotent`、`maxInFlightRequests`、`allowAutoTopicCreation`。 | options 对象中不存在 producer 键 |
+| F-6 | 未涉及 broker 端参数（`min.insync.replicas`、`flush.ms` 等本身也不属于客户端配置范畴）。 | — |
+
+#### F.2.3 KafkaModule 注册事实
+
+[Kafka.module.ts:L13-L30](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/Kafka.module.ts#L13-L30)
+
+| 编号 | 代码事实 | 依据 |
+|---|---|---|
+| F-7 | 通过 `ClientsModule.registerAsync([{ name: KAFKA_CLIENT, useFactory: createNestjsKafkaConfig }])` 注册 NestJS 的 `ClientKafka`。 | 第 15-19 行 |
+| F-8 | 未对 `ClientKafka` 做任何自定义子类化、装饰器包装或方法重写；`KafkaProducerService` 直接注入 NestJS 提供的 `ClientKafka` 实例。 | 第 16-17 行 `@Inject(KAFKA_CLIENT) private readonly kafkaClient: ClientKafka` |
+
+#### F.2.4 测试代码中的行为假设
+
+[KafkaProducer.service.spec.ts:L24-L28](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.spec.ts#L24-L28) 与 [KafkaProducer.service.spec.ts:L72-L78](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.spec.ts#L72-L78)
+
+| 编号 | 代码事实 | 依据 |
+|---|---|---|
+| F-9 | 测试用例通过 `jest.fn().mockReturnValue(of(null))` mock `ClientKafka.emit()`，其中 `of(null)` 是 RxJS 的同步 Observable 创建函数，会立即触发 `next(null)` 然后 `complete()`。 | 第 27 行；第 73 行 |
+| F-10 | 测试断言 `emitMessage()` 在 `emit` 返回 Observable.next 后 Promise resolve，说明测试作者对 `emit()` 的语义假设为"至少触发一次 next 即视为发送成功"。 | 第 72-78 行测试用例 |
+
+---
+
+### F.3 Kafka 发送确认语义 —— 对外部依赖行为的推断
+
+> ⚠️ **本节内容全部属于对外部库（NestJS / kafkajs / Kafka Broker）行为的推断**，这些行为不由本项目代码控制，可能随版本升级或部署环境变化而改变。将其列出仅为帮助理解运行时可能发生的行为，**不构成任何代码层面的契约或保证**。
+
+| 编号 | 推断内容 | 推断依据 | 不确定性边界 |
+|---|---|---|---|
+| I-1 | NestJS 9.4.3 的 `ClientKafka.emit(topic, message)` 内部会调用 `kafkajs.producer.send()`，并将返回的 Promise 适配为 Observable：Promise resolve → Observable.next + complete；Promise reject → Observable.error。 | `@nestjs/microservices` 9.4.3 公开文档与源码实现惯例；测试 F-9 / F-10 中 `of(null)` 的写法也与该语义一致。 | NestJS 内部实现未被 vendored 进本项目，无法从仓库代码直接验证；若未来升级 NestJS 版本且其修改了 Observable 适配策略，本项目无代码层感知手段。 |
+| I-2 | kafkajs 2.2.4 的 `producer.send()` 默认 `acks=-1`（即 `all`），表示生产者需等待所有当前 ISR 副本的确认后 Promise 才会 resolve；默认 `timeout=30000`。 | kafkajs 2.2.4 官方文档（kafka.js.org/docs/producing）中 `send` 方法参数表格声明。 | kafkajs 文档未附带版本化的变更追踪；即使文档描述正确，若运行时通过中间件、自定义 transport 或 broker 端 `message.timestamp.type` 等配置间接影响确认语义，生产者侧无法感知。 |
+| I-3 | `acks=all` 仅表示 Broker 将消息写入 ISR 副本的 OS page cache，不等价于写入物理磁盘。是否落盘由 broker 端 `flush.ms` / `flush.messages` / OS 刷盘策略共同决定。 | Apache Kafka 官方架构文档与业界共识。 | 属于 Kafka 分布式系统本身的可靠性边界，与本项目代码无关；不同部署环境（云厂商托管 Kafka vs 自建集群）的落盘策略差异极大。 |
+| I-4 | `acks=all` 的实际生效还受 broker 端 Topic 配置 `min.insync.replicas` 制约，若 ISR 大小低于该阈值，Broker 会返回 `NOT_ENOUGH_REPLICAS` 错误并使 producer.send() reject。 | Apache Kafka 官方文档与 kafkajs 错误码列表。 | `min.insync.replicas` 为 broker/Topic 级配置，客户端代码不可见也无法控制；本项目无法验证其在目标部署环境中的取值。 |
+| I-5 | 即使 acks=-1 成功确认，极端故障场景（所有 ISR 副本所在机器同时掉电且 page cache 未刷盘）下数据仍可能丢失。 | Apache Kafka 架构文档。 | 属于分布式系统通用可靠性边界，与本项目代码无关。 |
+
+---
+
+### F.4 事实与推断的边界总结
+
+| 维度 | 代码事实（仓库内可验证） | 外部推断（依赖运行时环境） |
+|---|---|---|
+| **依赖版本** | `@nestjs/microservices` **9.4.3**、`kafkajs` **2.2.4**（package-lock.json integrity 精确锁定） | — |
+| **Producer 配置** | 完全未配置 `acks` / `retry` / `idempotent` 等参数 | 实际取值依赖 kafkajs 默认值（推断 I-2） |
+| **emitMessage 返回值** | `Promise<void>`，不含 Kafka 元数据 | — |
+| **Promise resolve 触发** | Observable.next → resolve；Observable.error → reject（F-2） | Observable.next 对应 kafkajs Promise.resolve → 对应 Broker 已返回 acks 响应（推断 I-1 + I-2） |
+| **数据持久化** | 项目代码不包含任何持久化相关逻辑 | 依赖 Broker 配置与 OS 刷盘策略（推断 I-3 ~ I-5） |
+| **Broker 端参数** | 代码中完全不可见 | `min.insync.replicas` / `flush.ms` 等由运维侧管理（推断 I-3、I-4） |
+
+---
+
 ## 七、失败反馈边界分析
 
 ### 7.1 创建 PR 请求失败的边界情况
 
 #### 7.1.1 Kafka 消息发送失败边界
+
+> 关于 Kafka 发送确认语义的**代码事实与外部推断**的系统区分，详见第六章（附）：[六（附）：依赖锁定与 Kafka 发送确认语义 —— 代码事实 vs 外部推断](#六附依赖锁定与-kafka-发送确认语义--代码事实-vs-外部推断)。本节聚焦于失败场景的业务后果分析。
 
 **KafkaProducerService.emitMessage() 的实现：
 
@@ -692,22 +795,14 @@ async emitMessage(topic, message, schemaIds) {
 }
 ```
 
-**边界 1：对 `next` 回调含义的保守推断（多层不确定性叠加）。**
+**边界 1：从业务角度看 `next` 回调的确认范围。**
 
-本项目对 Kafka 生产者的配置极其有限：
-- [createNestjsKafkaConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts) 只配置了 `client`（brokers、clientId、ssl、sasl）和 `consumer`（groupId、sessionTimeout 等），**未显式指定任何 producer 级别参数**（`acks`、`retry`、`idempotent` 等均缺失）。
-- 因此生产者参数全部依赖下游依赖的默认值。
+结合第六章（附）F.2 节代码事实与 F.3 节推断，本项目代码可确认的最保守边界为：
+- **代码事实（F-1、F-2）**：`next` → `Promise.resolve()`，返回值为 `void`，无 Kafka 元数据
+- **代码事实（F-5）**：项目未配置 producer 级别的 `acks` / `retry` 等参数
+- **外部推断（I-1 ~ I-5）**：基于 NestJS 9.4.3 + kafkajs 2.2.4 的运行时行为，`next` 通常表示 broker 已返回 acks 响应，但具体确认等级、持久化程度受外部环境制约
 
-基于现有代码与依赖惯例，可做以下分层推断（每层推断都有其不确定性边界）：
-
-| 层级 | 可确认事实（基于代码/文档） | 不确定性边界 |
-|---|---|---|
-| **L1 NestJS → kafkajs 映射** | `ClientKafka.emit()` 返回 Observable，其 `next` 回调在内部 `kafkajs.producer.send()` 的 Promise resolve 时触发，`error` 在 reject 时触发。该映射关系可由 [KafkaProducer.service.spec.ts](file:///d:/fz/0601/solo-dogfeeding/code/42-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.spec.ts) 中 `emit.mockReturnValue(of(null))` 的测试写法佐证。 | NestJS 内部实现可能随版本变化；项目未锁定 NestJS / kafkajs 的精确子版本。 |
-| **L2 kafkajs 默认 acks** | kafkajs 官方文档声明 producer.send() 的 `acks` 默认值为 `-1`（即 `all`），含义为"all in-sync replicas must acknowledge"。 | 该默认值是 kafkajs 库层面的约定，若运行时环境通过其他方式（如自定义 transport、broker 端动态覆盖）修改了语义，生产者代码侧无法感知。 |
-| **L3 acks=-1 的实际含义** | acks=-1 表示生产者在收到**当前 ISR 集合中所有副本**的确认后才认为发送成功。但此处"确认"仅表示副本将消息写入了**操作系统页缓存（page cache）**，并不等价于写入物理磁盘。是否落盘由 broker 端 `flush.ms` / `flush.messages` 等参数控制，生产者侧完全不可见。 | 如果在生产者等待确认期间，ISR 集合发生变化（follower 掉队被踢出 ISR），或者 `min.insync.replicas`（broker 端 Topic 配置）导致 `NOT_ENOUGH_REPLICAS` 错误，生产者会抛异常，由 `error` 回调接收。本项目未显式配置 `min.insync.replicas`，该值由运维侧 broker 配置决定。 |
-| **L4 物理持久化边界** | 即使 acks=-1 确认返回，也**无法从生产者侧断言**数据已写入所有 ISR 副本的物理磁盘。极端情况（如所有 ISR 副本所在机器同时掉电且 OS page cache 未刷盘）下，数据仍可能丢失。 | 此类极端场景属于 Kafka 架构层面的可靠性边界，不依赖于本项目代码。 |
-
-综上，保守表述为：**`next` 回调 resolve，仅能说明 kafkajs producer.send() Promise 已 resolve；基于默认 acks=-1 的惯例，可合理推断当前 ISR 集合中的副本已将消息写入页缓存，但不能对物理磁盘持久化或极端故障场景下的数据完整性做出任何代码层面的保证。**
+因此，在业务失败场景分析中，**仅在代码事实层面保守表述**：`next` 回调 resolve 仅表示 `emitMessage` 未抛异常；对于消息是否已被 Broker 持久化，不做超出代码事实的任何保证。
 
 **saveToGitProvider 中对 emitMessage 的异常处理：
 
