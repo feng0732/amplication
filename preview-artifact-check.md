@@ -707,18 +707,77 @@ async handleCreatePrFailure(buildId: string, error: string) {
 // 轮询间隔: 1000ms (仅当有Running状态的Build时)
 const POLL_INTERVAL = 1000;
 
-// GET_LAST_COMMIT查询包含完整Commit+Builds+Action+Steps+Logs
+// 轮询停止条件判断 —— 只检查 Running 状态，不关心其他状态
 useEffect(() => {
-  const hasRunningBuilds = lastCommit?.builds?.some(
-    (b) => b.status === EnumBuildStatus.Running
-  );
-  if (hasRunningBuilds) {
-    startPolling(POLL_INTERVAL);
-  } else {
-    stopPolling();
+  let shouldPoll = false;
+
+  if (lastCommit && lastCommit.builds && lastCommit.builds.length > 0) {
+    const runningBuilds = lastCommit.builds.some(
+      (build) => build.status === EnumBuildStatus.Running
+    );
+    if (runningBuilds) {
+      shouldPoll = true;
+    }
   }
-}, [lastCommit]);
+
+  if (shouldPoll && currentProjectId) {
+    getLastCommitStartPolling(POLL_INTERVAL);
+  } else {
+    getLastCommitStopPolling();
+  }
+}, [..., lastCommit, ...]);
 ```
+
+**轮询停止条件边界**: `shouldPoll` 仅在存在至少一个 `status === Running` 的 Build 时为 true。这意味着：
+- 如果所有 Build 都变为 `Completed`/`Failed` → 立即停止轮询（预期行为）
+- 如果 Build 状态变为 `Canceled`/`Unknown`/`Invalid` → 也会立即停止轮询（即使后端可能还在处理中）
+
+**GET_LAST_COMMIT 轮询回调逻辑**:
+```typescript
+onCompleted: (data) => {
+  const updatedLastCommit = data.commits[0];
+  // 仅当当前 lastCommit 的 id 与最新返回一致时才更新
+  if (updatedLastCommit && updatedLastCommit.id === lastCommit?.id) {
+    setLastCommit(updatedLastCommit);
+    // 同步更新 commits 缓存中的对应 commit
+    clonedCommits[commitIdx] = updatedLastCommit;
+    setCommits(clonedCommits);
+  }
+}
+```
+
+#### updateBuildStatus 与轮询的相互影响
+
+`useBuildWatchStatus` 的 5 秒 Build 级轮询会通过 `updateBuildStatus` 回调实时更新 `lastCommit` 和 `commits` 缓存中的单个 Build 状态：
+
+```typescript
+const updateBuildStatus = useCallback((build: Build) => {
+  const clonedCommits = cloneDeep(commits);
+  const commitIdx = getCommitIdx(clonedCommits, build.commitId);
+  if (commitIdx === -1) return;
+  const commit = clonedCommits[commitIdx];
+
+  const buildIdx = commit.builds.findIndex((b) => b.id === build.id);
+  if (buildIdx === -1) return;
+  const builds = [...commit.builds];
+
+  // 仅在状态发生变化时才触发更新
+  if (builds[buildIdx].status === build.status) return;
+
+  builds[buildIdx].status = build.status;
+  builds[buildIdx].action = build.action;
+
+  setCommits(clonedCommits);
+  if (lastCommit.id === build.commitId) {
+    setLastCommit(commit);
+  }
+}, [commits, lastCommit]);
+```
+
+**关键交互**:
+1. `updateBuildStatus` 直接修改 `lastCommit` → 触发 Commit 级轮询的 `useEffect` 依赖变化
+2. Commit 级轮询重新评估 `shouldPoll`：若此时已无 Running Build，则停止 GET_LAST_COMMIT 轮询
+3. 但 Build 级轮询仍可能继续（单个 Build 页面独立轮询），两者互不阻塞
 
 GraphQL查询: `COMMIT_FIELDS_FRAGMENT`
 ```graphql
@@ -763,32 +822,154 @@ useEffect(() => {
 }, [data]);
 ```
 
-### 6.2 Commit 状态聚合
+### 6.2 Commit 状态聚合与边界处理
 
 **文件**: `packages/amplication-client/src/VersionControl/hooks/useCommitStatus.ts`
 
+#### 6.2.1 判断逻辑与优先级顺序
+
 ```typescript
-// 基于所有Build状态聚合Commit状态
 const commitStatus = useMemo(() => {
-  if (!commitBuilds?.length) return;
-  const buildsInProgress = commitBuilds.some(b => b.status === Running);
-  const buildsFailed = commitBuilds.some(b => b.status === Failed);
-  const buildsCompleted = commitBuilds.some(b => b.status === Completed);
+  if (!commitBuilds?.length) return undefined;  // 无 Build → undefined
 
-  if (buildsInProgress) return Running;   // 任一进行中 → Running
-  if (buildsFailed) return Failed;         // 任一失败 → Failed
-  if (buildsCompleted) return Completed;   // 全部完成 → Completed
+  // 使用 some() 检查：只要存在一个匹配即满足
+  const buildsInProgress = commitBuilds.some(
+    (build) => build.status === models.EnumBuildStatus.Running
+  );
+  const buildsFailed = commitBuilds.some(
+    (build) => build.status === models.EnumBuildStatus.Failed
+  );
+  const buildsCompleted = commitBuilds.some(
+    (build) => build.status === models.EnumBuildStatus.Completed
+  );
+
+  // ⚠️ 严格优先级顺序：Running > Failed > Completed > undefined
+  if (buildsInProgress) return models.EnumBuildStatus.Running;  // 第1优先级
+  if (buildsFailed) return models.EnumBuildStatus.Failed;       // 第2优先级
+  if (buildsCompleted) return models.EnumBuildStatus.Completed; // 第3优先级
+  // 所有 Build 都不在 Running/Failed/Completed 中 → 返回 undefined
 }, [commitBuilds]);
+```
 
-// 获取Commit最后一条错误信息
+**关键特征**:
+1. 使用 `some()` 而非 `every()`：**任一** Build 满足条件即触发该状态
+2. 只显式检查 `Running`、`Failed`、`Completed` 三种状态
+3. `Canceled`、`Unknown`、`Invalid` 三种状态**完全不在判断逻辑中**
+4. 判断顺序不可逆：例如 `[Running, Failed]` 的 Commit 会显示为 `Running`（而非 `Failed`）
+
+#### 6.2.2 Canceled / Unknown / Invalid 状态混入时的聚合结果
+
+以下是所有 Build 状态组合下 `commitStatus` 的实际返回值：
+
+| Build 状态组合 | buildsInProgress | buildsFailed | buildsCompleted | commitStatus 返回值 |
+|---|---|---|---|---|
+| `[Running, Running]` | ✅ true | ❌ false | ❌ false | `Running` |
+| `[Running, Completed]` | ✅ true | ❌ false | ✅ true | `Running` (Running优先) |
+| `[Running, Failed]` | ✅ true | ✅ true | ❌ false | `Running` (Running优先) |
+| `[Running, Canceled]` | ✅ true | ❌ false | ❌ false | `Running` (Running优先，Canceled被忽略) |
+| `[Running, Unknown]` | ✅ true | ❌ false | ❌ false | `Running` |
+| `[Running, Invalid]` | ✅ true | ❌ false | ❌ false | `Running` |
+| `[Failed, Failed]` | ❌ false | ✅ true | ❌ false | `Failed` |
+| `[Failed, Completed]` | ❌ false | ✅ true | ✅ true | `Failed` (Failed优先) |
+| `[Failed, Canceled]` | ❌ false | ✅ true | ❌ false | `Failed` (Canceled被忽略) |
+| `[Failed, Unknown]` | ❌ false | ✅ true | ❌ false | `Failed` |
+| `[Failed, Invalid]` | ❌ false | ✅ true | ❌ false | `Failed` |
+| `[Completed, Completed]` | ❌ false | ❌ false | ✅ true | `Completed` |
+| `[Completed, Canceled]` | ❌ false | ❌ false | ✅ true | `Completed` (Canceled被忽略) |
+| `[Completed, Unknown]` | ❌ false | ❌ false | ✅ true | `Completed` |
+| `[Completed, Invalid]` | ❌ false | ❌ false | ✅ true | `Completed` |
+| `[Canceled, Canceled]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[Canceled, Unknown]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[Canceled, Invalid]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[Unknown, Unknown]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[Unknown, Invalid]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[Invalid, Invalid]` | ❌ false | ❌ false | ❌ false | **undefined** ⚠️ |
+| `[]` (空数组) | — | — | — | **undefined** |
+
+**总结规律**:
+- 只要存在 `Running` → 必然返回 `Running`（忽略其他一切）
+- 无 `Running` 但存在 `Failed` → 返回 `Failed`（忽略 Completed/Canceled/Unknown/Invalid）
+- 无 `Running/Failed` 但存在 `Completed` → 返回 `Completed`（忽略 Canceled/Unknown/Invalid）
+- 仅剩 `Canceled/Unknown/Invalid` 任意组合 → 返回 **`undefined`**
+
+#### 6.2.3 commitStatus = undefined 时的前端显示行为
+
+当所有 Build 均为 Canceled/Unknown/Invalid（或 Build 列表为空）时，`commitStatus` 返回 `undefined`，各组件的处理如下：
+
+**(1) CommitBuildsStatusIcon 组件**
+
+**文件**: `packages/amplication-client/src/VersionControl/CommitBuildsStatusIcon.tsx`
+
+```typescript
+const CommitBuildsStatusIcon = ({ commitBuildStatus }: Props) => {
+  const isBuildRunning = useMemo(() => {
+    return commitBuildStatus === models.EnumBuildStatus.Running;
+    // undefined !== Running → false
+  }, [commitBuildStatus]);
+
+  return (
+    <span
+      // className 变为: build-status-icon build-status-icon--undefined
+      className={`${CLASS_NAME} ${CLASS_NAME}--${commitBuildStatus?.toLowerCase()}`}
+    >
+      {isBuildRunning && <CircularProgress size={16} />}  // false → 不显示加载器
+      {!isBuildRunning && commitBuildStatus && (         // commitBuildStatus 为 undefined → false
+        <Icon icon={BUILD_STATUS_TO_ICON[commitBuildStatus]} />  // 不渲染任何图标
+      )}
+    </span>
+  );
+};
+```
+
+**显示效果**: 图标区域完全空白，既没有旋转加载器，也没有 check/close 图标，仅渲染一个空的 `<span class="build-status-icon build-status-icon--undefined">`。
+
+**(2) commitLastError 错误消息**
+
+```typescript
 const commitLastError = useMemo(() => {
-  if (commitStatus !== Failed) return;
-  const failedBuild = commitBuilds.find(b => b.status === Failed);
-  const failedStep = failedBuild?.action.steps.find(s => s.status === Failed);
-  const failedLog = failedStep?.logs.find(l => l.level === Error);
+  if (!commitBuilds?.length) return;
+  if (commitStatus !== models.EnumBuildStatus.Failed) return;
+  // commitStatus 为 undefined → 提前 return，不执行后续错误查找
+  ...
   return failedLog?.message;
 }, [commitBuilds, commitStatus]);
 ```
+
+**显示效果**: 无论 Build 实际是否有错误，`commitLastError` 返回 `undefined`，前端不显示任何错误提示。
+
+**(3) LastCommit 中的 View code 按钮禁用条件**
+
+**文件**: `packages/amplication-client/src/VersionControl/LastCommit.tsx`
+
+```typescript
+<Button
+  disabled={commitRunning || commitStatus === EnumBuildStatus.Running}
+  // commitStatus 为 undefined → 不满足 === Running 条件
+  // → disabled 仅由 commitRunning 决定
+>
+  View code (multiple builds)
+</Button>
+```
+
+**显示效果**: 按钮不会因状态异常而被禁用（`undefined !== Running`），用户可以点击。但由于对应 Build 可能没有生成有效产物，`archiveURI` 或 PR 链接可能不存在，点击后可能跳转到空页面。
+
+#### 6.2.4 轮询停止与状态死锁
+
+轮询停止条件只检查 `Running` 状态（见 6.1），当 Commit 聚合落入 `undefined` 时：
+
+```
+场景: Build A = Canceled, Build B = Unknown
+
+1. shouldPoll = some(build.status === Running) → false
+2. Commit 级轮询立即停止
+3. 若 Build B 的 Unknown 本应在后端被重新计算为 Completed，
+   但前端已停止轮询 → 状态永远停留在 Unknown，commitStatus 保持 undefined
+4. Build 级轮询（useBuildWatchStatus）同样只在 status === Running 时轮询，
+   Unknown 状态的 Build 也不会触发轮询
+5. 最终结果: 前端状态与后端实际状态永久不一致
+```
+
+**唯一恢复方式**: 用户手动刷新页面，触发一次完整查询。
 
 ### 6.3 Last Commit 展示
 
