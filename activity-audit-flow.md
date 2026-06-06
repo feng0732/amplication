@@ -10,12 +10,9 @@ Amplication 的 Activity Log 与审计线索通过 **四层嵌套数据模型 + 
 UserAction (用户业务操作层) ──┐
                                ├──► Action (动作容器层)
 Build (代码构建层)     ────────┤         │
-Deployment (部署层)   ────────┘         ▼
-                                ActionStep (执行步骤层)
-                                         │
-                                         ▼
-                                  ActionLog (详细日志层)
-
+                                     ├──► ActionStep ──► ActionLog
+Deployment (部署层) ──── 仅 schema 定义，无实际执行代码
+───────────────────────────────────────────────────────────────
 事件流层（Kafka，不经过 UserAction 表）
 ───────────────────────────────────────────────────────────────
 USER_ACTION_TOPIC       → 用户账户级通知事件（注册/登录/切换工作区）
@@ -45,10 +42,10 @@ UserAction ──┐
              ├──► User (userId)
              ├──► Resource (resourceId)
              └──► Action ──► ActionStep ──► ActionLog
-Build ───────┤             ▲
-             │             │
-             │             │ (actionId 外键关联，三者共享同一套 Step/Log)
-Deployment ──┘
+Build ───────┘         ▲
+                           │
+                (Build 实际执行并写日志)
+                (Deployment 仅有 Prisma schema 定义，无实际执行代码)
 ```
 
 ### 2.2 各层模型详解
@@ -69,7 +66,7 @@ Deployment ──┘
 
 **操作类型枚举** 定义于 [types.ts#EnumUserActionType](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/userAction/types.ts#L5-L9)
 
-> **注意**：`Build` 和 `Deployment` **不经过** UserAction 表，它们直接通过 `actionId` 外键关联 Action。详见第 11 节。
+> **注意**：`Build` 不经过 UserAction 表，直接通过 `actionId` 外键关联 Action，且有完整的 Step/Log 执行链路。`Deployment` 虽然在 Prisma schema 中定义了 `actionId` 外键，但**无任何实际执行或写日志代码**（详见第 8.3 节）。
 
 #### Action - 动作容器层
 定义于 [schema.prisma#Action](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L452-L459)
@@ -454,10 +451,10 @@ async onUserActionLog(@Payload() message: UserActionLog.Value): Promise<void> {
 
 ### 8.1 哪些任务不创建 UserAction
 
-| 任务 | 关联方式 | 日志 Kafka 主题 | 消费落库入口 |
-|------|---------|----------------|-------------|
-| **Build（代码构建）** | `Build.actionId` 直接关联 Action | `DSG_LOG_TOPIC`、`CREATE_PR_LOG_TOPIC`、`DOWNLOAD_PRIVATE_PLUGINS_LOG_TOPIC` | [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/build/build.controller.ts) |
-| **Deployment（部署）** | `Deployment.actionId` 直接关联 Action | （未见独立 Kafka 日志主题） | （推测直接同步写入） |
+| 任务 | 关联方式 | 实际状态 | 日志 Kafka 主题 | 消费落库入口 |
+|------|---------|---------|----------------|-------------|
+| **Build（代码构建）** | `Build.actionId` 直接关联 Action | ✅ 完整实现，实际写 Step/Log | `DSG_LOG_TOPIC`、`CREATE_PR_LOG_TOPIC`、`DOWNLOAD_PRIVATE_PLUGINS_LOG_TOPIC` | [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/build/build.controller.ts) |
+| **Deployment（部署）** | `Deployment.actionId` 直接关联 Action（仅 schema 定义） | ❌ 无实际执行代码，无任何 Step/Log 写入 | 无 | 无 |
 
 ### 8.2 Build 的日志链路详解
 
@@ -499,7 +496,56 @@ public async onDsgLog(logEntry: CodeGenerationLog.Value): Promise<void> {
 }
 ```
 
-### 8.3 与 UserAction 体系的对比
+### 8.3 Deployment — 仅 Prisma schema 定义，无实际执行代码
+
+**结论**：Deployment 在当前代码库中是一个**预留结构**，仅存在 Prisma schema 定义，没有任何实际的创建、执行或写 Action/ActionStep/ActionLog 的业务代码。
+
+#### 8.3.1 Prisma schema 定义
+
+定义于 [schema.prisma#Deployment](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L629-L644)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | String | CUID 主键 |
+| `createdAt` | DateTime | 创建时间 |
+| `userId` | String | 关联创建用户（createdBy） |
+| `buildId` | String | 关联 Build |
+| `environmentId` | String | 关联 Environment |
+| `status` | EnumDeploymentStatus | 部署状态 |
+| `message` | String? | 状态信息 |
+| `actionId` | String | **关联 Action（预留字段，从未被写入）** |
+| `statusQuery` | Json? | 状态查询结果 |
+| `statusUpdatedAt` | DateTime? | 状态更新时间 |
+
+虽然定义了 `actionId → Action` 外键关联，但该字段从未被任何业务代码填充。
+
+#### 8.3.2 代码中对 Deployment 的实际使用（逐条核实）
+
+全局搜索 `deployment`（不区分大小写）仅命中 **5 个 TS 文件**，逐一核实：
+
+| 文件 | 使用方式 | 是否写 Step/Log |
+|------|---------|----------------|
+| [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts#L18-L20) | 枚举常量 `DeploymentId`，用于权限校验的 origin 参数类型 | ❌ |
+| [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L282) | 权限校验函数，仅执行 `prisma.deployment.count()` 查询 Deployment 是否属于指定 workspace | ❌ 仅查询，无写入 |
+| [mail.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/mail/mail.service.ts#L55-L82) | `sendDeploymentNotification()` 方法，用于发送部署成功/失败邮件 | ❌ 不涉及数据库/Action；且被 `IS_EMAIL_DEPLOYMENT_NOTIFICATION = false` 永久禁用 |
+| [SendDeploymentArgs.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/mail/dto/SendDeploymentArgs.ts) | 邮件通知 DTO（to/success/url） | ❌ |
+| [papermark.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/dbSchemaImport/predefinedSchemes/papermark/papermark.ts#L158) | 预定义示例 Schema 中的字段名 `deployment` | ❌ 仅字符串数据 |
+
+关键证据：全局搜索 `prisma.deployment.(create|update|delete)` **无任何匹配**，说明 Deployment 表从未被创建或修改。
+
+#### 8.3.3 Deployment vs Build 对比
+
+| 维度 | Build（实际实现） | Deployment（预留结构） |
+|------|------------------|----------------------|
+| 独立 Service 模块 | ✅ 有完整 `core/build/` 目录 | ❌ 无任何 `core/deployment/` 目录 |
+| GraphQL Resolver/Controller | ✅ BuildResolver + BuildController（Kafka） | ❌ 无 |
+| Prisma create 调用 | ✅ build.service.ts 中大量 `prisma.build.create(...)` | ❌ 全局搜索无 `prisma.deployment.create(...)` |
+| ActionStep 写入 | ✅ 创建时内联 step，后续 Kafka 持续更新 | ❌ 无任何代码写入 |
+| ActionLog 写入 | ✅ `actionService.logByStepId()` / `actionService.run()` | ❌ 无任何代码写入 |
+| Kafka 主题 | ✅ 7+ 个独立主题（DSG_LOG、CODE_GENERATION 等） | ❌ 无 |
+| 前端可见 | ✅ 有 GraphQL query + 状态追踪 | ❌ 无 |
+
+### 8.4 与 UserAction 体系的对比
 
 | 维度 | UserAction 体系 | Build（仅 Action） |
 |------|----------------|-------------------|
@@ -657,7 +703,7 @@ UserAction 的最终状态由其所有 ActionStep 的状态聚合计算得出，
 | 模式 | 实现位置 | 说明 |
 |------|---------|------|
 | **四阶层进记录** | UserAction → Action → ActionStep → ActionLog | 粗到细完整追溯链 |
-| **Action 层复用** | Build/Deployment/UserAction 均关联 Action | 同一套 Step/Log 机制服务多种场景 |
+| **Action 层复用** | Build/UserAction 实际使用；Deployment 仅 schema 定义 | 同一套 Step/Log 机制服务多种场景（Deployment 预留但未启用） |
 | **Fire-and-Forget 日志** | `void onEmitUserActionLog(...)` | 不阻塞业务主流程 |
 | **双通道 Kafka** | 通知事件（USER_ACTION_TOPIC/USER_BUILD_TOPIC）vs 日志落库（USER_ACTION_LOG_TOPIC/DSG_LOG_TOPIC） | 职责分离 |
 | **Schema Registry** | `@amplication/schema-registry` | 集中管理所有 Kafka 消息的 key/value schema |
@@ -686,6 +732,9 @@ UserAction 的最终状态由其所有 ActionStep 的状态聚合计算得出，
 | DB Schema Import 实现（样例） | [dbSchemaImport.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) |
 | GPT AI 对话实现（样例） | [gpt.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/gpt/gpt.service.ts) |
 | Build 实现（样例） | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/build/build.service.ts) |
+| Deployment Prisma Schema（仅定义，无实际代码） | [schema.prisma#Deployment](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L629-L644) |
+| Deployment 权限校验（仅查询，无写入） | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L282) |
+| Deployment 邮件通知（已永久禁用） | [mail.service.ts#sendDeploymentNotification](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/mail/mail.service.ts#L55-L82) |
 | 用户服务（USER_ACTION_TOPIC 发布） | [user.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-server/src/core/user/user.service.ts) |
 | 通知服务总入口 | [notification-service/app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/notification-service/src/app.controller.ts) |
 | 通知服务用户订阅处理 | [subscribeUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/notification-service/src/notification-packages/subscribeUser.ts) |
