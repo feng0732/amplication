@@ -29,9 +29,9 @@ Workspace（工作区）
 
 | 页面 | 路由场景 | 入口组件 | 复用内核 |
 |---|---|---|---|
-| 工作区 Catalog | `/:workspace/catalog` | [Catalog.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/Catalog.tsx#L12-L46) | `CatalogGrid` |
-| 项目资源列表 | `/:workspace/:project` | [ResourceList.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/ResourceList.tsx#L11-L31) | `CatalogGrid` + `fixedFilters` 限定 `projectId` |
-| 工作区图视图 | `/:workspace/graph` | [WorkspaceGraph.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) | `CatalogGraph` |
+| 工作区 Catalog | `/:workspace/catalog` | [Catalog.tsx](packages/amplication-client/src/Catalog/Catalog.tsx#L12-L46) | `CatalogGrid` |
+| 项目资源列表 | `/:workspace/:project` | [ResourceList.tsx](packages/amplication-client/src/Workspaces/ResourceList.tsx#L11-L31) | `CatalogGrid` + `fixedFilters` 限定 `projectId` |
+| 工作区图视图 | `/:workspace/graph` | [WorkspaceGraph.tsx](packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) | `CatalogGraph` |
 
 核心复用链：
 ```
@@ -45,14 +45,14 @@ CatalogGrid / CatalogGraph
 
 #### (1) CatalogContextProvider —— 全局挂载点
 
-Catalog 的所有状态（分页、搜索、过滤、数据）都挂在 [CatalogContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/CatalogContext.tsx#L45-L77) 下。
+Catalog 的所有状态（分页、搜索、过滤、数据）都挂在 [CatalogContext.tsx](packages/amplication-client/src/Catalog/CatalogContext.tsx#L45-L77) 下。
 
-它在 [WorkspaceLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L245-L297) 第 245 行被包裹在整个工作区布局内部，意味着：
+它在 [WorkspaceLayout.tsx](packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L245-L297) 第 245 行被包裹在整个工作区布局内部，意味着：
 - 同一个 Workspace 下，切换 Project / Catalog / Graph 页面，**Catalog 的筛选、分页状态会被保留**。
 
 #### (2) useCatalog Hook —— 业务逻辑核心
 
-[hooks/useCatalog.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/hooks/useCatalog.ts#L27-L194) 做了以下关键事情：
+[hooks/useCatalog.ts](packages/amplication-client/src/Catalog/hooks/useCatalog.ts#L27-L194) 做了以下关键事情：
 
 1. **分页**：通过 `useQueryPagination` 管理 `pageNumber/pageSize/totalCount`
 2. **默认过滤**：`DEFAULT_PROJECT_TYPE_FILTER` 排除三类资源：
@@ -67,7 +67,7 @@ Catalog 的所有状态（分页、搜索、过滤、数据）都挂在 [Catalog
 
 #### (3) SEARCH_CATALOG GraphQL Query
 
-定义在 [catalogQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/queries/catalogQueries.ts#L3-L94)，字段清单：
+定义在 [catalogQueries.ts](packages/amplication-client/src/Catalog/queries/catalogQueries.ts#L3-L94)，字段清单：
 ```
 catalog(where, orderBy, take, skip) {
   totalCount
@@ -87,13 +87,13 @@ catalog(where, orderBy, take, skip) {
 
 #### (4) CatalogDataColumns —— 列定义
 
-[CatalogDataColumns.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/CatalogDataColumns.tsx#L27-L251) 定义了表格列：
+[CatalogDataColumns.tsx](packages/amplication-client/src/Catalog/CatalogDataColumns.tsx#L27-L251) 定义了表格列：
 - 固定列：Type / Name / Project / Blueprint / Owner / Code Generator / Git Org / Git Repo / Description / Pending Changes / Last Build / Code Gen Version / Template / Template Version
 - 动态列：`columnsWithProperties()` 把工作区定义的 **CustomProperties** 动态追加为列
 
 ### 1.3 后端数据链路
 
-GraphQL 请求到达 [resource.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L85-L96) 的 `catalog` Query：
+GraphQL 请求到达 [resource.resolver.ts](packages/amplication-server/src/core/resource/resource.resolver.ts#L85-L96) 的 `catalog` Query：
 
 ```typescript
 @Query(() => PaginatedResourceQueryResult)
@@ -105,7 +105,7 @@ async catalog(@Args() args: FindManyResourceArgs): Promise<PaginatedResourceQuer
 
 关键注解 `@InjectContextValue` 自动把当前登录用户的 WorkspaceId 注入到 `where.project.workspace.id`，**从权限层保证不会查到其他工作区的数据**。
 
-Service 层 [resource.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1383) 分两步：
+Service 层 [resource.service.ts](packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1383) 分两步：
 
 #### (1) prepareResourceFindManyArgsForQuery —— 参数归一化
 
@@ -134,10 +134,10 @@ return { totalCount: count, data: resources };
 #### (3) ResolveField —— 关联字段懒加载
 
 GraphQL 返回的关联字段（project / owner / blueprint / builds / gitRepository 等）并不是 Prisma 一次查出来的，而是通过 `@ResolveField` **按字段独立解析**：
-- `project` → [resource.resolver.ts L250-L255](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L250-L255)
-- `owner` → [L345-L357](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L345-L357)
-- `builds` → [L119-L128](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L119-L128)
-- `blueprint` → [L290-L301](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L290-L301)
+- `project` → [resource.resolver.ts L250-L255](packages/amplication-server/src/core/resource/resource.resolver.ts#L250-L255)
+- `owner` → [L345-L357](packages/amplication-server/src/core/resource/resource.resolver.ts#L345-L357)
+- `builds` → [L119-L128](packages/amplication-server/src/core/resource/resource.resolver.ts#L119-L128)
+- `blueprint` → [L290-L301](packages/amplication-server/src/core/resource/resource.resolver.ts#L290-L301)
 
 ---
 
@@ -145,7 +145,7 @@ GraphQL 返回的关联字段（project / owner / blueprint / builds / gitReposi
 
 ### 2.1 工作区页面层级
 
-工作区的顶层布局是 [WorkspaceLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L55-L303)，它在一个组件里 **聚合了所有 hooks**，然后通过 `AppContextProvider` + `CatalogContextProvider` 向下分发：
+工作区的顶层布局是 [WorkspaceLayout.tsx](packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L55-L303)，它在一个组件里 **聚合了所有 hooks**，然后通过 `AppContextProvider` + `CatalogContextProvider` 向下分发：
 
 ```
 WorkspaceLayout
@@ -163,7 +163,7 @@ WorkspaceLayout
 
 ### 2.2 WorkspaceOverview —— 工作区概览页
 
-[WorkspaceOverview.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceOverview.tsx#L48-L133) 展示内容：
+[WorkspaceOverview.tsx](packages/amplication-client/src/Workspaces/WorkspaceOverview.tsx#L48-L133) 展示内容：
 
 | 区块 | 数据来源 |
 |---|---|
@@ -173,7 +173,7 @@ WorkspaceLayout
 
 ### 2.3 ProjectList —— 项目卡片网格
 
-[ProjectListItem.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Project/ProjectListItem.tsx#L28-L114) 的要点：
+[ProjectListItem.tsx](packages/amplication-client/src/Project/ProjectListItem.tsx#L28-L114) 的要点：
 
 1. **服务数量统计**：从 `project.resources` 中过滤出 `Service` + `MessageBroker` 类型，显示在卡片右上角
 2. **两个入口**：
@@ -182,7 +182,7 @@ WorkspaceLayout
 
 ### 2.4 projectsList 的数据来源
 
-`projectsList` 由 [useProjectSelector.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L37-L52) 发起，GraphQL 是 [projectQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/queries/projectQueries.ts#L3-L34) 中的 `GET_PROJECTS`：
+`projectsList` 由 [useProjectSelector.ts](packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L37-L52) 发起，GraphQL 是 [projectQueries.ts](packages/amplication-client/src/Workspaces/queries/projectQueries.ts#L3-L34) 中的 `GET_PROJECTS`：
 
 ```graphql
 query findProjects {
@@ -200,9 +200,9 @@ query findProjects {
 
 ### 2.5 WorkspaceGraph —— 工作区关系图
 
-[WorkspaceGraph.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) 本身是个空壳，直接渲染 `<CatalogGraph />`。
+[WorkspaceGraph.tsx](packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) 本身是个空壳，直接渲染 `<CatalogGraph />`。
 
-[CatalogGraph.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Catalog/CatalogGraph/CatalogGraph.tsx#L51-L246) 的数据链路：
+[CatalogGraph.tsx](packages/amplication-client/src/Catalog/CatalogGraph/CatalogGraph.tsx#L51-L246) 的数据链路：
 
 ```
 CatalogGraph
@@ -226,9 +226,9 @@ CatalogGraph
 
 | 指标 | 组件文件 | 数据来源 |
 |---|---|---|
-| Last Build（最近构建） | [ResourceLastBuild.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/ResourceLastBuild.tsx#L21-L63) | `resource.builds[0]`，来自 SEARCH_CATALOG 中 `builds(take:1, orderBy: createdAt Desc)` |
+| Last Build（最近构建） | [ResourceLastBuild.tsx](packages/amplication-client/src/Workspaces/ResourceLastBuild.tsx#L21-L63) | `resource.builds[0]`，来自 SEARCH_CATALOG 中 `builds(take:1, orderBy: createdAt Desc)` |
 | Code Gen Version | `ResourceLastBuildVersion`（在 CatalogDataColumns 中引用） | `resource.builds[0].codeGeneratorVersion` |
-| Pending Changes（待提交变更数） | [ResourcePendingChangesCount.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/ResourcePendingChangesCount.tsx#L14-L31) | 从 AppContext 的 `pendingChanges[]` 按 `resource.id` 过滤计数 |
+| Pending Changes（待提交变更数） | [ResourcePendingChangesCount.tsx](packages/amplication-client/src/Workspaces/ResourcePendingChangesCount.tsx#L14-L31) | 从 AppContext 的 `pendingChanges[]` 按 `resource.id` 过滤计数 |
 | Git Repo / Git Org | `ResourceGitRepo` / `ResourceGitOrg` | `resource.gitRepository` 字段 |
 | Template + Template Version | `ServiceTemplateChip` / `VersionTag` | `resource.serviceTemplate` + `resource.serviceTemplateVersion` |
 
@@ -239,7 +239,7 @@ CatalogGraph
 Pending Changes **不是 SEARCH_CATALOG 返回的**，而是单独一条链路：
 
 1. WorkspaceLayout 中调用 `usePendingChanges(currentProject, resourceTypeGroup)`
-2. GraphQL: [GET_PENDING_CHANGES_STATUS](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/queries/projectQueries.ts#L45-L102)
+2. GraphQL: [GET_PENDING_CHANGES_STATUS](packages/amplication-client/src/Workspaces/queries/projectQueries.ts#L45-L102)
 3. 返回 `pendingChanges[]`，每条包含：
    - `origin`（Entity 或 Block）
    - `resource`（变更所属的资源）
@@ -251,9 +251,9 @@ Pending Changes **不是 SEARCH_CATALOG 返回的**，而是单独一条链路�
 
 ### 3.3 资源概览摘要卡片（Resource Overview）
 
-当用户进入某个具体 Service 资源时，[ResourceOverview.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L49-L222) 在顶部面板右侧展示 4 个摘要数字：**Entities / APIs / Installed Plugins / Roles**。
+当用户进入某个具体 Service 资源时，[ResourceOverview.tsx](packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L49-L222) 在顶部面板右侧展示 4 个摘要数字：**Entities / APIs / Installed Plugins / Roles**。
 
-这 4 个数字以及插件分类数据都由同一个 hook —— [useResourceSummary.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/hooks/useResourceSummary.tsx#L40-L180) 统一聚合。
+这 4 个数字以及插件分类数据都由同一个 hook —— [useResourceSummary.tsx](packages/amplication-client/src/Resource/hooks/useResourceSummary.tsx#L40-L180) 统一聚合。
 
 ```
 useResourceSummary(currentResource)
@@ -271,7 +271,7 @@ useResourceSummary(currentResource)
 const models = currentResource?.entities?.length || 0;
 ```
 
-直接取自 `currentResource.entities` 数组长度。`currentResource.entities` 由 [useResources.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/hooks/useResources.ts#L117-L129) 中的 `GET_RESOURCES` Query 拉取，GraphQL 字段为：
+直接取自 `currentResource.entities` 数组长度。`currentResource.entities` 由 [useResources.ts](packages/amplication-client/src/Workspaces/hooks/useResources.ts#L117-L129) 中的 `GET_RESOURCES` Query 拉取，GraphQL 字段为：
 ```graphql
 entities { id, name }
 ```
@@ -291,7 +291,7 @@ useEffect(() => {
 const modules = findModuleActionsData?.moduleActions?.length || 0;
 ```
 
-数据来源于 `useModuleAction()` hook（[useModuleAction.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/ModuleActions/hooks/useModuleAction.tsx#L33-L100)）中的 `FIND_MODULE_ACTIONS` GraphQL 查询，本质是统计该资源下定义的 `ModuleAction`（API 端点动作）总数。注意：UI 上显示为 "APIs"，但代码变量名是 `modules`，映射关系在 [ResourceOverview.tsx L71-L76](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L71-L76) 中硬编码：
+数据来源于 `useModuleAction()` hook（[useModuleAction.tsx](packages/amplication-client/src/ModuleActions/hooks/useModuleAction.tsx#L33-L100)）中的 `FIND_MODULE_ACTIONS` GraphQL 查询，本质是统计该资源下定义的 `ModuleAction`（API 端点动作）总数。注意：UI 上显示为 "APIs"，但代码变量名是 `modules`，映射关系在 [ResourceOverview.tsx L71-L76](packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L71-L76) 中硬编码：
 ```typescript
 { icon: "api", title: "APIs", link: `${baseUrl}/modules`, value: summaryData.apis }
 ```
@@ -300,13 +300,13 @@ const modules = findModuleActionsData?.moduleActions?.length || 0;
 
 这部分由两个数据源组合而成：
 
-**① 已安装插件列表**：来自 [usePlugins.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Plugins/hooks/usePlugins.ts#L68-L150) hook，底层调用 `GET_PLUGIN_INSTALLATIONS` Query，返回当前资源的 `PluginInstallation[]`。
+**① 已安装插件列表**：来自 [usePlugins.ts](packages/amplication-client/src/Plugins/hooks/usePlugins.ts#L68-L150) hook，底层调用 `GET_PLUGIN_INSTALLATIONS` Query，返回当前资源的 `PluginInstallation[]`。
 ```typescript
 // useResourceSummary.tsx L129
 const installedPlugins = pluginInstallations?.length || 0;
 ```
 
-**② 插件分类（Categories）**：来自 [categoriesQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/hooks/categoriesQueries.ts#L1-L13) 的 `GET_CATEGORIES` Query，**注意这个请求走的是独立的 Apollo client**：
+**② 插件分类（Categories）**：来自 [categoriesQueries.ts](packages/amplication-client/src/Resource/hooks/categoriesQueries.ts#L1-L13) 的 `GET_CATEGORIES` Query，**注意这个请求走的是独立的 Apollo client**：
 ```typescript
 // useResourceSummary.tsx L61-L69
 useQuery(GET_CATEGORIES, {
@@ -318,14 +318,14 @@ useQuery(GET_CATEGORIES, {
 
 分类数据由 `amplication-plugin-api` 服务提供，而非主 amplication-server。
 
-**③ 已用分类 vs 可用分类**（供 [PluginsTile.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/PluginsTile.tsx#L43-L164) 展示）：
+**③ 已用分类 vs 可用分类**（供 [PluginsTile.tsx](packages/amplication-client/src/Resource/PluginsTile.tsx#L43-L164) 展示）：
 
 在 `useResourceSummary.tsx` L83-L124 中，代码按 rank 排序 categories，然后：
 - **usedCategories**：遍历已安装插件的 `plugin.categories`，按分类名分组，得到 `{ categoryName: { category, installedPlugin[] } }`；**过滤掉无 rank 的分类**
 - **availableCategories**：sortedCategories 中排除 usedCategories 里已有的，同时排除 rank 为 null 的
 
 PluginsTile 组件将两类数据各取前 4 个显示：
-- Installed Plugins 区：每个分类显示图标 + 名称 + 该分类下的插件 logo 组（[PluginLogoGroup](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Plugins/PluginLogoGroup.tsx)）
+- Installed Plugins 区：每个分类显示图标 + 名称 + 该分类下的插件 logo 组（[PluginLogoGroup](packages/amplication-client/src/Plugins/PluginLogoGroup.tsx)）
 - Available Plugins 区：每个分类显示图标 + 名称 + 描述 + "Try out" 链接
 
 分类图标和描述全部来自 `GET_CATEGORIES` 返回的 PluginCategory 对象。
@@ -342,11 +342,11 @@ const { data: rolesData } = useQuery<TData>(GET_ROLES, {
 const roles = rolesData?.resourceRoles?.length || 0;
 ```
 
-GraphQL 查询 `GET_ROLES` 定义在 [RoleList.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/ResourceRoles/RoleList.tsx#L127-L143)，字段为 `resourceRoles(where: { resource: { id: $id } })`，统计该资源下定义的角色总数。
+GraphQL 查询 `GET_ROLES` 定义在 [RoleList.tsx](packages/amplication-client/src/ResourceRoles/RoleList.tsx#L127-L143)，字段为 `resourceRoles(where: { resource: { id: $id } })`，统计该资源下定义的角色总数。
 
 #### (5) 渲染：ResourceOverview 的用法摘要区
 
-在 [ResourceOverview.tsx L63-L90](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L63-L90) 中：
+在 [ResourceOverview.tsx L63-L90](packages/amplication-client/src/Resource/ResourceOverview/ResourceOverview.tsx#L63-L90) 中：
 ```typescript
 const resourceUsageData = [
   { icon: "database", title: "Entities",          link: `${baseUrl}/entities`,  value: summaryData.models },
@@ -359,7 +359,7 @@ const resourceUsageData = [
 
 ### 3.4 项目级状态摘要
 
-在 WorkspaceOverview 的 Project 卡片（[ProjectListItem.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Project/ProjectListItem.tsx#L29-L37)）中：
+在 WorkspaceOverview 的 Project 卡片（[ProjectListItem.tsx](packages/amplication-client/src/Project/ProjectListItem.tsx#L29-L37)）中：
 
 ```typescript
 const services = useMemo(
@@ -378,20 +378,50 @@ WorkspaceOverview 头部面板展示：
 
 | 指标 | 来源 |
 |---|---|
-| Workspace 名称 + 颜色徽章 | `currentWorkspace.name` + 订阅 Plan 决定颜色 ([WorkspaceSelector.tsx](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceSelector.tsx) 中的 `getWorkspaceColor`) |
+| Workspace 名称 + 颜色徽章 | `currentWorkspace.name` + 订阅 Plan 决定颜色 ([WorkspaceSelector.tsx](packages/amplication-client/src/Workspaces/WorkspaceSelector.tsx) 中的 `getWorkspaceColor`) |
 | 订阅 Plan Chip | `currentWorkspace.subscription.subscriptionPlan` → 映射到 `SUBSCRIPTION_TO_CHIP_STYLE` |
 | 成员数量 | `GET_WORKSPACE_MEMBERS` → 过滤 `type === User` 计数 |
-| 项目列表计数标签 | [ProjectList.tsx L24-L28](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Project/ProjectList.tsx#L24-L28) 中 `projects.length` → 显示为 `"3 Projects"` 这样的 Tag |
+| 项目列表计数标签 | [ProjectList.tsx L24-L28](packages/amplication-client/src/Project/ProjectList.tsx#L24-L28) 中 `projects.length` → 显示为 `"3 Projects"` 这样的 Tag |
 
 **`projectsList.length` 的实际用途**（不是作为"工作区项目总数"的状态摘要展示，而是以下两处）：
 
 | 使用位置 | 代码 | 用途 |
 |---|---|---|
-| AddNewProject 按钮配额检查 | [WorkspaceOverview.tsx L73](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/WorkspaceOverview.tsx#L73) → [AddNewProject.tsx L45-L51](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Project/AddNewProject.tsx#L45-L51) | 作为 `FeatureIndicatorContainer` 的 `actualUsage` 参数，与计费配额 `BillingFeature.Projects` 比对，达到上限时禁用 "Add New Project" 按钮并提示升级 |
-| ProjectList 计数标签 | [ProjectList.tsx L24-L28](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Project/ProjectList.tsx#L24-L28) | 在项目网格上方显示 `"X Project(s)"` 的文本标签 |
-| useProjectSelector 路由逻辑 | [useProjectSelector.tsx L103](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L103), [L136-L137](file:///d:/fz/0601/solo-dogfeeding/code/46-amplication/packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L136-L137) | 判断项目列表是否为空，决定是否触发欢迎页/购买页跳转，以及判断当前选中 project 是否在列表中 |
+| AddNewProject 按钮配额检查 | [WorkspaceOverview.tsx L73](packages/amplication-client/src/Workspaces/WorkspaceOverview.tsx#L73) → [AddNewProject.tsx L45-L51](packages/amplication-client/src/Project/AddNewProject.tsx#L45-L51) | 作为 `FeatureIndicatorContainer` 的 `actualUsage` 参数，与计费配额 `BillingFeature.Projects` 比对，达到上限时禁用 "Add New Project" 按钮并提示升级 |
+| ProjectList 计数标签 | [ProjectList.tsx L24-L28](packages/amplication-client/src/Project/ProjectList.tsx#L24-L28) | 在项目网格上方显示 `"X Project(s)"` 的文本标签 |
+| useProjectSelector 路由逻辑 | [useProjectSelector.tsx L103](packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L103), [L136-L137](packages/amplication-client/src/Workspaces/hooks/useProjectSelector.ts#L136-L137) | 判断项目列表是否为空，决定是否触发欢迎页/购买页跳转，以及判断当前选中 project 是否在列表中 |
 
-Workspace Footer 还会显示最近一次全局提交信息（来自 `useCommits`）。
+### 3.6 Workspace Footer 的最近提交信息
+
+Workspace Footer 显示的最近 Commit ID 和 Build ID **不是全局提交**，而是严格遵循当前项目 + Services 资源组的查询条件。
+
+调用链和过滤条件：
+
+```
+WorkspaceLayout (L109)
+  └── useCommits(currentProject?.id)              # 参数限定为当前项目 ID
+        ├── GET_COMMITS Query (useCommits.ts L240-L251)
+        │     ├── projectId: currentProjectId     # ← 条件 1：仅当前项目
+        │     ├── resourceTypeGroup: Services     # ← 条件 2：仅 Services 资源组（不含 Platform）
+        │     ├── orderBy: createdAt Desc
+        │     └── take: 20
+        └── GET_LAST_COMMIT Query (L95-L99)
+              └── projectId: currentProjectId     # 轮询同样限项目
+          │
+          ▼
+  └── <WorkspaceFooter lastCommit={commitUtils.lastCommit} />
+        └── WorkspaceFooter.tsx L39-L46
+              lastCommit.builds.find(
+                b => b.resourceId === currentResource.id  # ← 条件 3：仅当前选中资源的 build
+              )
+```
+
+关键代码位置：
+- Hook 调用：`packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx` L109、L286
+- 查询条件：`packages/amplication-client/src/VersionControl/hooks/useCommits.ts` L240-L251（GET_COMMITS）、L95-L99（GET_LAST_COMMIT）
+- 资源级二次过滤：`packages/amplication-client/src/Workspaces/WorkspaceFooter.tsx` L39-L46
+
+三层过滤保证用户在 Footer 看到的 Commit/Build ID 与当前上下文一致：**当前项目 → Services 资源组 → 当前选中资源**。
 
 ---
 
