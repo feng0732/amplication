@@ -427,55 +427,17 @@ async create(args: CreatePluginInstallationArgs, user: User): Promise<PluginInst
 
 [packages/amplication-server/src/core/resource/serviceTemplate.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L498-L599)
 
+#### 表面流程（代码意图）
+
 ```typescript
 async upgradeServiceToLatestTemplateVersion(args: FindOneArgs, user: User): Promise<Resource> {
-  const resourceId = args.where.id;
-
-  // 1. 校验资源存在
-  const resource = await this.resourceService.resource({ where: { id: resourceId } });
-  if (!resource) {
-    throw new AmplicationError(`Resource with id ${resourceId} not found `);
-  }
-
-  // 2. 校验资源是否基于模板
-  const serviceTemplateVersion =
-    await this.resourceService.getServiceTemplateSettings(resourceId, user);
-  if (!serviceTemplateVersion) {
-    throw new AmplicationError(
-      `Service with id ${resourceId} is not based on a template `
-    );
-  }
-
-  // 3. 校验模板存在
-  const template = await this.resourceService.resource({
-    where: { id: serviceTemplateVersion.serviceTemplateId },
-  });
-  if (!template) {
-    throw new AmplicationError(
-      `Template with id ${serviceTemplateVersion.serviceTemplateId} not found `
-    );
-  }
-
-  // 4. 校验存在更新版本
-  const latestVersion = await this.resourceVersionService.getLatest(template.id);
-  if (latestVersion.version === serviceTemplateVersion.version) {
-    throw new AmplicationError(
-      `Service with id ${resourceId} is already up to date `
-    );
-  }
-
+  // 1-4. 前置校验：资源存在、基于模板、模板存在、有更新版本 ...
   // 5. 对比两个版本间的差异
-  const changes = await this.resourceVersionService.compareResourceVersions({
-    where: {
-      resource: { id: template.id },
-      sourceVersion: serviceTemplateVersion.version,
-      targetVersion: latestVersion.version,
-    },
-  });
+  const changes = await this.resourceVersionService.compareResourceVersions({...});
 
   const mergeOptions: BlockMergeOptions = { updatedManuallyCreatedBlocks: true };
 
-  // 6. 合并变更：新增、删除、更新 Block
+  // 6. 合并变更：新增、删除、更新 Block（代码意图：并发等待全部完成）
   await Promise.all([
     changes.createdBlocks.map(blockVersion =>
       this.handleMergeCreatedBlock(resourceId, blockVersion, user, mergeOptions)
@@ -489,16 +451,103 @@ async upgradeServiceToLatestTemplateVersion(args: FindOneArgs, user: User): Prom
   ]);
 
   // 7. 更新资源的模板版本记录
-  await this.resourceTemplateVersionService.updateResourceTemplateVersion({
-    where: { id: resourceId },
-    data: { version: latestVersion.version, serviceTemplateId: serviceTemplateVersion.serviceTemplateId },
-  }, user);
+  await this.resourceTemplateVersionService.updateResourceTemplateVersion({...}, user);
 
   // 8. 标记版本过期告警为已解决
   await this.outdatedVersionAlertService.resolvesServiceTemplateUpdated({ resourceId });
 
   return resource;
 }
+```
+
+#### 实际执行顺序（存在两个严重 Bug）
+
+**Bug 1：`forEach` 返回 `undefined`**
+
+```typescript
+// ❌ updatedPromises = undefined，不是 Promise 数组！
+// Array.prototype.forEach() 不返回任何值，始终返回 undefined
+const updatedPromises = changes.updatedBlocks.forEach(async (diff) => {
+  return this.handleMergeUpdatedBlock(resourceId, diff, user, mergeOptions);
+});
+```
+
+**Bug 2：`Promise.all` 接收嵌套数组，不展开内部 Promise**
+
+```typescript
+// ❌ Promise.all([Promise[], Promise[], undefined])
+// Promise.all 不会递归展开嵌套数组，它会把数组当作普通值立即 resolve
+await Promise.all([
+  changes.createdBlocks.map(...),   // 这是一个数组对象，不是 Promise
+  changes.deletedBlocks.map(...),   // 这是一个数组对象，不是 Promise
+  changes.updatedBlocks.forEach(...), // 这是 undefined
+]);
+```
+
+**实际执行时序图**：
+
+```
+时间轴 ──────────────────────────────────────────────────────────────────────►
+
+T1  compareResourceVersions()        ────✅ 完成（await 生效）
+│
+T2  createdBlocks.map(async)        ──── 启动 N 个异步任务（后台执行）
+    deletedBlocks.map(async)        ──── 启动 M 个异步任务（后台执行）
+    updatedBlocks.forEach(async)    ──── 启动 K 个异步任务（后台执行，无返回值）
+│
+T3  Promise.all([数组, 数组, undefined])
+    └─ 三个参数都不是 Promise → **立即 resolve，不等待任何后台任务**
+│
+T4  updateResourceTemplateVersion() ──── ✅ 立即执行：模板版本记录被更新为新版本
+    │
+T5  resolvesServiceTemplateUpdated() ─── ✅ 立即执行：告警被标记为已解决
+    │
+T6  HTTP 响应返回给前端 ──────────────── ✅ 调用方认为升级已完成
+    │
+    │  ... 后台仍在执行 ...
+    │
+T7  handleMergeCreatedBlock 插件A   ─── ✅ 代码引擎版本/插件可能这时才完成
+T8  handleMergeUpdatedBlock 代码引擎 ── ✅ 这时才真正同步完成
+T9  handleMergeCreatedBlock 插件B   ─── ❌ 若抛出异常，完全无人捕获
+```
+
+#### 对三个关键状态的具体影响
+
+| 影响目标 | 具体表现 | 源码位置 |
+|----------|----------|----------|
+| **模板版本记录** | 在 Block 合并操作完成前就已更新为最新版本号。系统显示资源已升级，但实际插件/代码引擎版本可能还未同步，甚至永远不会完成（若异步任务异常）。 | [packages/amplication-server/src/core/resourceTemplateVersion/resourceTemplateVersion.service.ts#L51-L88](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resourceTemplateVersion/resourceTemplateVersion.service.ts#L51-L88) |
+| **告警状态** | 在实际升级完成前，所有 `TemplateVersion` 类型告警已通过 `updateMany` 被批量标记为 `Resolved`。前端不再显示告警，用户误以为升级已完成。 | [packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L126-L141](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L126-L141) |
+| **代码引擎版本同步** | 代码引擎版本的同步可能发生在 HTTP 响应返回之后，也可能因 `forEach` 异步异常未捕获而**完全丢失**。CodeEngineVersion 的变更同时出现在 createdBlocks 和 updatedBlocks 中，两类都不被 await。 | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L616-L634](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L616-L634) |
+
+#### handleMergeDeletedBlock 的空实现
+
+[packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L637-L643](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L637-L643)
+
+```typescript
+async handleMergeDeletedBlock(
+  targetResourceId: string,
+  blockVersion: BlockVersion,
+  user: User
+): Promise<void> {
+  return;  // ⚠️ 空实现：模板中删除的插件不会同步到目标资源
+}
+```
+
+#### 正确实现应该是
+
+```typescript
+// ✅ 正确写法：使用展开运算符或 concat 扁平化 Promise 数组
+await Promise.all([
+  ...changes.createdBlocks.map(blockVersion =>
+    this.handleMergeCreatedBlock(resourceId, blockVersion, user, mergeOptions)
+  ),
+  ...changes.deletedBlocks.map(blockVersion =>
+    this.handleMergeDeletedBlock(resourceId, blockVersion, user)
+  ),
+  ...changes.updatedBlocks.map(diff =>   // ✅ 用 map 而不是 forEach
+    this.handleMergeUpdatedBlock(resourceId, diff, user, mergeOptions)
+  ),
+]);
 ```
 
 ### 3.6 Block 合并处理
@@ -785,17 +834,17 @@ private async internalCreateServiceFromTemplate(args, template, user) {
 
 | 校验阶段 | 校验内容 | 失败影响 | 抛出异常位置 |
 |----------|----------|----------|--------------|
-| 模板可用性校验 | 模板在当前项目中是否可用 | **硬失败**：迁移完全中断，资源尚未创建 | [serviceTemplate.service.ts#L255-L266](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L255-L266) |
-| 模板版本存在校验 | 模板至少有一个已发布版本 | **硬失败**：迁移完全中断，资源尚未创建 | [serviceTemplate.service.ts#L272-L274](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L272-L274) |
-| Blueprint 存在校验 | 模板关联的 Blueprint 存在且已启用 | **硬失败**：迁移完全中断，资源尚未创建 | [serviceTemplate.service.ts#L282-L290](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L282-L290) |
-| Blueprint 资源类型校验 | Blueprint 类型必须是 Service 或 Component | **硬失败**：迁移完全中断，资源尚未创建 | [serviceTemplate.service.ts#L294-L302](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L294-L302) |
-| 计费配额校验 | 工作区服务数量未超过套餐限制 | **硬失败**：资源创建前中断 | [resource.service.ts#L223-L245](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L223-L245) |
-| 项目配置存在校验 | 项目必须存在 ProjectConfiguration | **硬失败**：资源创建前中断 | [resource.service.ts#L249-L253](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L249-L253) |
-| 代码生成器 License 校验 | 用户套餐是否支持所选代码生成器 | **硬失败**：资源创建前中断 | [resource.service.ts#L415-L450](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L415-L450) |
-| 资源名称重复校验 | 同项目下资源名称不重复（自动追加序号） | 不会失败，自动重命名 | [resource.service.ts#L255-L279](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L255-L279) |
-| 插件重复安装校验 | 目标资源已安装同名插件 | **部分失败**：资源已创建但插件安装中断 | [pluginInstallation.service.ts#L142-L146](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L142-L146) |
-| 插件配置校验 | 插件要求认证实体但资源未配置 | **部分失败**：资源已创建但插件安装中断 | [pluginInstallation.service.ts#L97-L119](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L97-L119) |
-| Block 父节点类型校验 | Block 的父节点类型合法性 | **硬失败**：Block 创建失败导致整个操作失败 | [block.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/block/block.service.ts#L83-L103) |
+| 模板可用性校验 | 模板在当前项目中是否可用 | **硬失败**：迁移完全中断，资源尚未创建 | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L255-L266](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L255-L266) |
+| 模板版本存在校验 | 模板至少有一个已发布版本 | **硬失败**：迁移完全中断，资源尚未创建 | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L272-L274](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L272-L274) |
+| Blueprint 存在校验 | 模板关联的 Blueprint 存在且已启用 | **硬失败**：迁移完全中断，资源尚未创建 | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L282-L290](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L282-L290) |
+| Blueprint 资源类型校验 | Blueprint 类型必须是 Service 或 Component | **硬失败**：迁移完全中断，资源尚未创建 | [packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L294-L302](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L294-L302) |
+| 计费配额校验 | 工作区服务数量未超过套餐限制 | **硬失败**：资源创建前中断 | [packages/amplication-server/src/core/resource/resource.service.ts#L223-L245](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L223-L245) |
+| 项目配置存在校验 | 项目必须存在 ProjectConfiguration | **硬失败**：资源创建前中断 | [packages/amplication-server/src/core/resource/resource.service.ts#L249-L253](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L249-L253) |
+| 代码生成器 License 校验 | 用户套餐是否支持所选代码生成器 | **硬失败**：资源创建前中断 | [packages/amplication-server/src/core/resource/resource.service.ts#L415-L450](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L415-L450) |
+| 资源名称重复校验 | 同项目下资源名称不重复（自动追加序号） | 不会失败，自动重命名 | [packages/amplication-server/src/core/resource/resource.service.ts#L255-L279](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L255-L279) |
+| 插件重复安装校验 | 目标资源已安装同名插件 | **部分失败**：资源已创建但插件安装中断 | [packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L142-L146](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L142-L146) |
+| 插件配置校验 | 插件要求认证实体但资源未配置 | **部分失败**：资源已创建但插件安装中断 | [packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L97-L119](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts#L97-L119) |
+| Block 父节点类型校验 | Block 的父节点类型合法性 | **硬失败**：Block 创建失败导致整个操作失败 | [packages/amplication-server/src/core/block/block.service.ts#L83-L103](file:///d:/fz/0601/solo-dogfeeding/code/53-amplication/packages/amplication-server/src/core/block/block.service.ts#L83-L103) |
 
 ### 4.2 硬失败 vs 部分失败
 
