@@ -411,9 +411,84 @@ await Promise.all([createdPromises, deletedPromises, updatedPromises]);
 
 ---
 
-### 9.5 CodeEngineVersion 覆盖局部字段的具体时序
+### 9.5 CodeEngineVersion 覆盖局部字段的所有执行时机
 
-当 CodeEngineVersion 出现在 `updatedBlocks` 中时（即模板修改了代码生成器版本），执行路径是：
+`Resource.codeGeneratorVersion` 和 `Resource.codeGeneratorStrategy` 两个字段（即"局部覆盖字段"）被覆盖的入口共有 **3 个**：
+
+#### 入口 A：用户通过 GraphQL API 手动更新（同步安全路径）
+
+在 [resource.resolver.ts#L236-L241](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L236-L241)：
+
+```typescript
+async updateCodeGeneratorVersion(args, user) {
+  return this.resourceService.updateCodeGeneratorVersion(args, user);
+}
+```
+
+执行链路：
+```
+GraphQL Mutation → ResourceResolver.updateCodeGeneratorVersion()
+    ↓ await
+ResourceService.updateCodeGeneratorVersion() [resource.service.ts#L361-L413]
+    ├─ await billing 权限校验
+    ├─ await analytics.trackWithContext()
+    ├─ await prisma.resource.update(
+    │      { codeGeneratorVersion, codeGeneratorStrategy }
+    │    )   ← ✅ 直接覆盖 Resource 表字段，有 await
+    └─ [如果是 ServiceTemplate]
+          await templateCodeEngineVersionService.update()
+               ← ✅ 同步更新 CodeEngineVersion Block
+```
+
+**该路径完全同步，没有问题。**
+
+---
+
+#### 入口 B：模板升级时 CodeEngineVersion 出现在 `createdBlocks`
+
+当模板**首次**设置代码生成器版本时（之前不存在 TemplateCodeEngineVersion Block），版本比较会将其归入 `createdBlocks`。
+
+在 [serviceTemplate.service.ts#L601-L642](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L601-L642) 的 `handleMergeCreatedBlock()`：
+
+```typescript
+if (blockType === EnumBlockType.CodeEngineVersion) {
+  return this.resourceService.updateCodeGeneratorVersion(
+    { ... }, user
+  );  // ← 覆盖 Resource 字段
+}
+```
+
+**该调用被启动于 `changes.createdBlocks.map(async ...)`，但由于 Bug 2（Promise.all 嵌套数组），不被等待。**
+
+---
+
+#### 入口 C：模板升级时 CodeEngineVersion 出现在 `updatedBlocks`
+
+当模板修改了已有的代码生成器版本（versionNumber 变化），版本比较会将其归入 `updatedBlocks`。
+
+在 [serviceTemplate.service.ts#L645-L692](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L645-L692) 的 `handleMergeUpdatedBlock()`：
+
+```typescript
+if (blockType === EnumBlockType.CodeEngineVersion) {
+  return this.resourceService.updateCodeGeneratorVersion(
+    { ... }, user
+  );  // ← 覆盖 Resource 字段
+}
+```
+
+**该调用被启动于 `changes.updatedBlocks.forEach(async ...)`，由于 Bug 1（forEach 返回 undefined），完全不被等待。**
+
+---
+
+#### ❌ 注意：BuildService.updateCodeGeneratorVersion 不是此入口
+
+[build.service.ts#L362-L387](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/build/build.service.ts#L362-L387) 中的 `updateCodeGeneratorVersion()` 更新的是 **Build 表** 的 `codeGeneratorVersion` 字段，记录某次构建实际使用的 DSG 版本，**不影响 Resource 表的局部覆盖字段**。两者是独立的。
+
+---
+
+### 9.6 CodeEngineVersion 覆盖的具体时序与不一致窗口
+
+以入口 C（updatedBlocks 中出现 CodeEngineVersion）为例：
 
 ```
 handleMergeUpdatedBlock()
@@ -429,22 +504,174 @@ handleMergeUpdatedBlock()
 由于 Bug 1 + Bug 2，步骤 (3) 对 `Resource` 表字段的覆盖**发生在函数返回之后**。
 
 这造成一个**不一致窗口**：
-| 时间点 | ResourceTemplateVersion Block | Resource.codeGeneratorVersion | OutdatedVersionAlert |
-|--------|-------------------------------|-------------------------------|----------------------|
-| 升级前 | v1.0.0 | 用户自定义值（如 v2.0.0 Specific） | New |
-| 函数刚返回时 | v1.1.0 ✅ 已更新 | 用户自定义值 ❌ 尚未覆盖 | Resolved ✅ 已解决 |
-| 若干毫秒后 | v1.1.0 | v1.1.0 对应的模板值 ✅ 被覆盖 | Resolved |
 
-**在不一致窗口内**：
-- 用户看到告警已解决、模板版本已升级
-- 但实际构建时使用的 codeGeneratorVersion 仍然是旧值
-- 如果步骤 (3) 的数据库更新失败，用户也不会收到任何错误
+| 时间点 | ResourceTemplateVersion Block | Resource.codeGeneratorVersion | OutdatedVersionAlert | 风险 |
+|--------|-------------------------------|-------------------------------|----------------------|------|
+| 升级前 | v1.0.0 | 用户自定义值（如 v2.0.0 Specific） | New | — |
+| 函数刚返回时 | v1.1.0 ✅ 已更新 | 用户自定义值 ❌ 尚未覆盖 | Resolved ✅ 已解决 | 此时触发构建，使用的仍是旧版本 |
+| 若干毫秒后 | v1.1.0 | v1.1.0 对应的模板值 ✅ 被覆盖 | Resolved | — |
+| （异常情况）步骤(3)抛错 | v1.1.0 | 用户自定义值 ❌ 永远不覆盖 | Resolved | 用户认为升级成功，实际永远停留在旧版本 |
 
 ---
 
-## 十、局部覆盖字段与升级提示状态的执行顺序分析
+## 十、升级提示创建入口的 await 链路与 Kafka 异步边界
 
-### 10.1 涉及的四类数据变更
+### 10.1 告警触发的完整调用链
+
+升级提示（OutdatedVersionAlert）的创建入口在 ServiceTemplate 发布新版本时被触发，完整的 await 链路如下：
+
+```
+GraphQL: createResourceVersion
+    ↓ await
+ResourceVersionService.create() [resourceVersion.service.ts#L40-L112]
+    ├─ await validateVersion()
+    ├─ await entityService.getLatestVersions()
+    ├─ await blockService.getLatestVersions()
+    ├─ await getLatest()
+    ├─ await prisma.resourceVersion.create()  ← ✅ ResourceVersion 入库
+    │
+    └─ [如果是 ServiceTemplate]
+         await outdatedVersionAlertService.triggerAlertsForTemplateVersion(...)
+         ← ✅ 有 await，见 L97
+             │
+             ▼
+triggerAlertsForTemplateVersion() [outdatedVersionAlert.service.ts#L179-L246]
+    ├─ await prisma.resource.findUnique()  ← 校验是 ServiceTemplate
+    ├─ await blockService.findManyByBlockType()  ← 查询所有使用该模板的资源
+    │
+    └─ for (const service of services)  ← ⚠️ 串行遍历，不是并行
+         ├─ await resourceService.getServiceTemplateSettings()  ✅
+         └─ await outdatedVersionAlertService.create(...)       ✅
+                 │
+                 ▼
+         OutdatedVersionAlertService.create() [outdatedVersionAlert.service.ts#L45-L73]
+             ├─ await prisma.outdatedVersionAlert.updateMany()  ✅ 旧告警 → Canceled
+             ├─ await prisma.outdatedVersionAlert.create()      ✅ 新告警入库
+             └─ await this.raiseNotifications(alertId, ...)    ✅ 有 await，见 L70
+                     │
+                     ▼
+             raiseNotifications() [outdatedVersionAlert.service.ts#L75-L124]
+                 ├─ await prisma.outdatedVersionAlert.findFirst()   ✅
+                 ├─ await workspaceService.findWorkspaceUsers()     ✅
+                 └─ for (const user of workspaceUsers)
+                       this.kafkaProducerService
+                           .emitMessage(...)   ← ❌ 没有 await
+                           .catch(logger.error)
+```
+
+---
+
+### 10.2 KafkaProducerService.emitMessage() 的异步边界
+
+在 [KafkaProducer.service.ts#L22-L38](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts#L22-L38) 中：
+
+```typescript
+async emitMessage(
+  topic: string,
+  message: DecodedKafkaMessage,
+  schemaIds?: SchemaIds
+): Promise<void> {
+  const kafkaMessage = await this.serializer.serialize(message, schemaIds);
+  return await new Promise((resolve, reject) => {
+    this.kafkaClient.emit(topic, kafkaMessage).subscribe({
+      error: (err) => reject(err),
+      next: () => resolve(),    // ← 等待 Kafka broker 确认 ACK
+    });
+  });
+}
+```
+
+**关键点**：
+1. `emitMessage()` 的返回类型是 `Promise<void>`，它**确实是一个真正的 Promise**
+2. 内部通过 `new Promise` 包装了 RxJS 的 `subscribe`，会等待 Kafka broker 返回 ACK 后才 resolve
+3. 如果 Kafka 发送失败，Promise 会 reject
+
+---
+
+### 10.3 raiseNotifications() 的异步边界
+
+在 [outdatedVersionAlert.service.ts#L75-L124](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L75-L124)：
+
+```typescript
+async raiseNotifications(alertId: string, alertInitiator: string) {
+  const alert = await this.prisma.outdatedVersionAlert.findFirst(...);  // ✅ await
+  const { resource } = alert;
+  const { project } = resource;
+
+  const workspaceUsers = await this.workspaceService.findWorkspaceUsers(...);  // ✅ await
+
+  for (const user of workspaceUsers) {
+    this.kafkaProducerService
+      .emitMessage(...)          // ❌ 没有 await！
+      .catch((error) => this.logger.error(...));
+  }
+}
+```
+
+**关键点**：
+1. 函数被 `async` 标记，前两步数据库查询都正确使用了 `await`
+2. 但在 `for` 循环中，`emitMessage()` **没有 await**，只附加了 `.catch()` 吞掉错误
+3. 由于没有 await，循环会瞬间完成（启动了 N 个 fire-and-forget 的 Promise）
+4. `raiseNotifications()` 随后隐式返回 `Promise.resolve(undefined)`
+5. 外层 `create()` 中的 `await raiseNotifications()` 只等待了**数据库查询部分**，**不等待 Kafka 发送**
+
+---
+
+### 10.4 精确的异步边界图
+
+```
+OutdatedVersionAlertService.create()
+    │
+    ├─ await updateMany(Canceled)   ──── 数据库写入完成
+    ├─ await create(New)            ──── 数据库写入完成
+    │
+    ├─ await raiseNotifications()
+    │       ├─ await findFirst(alert)    ──┐
+    │       └─ await findWorkspaceUsers()  ── 数据库部分完成
+    │       │
+    │       └─ for (user) {
+    │            emitMessage()  ← fire-and-forget，不等待
+    │            emitMessage()  ← fire-and-forget，不等待
+    │            ...
+    │          }
+    │       │
+    │       └─ raiseNotifications 返回（Kafka 仍在后台发送）
+    │
+    └─ create() 返回 alert 对象
+           │
+           └─ triggerAlertsForTemplateVersion 继续处理下一个服务（串行）
+                  │
+                  └─ 所有服务处理完后
+                         └─ ResourceVersionService.create() 返回
+
+          ╔══════════════════════════════════════════════╗
+          ║  Kafka 消息此时仍在后台发送中：                ║
+          ║  - serialize 消息                             ║
+          ║  - kafkaClient.emit + subscribe 等待 ACK     ║
+          ║  - 失败时只打日志，不影响主流程                ║
+          ╚══════════════════════════════════════════════╝
+```
+
+---
+
+### 10.5 triggerAlertsForTemplateVersion 的串行遍历
+
+在 [outdatedVersionAlert.service.ts#L222-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L222-L244)：
+
+```typescript
+for (const service of services) {
+  const currentTemplateVersion = await this.resourceService.getServiceTemplateSettings(...);
+  await this.create({...}, template.name);
+}
+```
+
+使用 `for...of` + `await` 逐个服务**串行**创建告警。如果有 N 个服务使用该模板，将产生 N 次数据库读取 + N 次告警创建（每次告警创建内部还有多次 DB 查询和 Kafka 发送的启动），全部串行执行，时间复杂度为 O(N)。
+
+---
+
+## 十一、局部覆盖字段与升级提示状态的执行顺序分析
+
+### 11.1 模板升级中的四类数据变更
 
 模板升级过程中共发生四类数据写入操作，它们之间存在时序依赖：
 
@@ -455,7 +682,7 @@ handleMergeUpdatedBlock()
 | ③ | 更新 ResourceTemplateVersion Block | `Block` 表（blockType=ResourceTemplateVersion） | `resourceTemplateVersionService.updateResourceTemplateVersion()` |
 | ④ | 告警状态 New → Resolved | `OutdatedVersionAlert` 表 | `outdatedVersionAlertService.resolvesServiceTemplateUpdated()` |
 
-### 10.2 正确的依赖关系应该是
+### 11.2 正确的依赖关系应该是
 
 ```
 ① CodeEngineVersion 覆盖 Resource 字段 ──┐
@@ -479,7 +706,7 @@ handleMergeUpdatedBlock()
 
 ---
 
-### 10.3 当前代码实际的执行顺序
+### 11.3 当前代码实际的执行顺序
 
 由于 Bug 1 和 Bug 2，**实际执行顺序变成了并行且不可预测**：
 
@@ -512,9 +739,9 @@ handleMergeUpdatedBlock()
 
 ---
 
-### 10.4 OutdatedVersionAlert.create() 的内部时序
+### 11.4 OutdatedVersionAlert.create() 的内部时序（已校准）
 
-当模板发布新版本时（[outdatedVersionAlert.service.ts#L45-L73](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L45-L73)），告警创建的内部顺序是正确的：
+当模板发布新版本时（[outdatedVersionAlert.service.ts#L45-L73](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L45-L73)），告警创建的内部顺序如下：
 
 ```typescript
 async create(args, alertInitiator) {
@@ -529,44 +756,23 @@ async create(args, alertInitiator) {
     data: { ...args.data, status: New }
   });
 
-  // 步骤 3: 发送 Kafka 通知（fire-and-forget，不等待）
-  this.raiseNotifications(alert.id, alertInitiator);  // 没有 await!
+  // 步骤 3: 发送通知（⚠️ 只 await 数据库查询部分，不 await Kafka 发送）
+  await this.raiseNotifications(alert.id, alertInitiator);
 
   return alert;
 }
 ```
 
-**注意**：`raiseNotifications()` 中的 Kafka 消息发送是 **fire-and-forget** 的——没有 `await`，失败时只打日志不抛出异常：
+**关键校准**：之前的分析称 `raiseNotifications()` "没有 await"是不准确的。实际上：
+- ✅ `create()` 中 `await this.raiseNotifications()` —— 有 await
+- ✅ `raiseNotifications()` 内部 `findFirst()` 和 `findWorkspaceUsers()` —— 有 await
+- ❌ `raiseNotifications()` 内部循环中 `kafkaProducerService.emitMessage()` —— **没有 await**，只有 `.catch()`
 
-```typescript
-// [outdatedVersionAlert.service.ts#L96-L123]
-for (const user of workspaceUsers) {
-  this.kafkaProducerService
-    .emitMessage(...)    // ❌ 没有 await
-    .catch((error) => this.logger.error(...));
-}
-```
-
-这意味着告警数据库记录创建成功后，函数立即返回，而 Kafka 通知可能仍在发送中（或发送失败）。
+即：数据库操作都被正确等待，只有 Kafka 消息发送是 fire-and-forget。
 
 ---
 
-### 10.5 triggerAlertsForTemplateVersion 中的串行遍历
-
-在 [outdatedVersionAlert.service.ts#L222-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L222-L244)：
-
-```typescript
-for (const service of services) {
-  const currentTemplateVersion = await this.resourceService.getServiceTemplateSettings(...);
-  await this.create({...}, template.name);
-}
-```
-
-使用 `for...of` + `await` 逐个服务串行创建告警。如果有 N 个服务使用该模板，将产生 N 次数据库读取 + N 次告警创建，全部串行执行，时间复杂度为 O(N)。
-
----
-
-## 十一、Bug 修复建议
+## 十二、Bug 修复建议
 
 ### 修复 1：将 `forEach` 改为 `map`
 
@@ -592,13 +798,32 @@ await Promise.all([createdPromises, deletedPromises, updatedPromises]);
 await Promise.all([...createdPromises, ...deletedPromises, ...updatedPromises]);
 ```
 
-### 修复 3（可选增强）：使用事务保证一致性
+### 修复 3（可选增强）：raiseNotifications 中 Kafka 发送改为并行等待
+
+```typescript
+// ❌ 旧代码：fire-and-forget
+for (const user of workspaceUsers) {
+  this.kafkaProducerService
+    .emitMessage(...)
+    .catch((error) => this.logger.error(...));
+}
+
+// ✅ 修复后：并行发送，全部完成后返回
+const emitPromises = workspaceUsers.map((user) =>
+  this.kafkaProducerService
+    .emitMessage(...)
+    .catch((error) => this.logger.error(...))
+);
+await Promise.all(emitPromises);
+```
+
+### 修复 4（可选增强）：使用事务保证一致性
 
 将 ①②③④ 纳入同一个数据库事务中，确保要么全部成功，要么全部回滚。当前所有操作都是独立的 `prisma.update()` / `prisma.updateMany()` 调用，没有事务包裹。
 
 ---
 
-## 十二、涉及的核心文件清单
+## 十三、涉及的核心文件清单
 
 | 文件 | 职责 |
 |------|------|
