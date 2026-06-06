@@ -301,6 +301,111 @@ enum UserActionType {
 
 > **注意**：当前代码中 `setNotificationRegistry` 固定使用 `CURRENT_WORKSPACE` action 类型，而 subscribeUser 中间件并未区分 action 类型，仅根据 `enableUser` 布尔值判断创建或删除订阅者。
 
+### Stigg Webhook → 订阅更新 → 通知权限变化 的完整链路
+
+这是最容易被忽略的一条链路：**Stigg 支付系统的订阅状态变更通过 Webhook 写入数据库，进而影响用户的 BillingFeature.Notification 权限，最终决定 Novu 订阅者的创建/删除**。
+
+#### 完整路径图
+
+```
+Stigg 支付系统（订阅创建/升级/降级/取消/过期/促销权益变更）
+    │ HTTP POST，header 带 stigg-webhooks-secret
+    ▼
+SubscriptionController.updateStatus()     [subscription.controller.ts#L20-L32]
+    │  POST /subscriptions/updateStatus
+    │  校验 header 中的 stigg-webhooks-secret
+    ▼
+SubscriptionService.handleUpdateSubscriptionStatusEvent()
+                                            [subscription.service.ts#L261-L332]
+    │
+    ├─ 事件类型: subscription.created / .updated / .expired / .canceled
+    │     → prisma.subscription.upsert()  写入/更新 DB 订阅记录
+    │     → subscription.created/.updated 额外触发:
+    │           updateProjectLicensed(workspaceId)
+    │           updateServiceLicensed(workspaceId)
+    │
+    └─ 事件类型: promotionalEntitlement.granted / .updated / .revoked / .expired
+          → 不写 subscription 表
+          → 直接触发 updateProjectLicensed() / updateServiceLicensed()
+    │
+    │ （注意：此处不会立即发送任何 Kafka 通知消息）
+    │
+    ▼ （用户下次刷新前端页面或访问工作区）
+WorkspaceResolver.currentWorkspace()      [workspace.resolver.ts#L79-L92]
+    │  GraphQL Query: currentWorkspace
+    ▼
+UserService.setNotificationRegistry(user)  [user.service.ts#L175-L202]
+    │
+    ▼
+BillingService.getBooleanEntitlement(workspaceId, BillingFeature.Notification)
+                                            [billing.service.ts#L212-L227]
+    │  从 Stigg SDK 实时拉取布尔权限
+    │  BillingFeature.Notification = "feature-notifications"
+    ▼
+  hasAccess = true / false → canShowUserNotification
+    │
+    ▼
+发送 USER_ACTION_TOPIC Kafka 消息
+    value.enableUser = canShowUserNotification
+    │
+    ▼
+notification-service AppController.subscribeNotification()
+    │
+    ▼
+subscribeUser() 中间件                    [subscribeUser.ts]
+    │
+    ├─ enableUser = true  → novuService.createSubscriber() / updateSubscriber()
+    └─ enableUser = false → novuService.deleteSubscriber()
+```
+
+#### 关键代码位置
+
+1. **Stigg Webhook 入口**：[subscription.controller.ts#L20-L32](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/subscription/subscription.controller.ts#L20-L32)
+
+   ```typescript
+   @Post("updateStatus")
+   async updateStatus(
+     @Headers("stigg-webhooks-secret") stiggWebhooksSecret,
+     @Body() updateStatusDto: UpdateStatusDto
+   ): Promise<void> {
+     if (stiggWebhooksSecret !== this.stiggWebhooksSecret) {
+       throw new Error("Invalid stigg-webhooks-secret");
+     }
+     await this.subscriptionService.handleUpdateSubscriptionStatusEvent(updateStatusDto);
+   }
+   ```
+
+2. **订阅状态事件处理**：[subscription.service.ts#L261-L332](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/subscription/subscription.service.ts#L261-L332)
+
+   处理的 Webhook 事件类型：
+   | 事件类型 | 处理动作 |
+   |---------|---------|
+   | `subscription.created` | DB upsert subscription + trackUpgradeCompletedEvent + 更新 Project/Service 许可 |
+   | `subscription.updated` | DB upsert subscription（仅更新 status）+ 更新 Project/Service 许可 |
+   | `subscription.expired` | DB upsert subscription（仅更新 status） |
+   | `subscription.canceled` | DB upsert subscription（仅更新 status） |
+   | `promotionalEntitlement.granted` | 直接更新 Project/Service 许可 |
+   | `promotionalEntitlement.updated` | 直接更新 Project/Service 许可 |
+   | `promotionalEntitlement.revoked` | 直接更新 Project/Service 许可 |
+   | `promotionalEntitlement.expired` | 直接更新 Project/Service 许可 |
+
+3. **Notification Billing Feature 定义**：[billing-feature.types.ts#L21](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts#L21)
+   ```typescript
+   Notification = "feature-notifications"
+   ```
+
+4. **用户侧触发点（权限拉取 + Kafka 发送）**：
+   - GraphQL 入口：[workspace.resolver.ts#L79-L92](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
+   - 权限检查 + Kafka 发送：[user.service.ts#L175-L202](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/user/user.service.ts#L175-L202)
+
+#### 设计要点与注意事项
+
+- **延迟同步（非实时）**：Stigg Webhook 只负责更新数据库订阅状态，**不会立即向 Kafka 发消息**。必须等到用户下次请求 `currentWorkspace`（通常是前端刷新或打开工作区）时，才会通过 `setNotificationRegistry()` 重新拉取 Stigg 权限并同步 Novu 订阅者状态。
+- **两层权限检查**：
+  1. DB 层：`subscription` 表记录工作区当前的订阅计划和状态
+  2. 实时层：`BillingService.getBooleanEntitlement()` 通过 Stigg SDK 实时查询 Feature 权限（feature-notifications），这才是 `enableUser` 的最终依据
+- **许可同步副作用**：`updateProjectLicensed()` 和 `updateServiceLicensed()` 会根据 Stigg 返回的 metered entitlement（Projects / Services 使用限额）更新项目和服务的 `licensed` 布尔字段，这与通知功能无关，但同样由 Stigg Webhook 驱动。
+
 ### 关于"成员邀请"的说明
 
 成员邀请（邀请邮件发送）**不走 Kafka 通知管道**，而是直接调用邮件服务：
@@ -355,13 +460,14 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 ## 数据流向总结表
 
-| 事件类型 | 发送方 Service | Kafka Topic | Notification 中间件 | Novu 调用方法 | Novu eventName |
-|---------|---------------|-------------|---------------------|--------------|----------------|
-| 用户订阅 | UserService | `user-action.internal.1` | subscribeUser | createSubscriber / deleteSubscriber | - |
-| 构建完成 | BuildService | `user-build.internal.1` | buildCompleted | triggerNotificationToSubscriber | `build-completed` |
-| 插件过期告警 | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
-| 模板过期告警 | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
-| 功能公告 | UserService | `user-announcement.internal.1` | featureAnnouncement | triggerNotificationToSubscriber | 动态（模板标识符） |
+| 事件类型 | 触发源头 | 发送方 Service | Kafka Topic | Notification 中间件 | Novu 调用方法 | Novu eventName |
+|---------|---------|---------------|-------------|---------------------|--------------|----------------|
+| 用户订阅（含订阅权限变化） | 用户登录/切换工作区 **或** Stigg Webhook 更新订阅后用户访问工作区 | UserService | `user-action.internal.1` | subscribeUser | createSubscriber / deleteSubscriber | - |
+| 构建完成 | DSG 代码生成成功回调 | BuildService | `user-build.internal.1` | buildCompleted | triggerNotificationToSubscriber | `build-completed` |
+| 插件过期告警 | Plugin Repository 发布新版本 → ResourceVersion.create | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
+| 模板过期告警 | ServiceTemplate 发布新版本 → ResourceVersion.create | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
+| 功能公告 | 管理员手动调用接口 | UserService | `user-announcement.internal.1` | featureAnnouncement | triggerNotificationToSubscriber | 动态（模板标识符） |
+| Stigg 订阅 Webhook（不直接发通知） | Stigg 支付系统推送 | SubscriptionService | **不直接发 Kafka** | 仅更新 DB，等用户下次访问 currentWorkspace 时通过 USER_ACTION_TOPIC 同步 | - | - |
 
 ---
 
@@ -386,3 +492,22 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 ### 4. 事件溯源（Action + ActionStep + ActionLog）
 
 构建任务执行过程伴随完整的 Action → ActionStep → ActionLog 三层记录模型（见 [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/action/action.service.ts)），但此模型仅用于任务状态追踪，**不直接触发通知**。通知仅在关键业务节点（代码生成成功、插件新版本发布等）显式触发。
+
+### 5. Stigg Webhook 延迟同步（Pull-on-Read）
+
+订阅/权限变化的同步采用 **Webhook 写 DB + 用户请求时拉取权限** 的两段式设计，而非 Webhook 直接推送通知：
+
+1. **写路径（Webhook → DB）**：Stigg Webhook 触发时，`handleUpdateSubscriptionStatusEvent()` 只做两件事：
+   - 写入/更新 `subscription` 表（记录计划和状态）
+   - 更新 `project` / `resource` 表的 `licensed` 字段（按使用限额标记许可状态）
+   
+2. **读路径（用户请求 → 实时权限 → Novu 同步）**：用户每次请求 `currentWorkspace` 时：
+   - 调 `BillingService.getBooleanEntitlement(workspaceId, BillingFeature.Notification)` 从 Stigg SDK 实时拉取布尔权限
+   - 用权限结果填充 `enableUser` 字段，发送 `USER_ACTION_TOPIC` Kafka 消息
+   - notification-service 消费后在 Novu 中 createSubscriber/deleteSubscriber
+
+**这种设计的考量**：
+- Webhook 侧无需感知 Novu，职责单一（仅持久化订阅状态）
+- 权限判断走 Stigg SDK 实时查询，避免 DB 缓存与 Stigg 实际状态不一致
+- 以用户访问为自然触发点，不必遍历所有工作区用户批量同步，节省资源
+- **代价**：订阅变更后用户如果一直不访问系统，Novu 侧的订阅者状态不会被刷新
