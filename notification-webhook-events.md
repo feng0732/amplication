@@ -10,7 +10,7 @@ Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息�
 业务服务 (amplication-server)
         │
         ▼ 发送 Kafka 消息
-   Kafka 消息队列 (5 个 Topic)
+   Kafka 消息队列 (notification-service 监听 5 个 Topic，其中 4 个有完整链路)
         │
         ▼ 消费消息
   notification-service (微服务)
@@ -35,7 +35,11 @@ Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息�
 
 ## Kafka Topics 定义
 
-所有 Topic 定义在 [schema-registry/src/index.ts](libs/schema-registry/src/index.ts#L29-L69) 中的 `KAFKA_TOPICS` 枚举：
+notification-service 在 [app.controller.ts](packages/notification-service/src/app.controller.ts) 中共监听 **5 个 Kafka Topic**，但其中只有 4 个在 schema-registry 中有常量定义且具备完整的发送方 → 处理包链路。
+
+### Schema Registry 中定义的 4 个 Topic（完整链路）
+
+定义位置：[schema-registry/src/index.ts](libs/schema-registry/src/index.ts#L29-L69) 中的 `KAFKA_TOPICS` 枚举：
 
 | Topic 常量 | Topic 实际值 | 触发场景 |
 |------------|-------------|---------|
@@ -43,6 +47,20 @@ Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息�
 | `USER_BUILD_TOPIC` | `user-build.internal.1` | 构建（代码生成）完成 |
 | `USER_ANNOUNCEMENT_TOPIC` | `user-announcement.internal.1` | 功能公告发送 |
 | `TECH_DEBT_CREATED_TOPIC` | `platform.internal.tech-debt.created.1` | 插件版本/模板版本/代码引擎版本过期告警 |
+
+### 未注册的第 5 个 Topic：`user-preview-generation-completed.internal.1`
+
+该 Topic **仅出现在 notification-service 的 `@EventPattern` 硬编码字符串中**，状态如下：
+
+| 检查项 | 结果 | 证据 |
+|-------|------|------|
+| 是否在 KAFKA_TOPICS 枚举中定义 | ❌ 无 | [schema-registry/src/index.ts](libs/schema-registry/src/index.ts#L29-L69) 无对应常量 |
+| 是否有 schema（key/value 类型） | ❌ 无 | `libs/schema-registry/src/lib/` 下无 preview 相关子目录 |
+| 是否有发送方代码 | ❌ 无 | 全仓库搜索无任何 `emitMessage`/`send` 相关引用 |
+| 是否有对应 notification-packages 处理包 | ❌ 无 | `notification-packages/` 目录下只有 4 个处理包（见下） |
+| compose 中间件是否能处理 | ❌ 不能 | 所有中间件的 topic 判断均不匹配 |
+
+> **结论**：`user-preview-generation-completed.internal.1` 是一个**预留的空监听器**，目前不会产生任何通知。即使该 topic 有消息到达，也会经过 compose 管道但没有中间件匹配 topic，最终 `notifications` 数组为空，不执行任何 Novu 调用。
 
 ---
 
@@ -75,15 +93,30 @@ notifyTechDebt(@Payload() message, @Ctx() context: KafkaContext) { ... }
 
 ```typescript
 compose(
-  subscribeUser,       // 用户订阅管理（创建/删除 Novu subscriber）
-  buildCompleted,      // 构建完成通知
-  featureAnnouncement, // 功能公告通知
-  techDebtAlert,       // 技术债务告警通知
+  subscribeUser,       // topic: user-action.internal.1          → 用户订阅管理（创建/删除 Novu subscriber）
+  buildCompleted,      // topic: user-build.internal.1            → 构建完成通知
+  featureAnnouncement, // topic: user-announcement.internal.1     → 功能公告通知
+  techDebtAlert,       // topic: platform.internal.tech-debt.created.1 → 技术债务告警通知
   novuPackage          // 统一执行：遍历 notifications 数组调用 Novu API
 )({ message, topic, novuService, amplicationLogger, notifications: [] })
 ```
 
 每个中间件根据 `topic` 判断是否处理，符合条件则向 `notifications` 数组 push 一条通知任务，最后由 `novuPackage` 统一执行 Novu API 调用。
+
+> **注意**：compose 链中只有 **4 个业务通知中间件**，对应 4 个已注册的 Kafka Topic。`user-preview-generation-completed.internal.1` 没有对应的中间件，消息到达后 `notifications` 数组保持为空，不产生任何 Novu 调用。
+
+### notification-packages 目录清单
+
+实际文件位于 [packages/notification-service/src/notification-packages/](packages/notification-service/src/notification-packages/)：
+
+| 处理包文件 | 对应 Topic |
+|-----------|-----------|
+| `subscribeUser.ts` | `user-action.internal.1` |
+| `buildCompleted.ts` | `user-build.internal.1` |
+| `featureAnnouncement.ts` | `user-announcement.internal.1` |
+| `techDebtAlert.ts` | `platform.internal.tech-debt.created.1` |
+
+目录中不存在 `previewUserGenerationCompleted.ts` 或类似文件，进一步印证该 topic 尚无处理逻辑。
 
 ### Novu 集成
 
@@ -470,6 +503,7 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 | 模板过期告警 | ServiceTemplate 发布新版本 → ResourceVersion.create | OutdatedVersionAlertService | `platform.internal.tech-debt.created.1` | techDebtAlert | triggerNotificationToSubscriber | `technical-debt-alert` |
 | 功能公告 | 管理员手动调用接口 | UserService | `user-announcement.internal.1` | featureAnnouncement | triggerNotificationToSubscriber | 动态（模板标识符） |
 | Stigg 订阅 Webhook（不直接发通知） | Stigg 支付系统推送 | SubscriptionService | **不直接发 Kafka** | 仅更新 DB，等用户下次访问 currentWorkspace 时通过 USER_ACTION_TOPIC 同步 | - | - |
+| Preview 生成完成（预留，未实现） | 无 | 无发送方 | `user-preview-generation-completed.internal.1` | 无对应中间件 | - | - |
 
 ---
 
@@ -513,3 +547,16 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 - 权限判断走 Stigg SDK 实时查询，避免 DB 缓存与 Stigg 实际状态不一致
 - 以用户访问为自然触发点，不必遍历所有工作区用户批量同步，节省资源
 - **代价**：订阅变更后用户如果一直不访问系统，Novu 侧的订阅者状态不会被刷新
+
+### 6. 预留空监听器（Skeleton Listener）
+
+`user-preview-generation-completed.internal.1` 是一个典型的预留监听器：在 [app.controller.ts](packages/notification-service/src/app.controller.ts#L44-L52) 中声明了 `@EventPattern`，但未配置以下任何一项：
+
+| 组件 | 是否存在 | 说明 |
+|------|---------|------|
+| KAFKA_TOPICS 枚举常量 | ❌ | schema-registry 中未定义 |
+| Kafka message schema（key/value） | ❌ | 无 TypeScript 类型约束 |
+| 发送方（producer） | ❌ | 全仓库无 `emitMessage` 调用 |
+| notification-packages 处理包 | ❌ | compose 链中无对应中间件 |
+
+这种设计的意图通常是**提前为未来功能预留 Topic 接入点**，避免后续上线时需要修改 notification-service 的部署配置（Kafka consumer 订阅列表）。但目前该 Topic 不会产生任何实际效果。
