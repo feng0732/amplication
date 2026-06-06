@@ -407,14 +407,95 @@ Amplication 的代码生成引擎在每一个关键生成环节都暴露了 **Be
 
 ### 6.2 与 GraphQL 契约直接相关的插件事件
 
-以下是直接影响 GraphQL 类型、Resolver 和访问控制的关键插件点：
+以下是直接影响 GraphQL 类型、Resolver 和访问控制的关键插件点。
 
 #### GraphQL 类型层（DTOs）
 
 | EventName | 参数类型 | 可介入时机 | 影响范围 |
 |-----------|---------|------------|---------|
-| `CreateDTOs` | `CreateDTOsParams` | Before + After | 所有 Entity 相关 DTO（Entity/CreateInput/WhereInput 等）的生成，可修改 DTO 类结构、字段列表、装饰器 |
-| `CreatePrismaSchema` | `CreatePrismaSchemaParams` | Before + After | Prisma Schema，会间接影响生成的所有 DTO 类型（因为 DTO 字段数据来源于 Entity→Prisma） |
+| `CreateDTOs` | `CreateDTOsParams`（仅含 `dtos` + `dtoNameToPath`） | Before + After | 所有 Entity 相关 DTO（Entity/CreateInput/WhereInput 等），可修改 AST 节点、新增 DTO、重命名路径 |
+| `CreatePrismaSchema` | `CreatePrismaSchemaParams` | Before + After | Prisma Schema，会间接影响生成的所有 DTO 类型 |
+
+> **重要纠正**：`CreateDTOsParams` 的**真实参数只有两个字段**（[plugin-events-params.types.ts L353-L356](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugin-events-params.types.ts#L353-L356)）：
+> - `dtos: DTOs` —— 已生成的 DTO AST 节点集合
+> - `dtoNameToPath: Record<string, string>` —— DTO 类名到输出文件路径的映射
+>
+> **参数中没有 Entity！** 插件无法在此事件上直接修改原始实体配置，只能操作已生成的 AST 节点。
+
+##### DTOs 数据结构详解
+
+DTOs 是一个三层嵌套的 AST 节点集合（[code-gen-types.ts L194-L216](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/code-gen-types.ts#L194-L216)）：
+
+```
+DTOs {
+  [entityName: string]: EntityEnumDTOs & EntityDTOs
+}
+├── EntityDTOs
+│   ├── entity: NamedClassDeclaration           // @ObjectType() —— 主实体输出类型
+│   ├── createInput: NamedClassDeclaration      // @InputType() —— 创建输入
+│   ├── updateInput: NamedClassDeclaration      // @InputType() —— 更新输入
+│   ├── whereInput: NamedClassDeclaration       // @InputType() —— 过滤条件
+│   ├── whereUniqueInput: NamedClassDeclaration // @InputType() —— 唯一键条件
+│   ├── deleteArgs: NamedClassDeclaration       // @ArgsType() —— 删除参数
+│   ├── countArgs: NamedClassDeclaration        // @ArgsType() —— 计数参数
+│   ├── findManyArgs: NamedClassDeclaration     // @ArgsType() —— 列表查询参数
+│   ├── findOneArgs: NamedClassDeclaration      // @ArgsType() —— 单体查询参数
+│   ├── createArgs?: NamedClassDeclaration      // @ArgsType() —— 创建参数
+│   ├── updateArgs?: NamedClassDeclaration      // @ArgsType() —— 更新参数
+│   ├── orderByInput: NamedClassDeclaration     // @InputType() —— 排序输入
+│   └── listRelationFilter: NamedClassDeclaration // @InputType() —— 关联过滤
+└── EntityEnumDTOs
+    └── [enumName: string]: TSEnumDeclaration   // TS 枚举（Entity 字段枚举）
+```
+
+每个 `NamedClassDeclaration` 是 `ast-types` 的 TS AST 节点，包含：
+- `id: Identifier` —— 类名
+- `decorators: Decorator[]` —— 类装饰器（`@ObjectType`、`@InputType` 等）
+- `body: ClassBody` —— 类体，内含 `ClassProperty` 节点（每个字段一个）
+
+##### CreateDTOs Before / After 钩子的真实介入方式
+
+`CreateDTOs` 事件由 [create-dtos.ts L36-L44](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L36-L44) 中的 `createDTOModules()` 触发：
+
+```
+createDTOs(entities)           // 1. 先根据 Entity[] 生成 DTOs（AST 节点集合）
+getDTONameToPath(dtos)         // 2. 生成 dtoName → 文件路径映射
+         │
+         ▼
+pluginWrapper(
+  createDTOModulesInternal,
+  EventNames.CreateDTOs,
+  { dtos, dtoNameToPath }      // ◀─ Before 钩子在这里介入
+)
+         │
+         ▼
+createDTOModulesInternal()     // 3. 遍历 DTOs 中的所有 AST，生成 Module（文件）
+         │
+         ▼
+返回 ModuleMap                  // ◀─ After 钩子在这里介入
+```
+
+| 钩子 | 可操作对象 | 能做什么 | 不能做什么 |
+|------|-----------|---------|-----------|
+| **Before** | `dtos`（AST 节点集合）、`dtoNameToPath`（路径映射） | 修改已有 ClassProperty 的装饰器/类型；往已有 ClassDeclaration 追加/删除 ClassProperty；往 `dtos` 中新增自定义 NamedClassDeclaration；更新路径映射 | 访问原始 Entity（参数中没有）；直接操作最终文件 |
+| **After** | `ModuleMap`（文件集合） | 修改已有文件代码；新增/替换/删除文件模块 | 访问 DTO AST（已被编译成字符串） |
+
+##### ModuleMap 数据结构与操作方式
+
+`ModuleMap` 是 `FileMap<string>` 的子类（[code-gen-types.ts L151-L178](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/code-gen-types.ts#L151-L178)），本质是 `path → Module` 的有序 Map。每个 Module 包含：
+
+- `path: string` —— 输出文件的相对路径（如 `"src/customer/base/customer.resolver.base.ts"`）
+- `code: string` —— 文件源代码（已由 AST printer 渲染的字符串）
+
+After 钩子中对 ModuleMap 的典型操作：
+
+| API | 用途 |
+|-----|------|
+| `moduleMap.set(module)` | 新增或覆盖一个文件模块 |
+| `moduleMap.modules()` | 获取所有模块数组，用于遍历修改 |
+| `moduleMap.replaceModulesCode((path, code) => newCode)` | 批量替换所有模块的代码字符串 |
+| `moduleMap.replaceModulesPath((path) => newPath)` | 批量重命名所有模块的输出路径 |
+| `moduleMap.get(path)` | 按路径获取单个模块 |
 
 #### Resolver 层
 
@@ -478,13 +559,14 @@ Amplication 的代码生成引擎在每一个关键生成环节都暴露了 **Be
 
 ### 6.3 插件对 GraphQL 契约的典型影响方式
 
-插件通过介入这些事件可以：
+插件通过介入这些事件可以（以下方式均结合代码实际参数验证）：
 
-1. **新增自定义 GraphQL 类型**：在 `CreateDTOs` 的 After 钩子中往 `dtos` Map 追加新的 `NamedClassDeclaration`，并更新 `dtoNameToPath` 映射
+1. **新增自定义 GraphQL 类型**：在 `CreateDTOs` 的 **Before** 钩子中往 `dtos[entityName]` 对象上追加新的 `NamedClassDeclaration` AST 节点，并同步更新 `dtoNameToPath` 映射（这样 `createDTOModulesInternal` 才会把它编译成文件）。或者在 **After** 钩子中通过 `moduleMap.set()` 直接注入新的 Module 文件。
 2. **替换 Resolver 方法**：在 `CreateEntityResolverBase` 的 After 钩子中用 TS AST 遍历 `classDeclaration.body.body`，找到目标方法后替换 `ClassMethod` 节点
-3. **添加字段装饰器**：在 `CreateDTOs` 的 Before 钩子修改传入的 Entity 字段数组，或在 After 钩子直接操作 AST 为 ClassProperty 追加 Decorator
+3. **为 DTO 字段添加装饰器**：在 `CreateDTOs` 的 **Before** 钩子中操作 `dtos` 中的 AST——找到目标 `NamedClassDeclaration.body.body` 里的 `ClassProperty`，直接 push 新的 Decorator 节点（如 GraphQL `@Field`、验证器 `@IsOptional`、或 `@ApiProperty`）。注意：CreateDTOs 参数中没有 Entity，不能通过修改 Entity 来间接影响字段。
 4. **为 Resolver 追加 ACL 装饰器**：由于 DSG 默认不在 Resolver 方法上生成 `@UseRoles` 和 ACL 拦截器（参见第四章 4.6 节），插件可在 `CreateEntityResolverBase` 的 After 钩子中通过 AST 手动为方法添加 `@UseInterceptors(AclFilterResponseInterceptor)`、`@UseRoles({...})` 等装饰器（需同时确保 import 语句被追加）
 5. **新增 Resolver 方法**：在 After 钩子中 push 新的 `ClassMethod`（带 `@Query`/`@Mutation` 装饰器）到 Resolver 基类
+6. **完全替换默认行为**：在任意事件的 Before 钩子中设置 `context.utils.skipDefaultBehavior = true`，然后由插件自行生成 ModuleMap 返回给 After 钩子处理（常用于完全替换某个 Entity 的 DTO 或 Resolver 生成逻辑）
 
 ---
 
