@@ -219,14 +219,33 @@ Object.keys(entityActions.entityDefaultActions).forEach((key) => {
 
 两者都在 [create-resolver.ts L434-L556](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L434-L556) 中生成并追加到 Resolver Base 类。
 
+### 4.6 Resolver 方法装饰器的真实状态（与 Controller 对比）
+
+这是容易理解错误的关键点：**Resolver 和 Controller 的初始装饰器完全不同**。
+
+| 装饰器 / 拦截器 | Resolver Base 模板初始状态 | Controller Base 模板初始状态 |
+|-----------------|--------------------------|----------------------------|
+| `@graphql.Query` / `@graphql.Mutation` | ✅ 存在于 Resolver 模板 | ❌ 不存在 |
+| `@common.Get` / `@common.Post` 等 REST 装饰器 | ❌ 不存在 | ✅ 存在于 Controller 模板 |
+| `@nestAccessControl.UseRoles({...})` | ❌ **不存在** | ❌ 模板中不存在（但生成后通过运行时或其他链路注入） |
+| `@common.UseInterceptors(AclFilterResponseInterceptor)` | ❌ **不存在** | ❌ 模板中不存在 |
+| `@common.UseInterceptors(AclValidateRequestInterceptor)` | ❌ **不存在** | ❌ 模板中不存在 |
+| `@Public()` | ❌ 不存在，仅当 Action 为 Public 时由 `setEndpointPermissions()` 动态添加 | ❌ 不存在，仅当 Action 为 Public 时动态添加 |
+
+**结论**：GraphQL Resolver 的 6 个 CRUD 方法和关联方法在代码生成后，**默认只有 GraphQL 原生装饰器**（`@Query`/`@Mutation`/`@ResolveField`/`@Args`/`@Parent`），没有任何 ACL 相关的 `@UseRoles` 或拦截器装饰器。`setEndpointPermissions()` 对 Resolver 的**唯一实际作用**是在权限类型为 Public 时追加 `@Public()` 装饰器——其他"移除拦截器/移除 UseRoles"操作均为空操作（因为本来就不存在这些装饰器）。
+
+测试快照验证（以 Customer 实体为例）：Resolver Base 的 `customers()`、`customer()`、`createCustomer()`、`updateCustomer()`、`deleteCustomer()` 五个方法上只有 `@graphql.Query` / `@graphql.Mutation`，没有任何 ACL 装饰器；只有关联方法 `findOrders()` 上出现了 `@Public()`（因为关联实体 Order 的 Search 权限是 Public）。
+
 ---
 
 ## 五、资源配置 → 访问控制（ACL）
 
 Amplication 的访问控制分**两层**实现：
 
-1. **请求拦截层**：通过 NestJS 装饰器（`@UseRoles`、拦截器）在 Resolver/Controller 方法上
+1. **端点标记层**：通过 NestJS 装饰器（`@Public()` 标记公开端点、`@UseRoles` 声明角色权限要求、ACL 拦截器执行校验）
 2. **授权规则层**：通过 `accesscontrol` 库的 `grants.json` 配置，支持细粒度到字段级的权限
+
+> **注意**：ACL 装饰器（`@UseRoles` + 两个拦截器）在 GraphQL Resolver 生成代码中**不出现**，仅在 REST Controller 生成代码中出现。GraphQL 端点的运行时授权依赖其他机制（如全局 Guard、模块级配置），或依赖后续版本的补充。
 
 ### 5.1 EntityPermission 数据结构
 
@@ -279,20 +298,66 @@ const attributes = createAttributes([
 
 详见 [create-grants.ts L97-L121](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/create-grants.ts#L97-L121)。
 
-### 5.3 Resolver 方法的装饰器注入
+### 5.3 端点权限装饰器注入（setEndpointPermissions 精确行为）
 
-访问控制的**请求拦截层**由 [set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts) 的 `setEndpointPermissions()` 实现，该函数在每个 Resolver/Controller 方法上被调用（如 [create-resolver.ts L340-L342](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L340-L342)）。
+访问控制的端点标记由 [set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts) 的 `setEndpointPermissions()` 实现。该函数在以下位置被调用：
 
-其核心逻辑：如果某 Action 被配置为 `Public` 类型：
+- Resolver Base 的 6 个 CRUD 方法：[create-resolver.ts L340-L342](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L340-L342)
+- Resolver 的 ToOne / ToMany 关联方法：[create-resolver.ts L487-L492](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L487-L492) 和 [create-resolver.ts L548-L553](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L548-L553)
+- Controller Base 的 5 个 CRUD 方法：[create-controller.ts L320-L322](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/controller/create-controller.ts#L320-L322)
+- Controller 的 ToMany 关联方法：[create-controller.ts L478-L480](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/controller/create-controller.ts#L478-L480)
 
-1. **Search / View**（读操作）：移除 `AclFilterResponseInterceptor`（不再过滤响应字段）
-2. **Create / Update**（写操作）：移除 `AclValidateRequestInterceptor`（不再验证请求字段）
-3. 移除 `@UseRoles()` 装饰器（不再强制登录）
-4. 添加 `@Public()` 装饰器（标记为公开端点）
+#### 函数实际执行逻辑（逐行解读）
 
-非 Public 的方法保留默认的 `@UseRoles()` + 两个 ACL 拦截器组合，由运行时的 `accesscontrol` + `grants.json` 做最终授权判断。
+```ts
+function setEndpointPermissions(classDeclaration, methodId, action, entity) {
+  // 1. 找方法
+  const classMethod = getClassMethodById(classDeclaration, methodId);
+  if (!classMethod) return;
 
-方法与 Action 的对应关系（[create-resolver.ts L307-L338](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L307-L338)）：
+  // 2. 查权限：不是 Public → 直接 return，什么都不做
+  if (!isPublicEntity(entity, action)) return;
+
+  // 3. Search / View 读操作 → 移除响应过滤拦截器
+  if (action === EnumEntityAction.Search || action === EnumEntityAction.View) {
+    removeIdentifierFromUseInterceptorDecorator(
+      classMethod, ACL_FILTER_RESPONSE_INTERCEPTOR_NAME
+    );
+  }
+
+  // 4. Create / Update 写操作 → 移除请求校验拦截器
+  if (action === EnumEntityAction.Create || action === EnumEntityAction.Update) {
+    removeIdentifierFromUseInterceptorDecorator(
+      classMethod, ACL_VALIDATE_REQUEST_INTERCEPTOR_NAME
+    );
+  }
+
+  // 5. 移除 @UseRoles
+  removeDecoratorByName(classMethod, USE_ROLES_DECORATOR_NAME);
+
+  // 6. 再次移除 @UseRoles（防御性重复）
+  removeDecoratorByName(classMethod, USE_ROLES_DECORATOR_NAME);
+
+  // 7. 追加 @Public()
+  classMethod.decorators?.unshift(createPublicDecorator());
+}
+```
+
+#### 对 Resolver 的实际效果 vs 对 Controller 的实际效果
+
+| 步骤 | Resolver（实际效果） | Controller（实际效果） |
+|------|---------------------|----------------------|
+| 3. 移除 `AclFilterResponseInterceptor` | **空操作**（模板里没有这个装饰器） | 如果模板有则移除 |
+| 4. 移除 `AclValidateRequestInterceptor` | **空操作**（模板里没有这个装饰器） | 如果模板有则移除 |
+| 5. 移除 `@UseRoles` | **空操作**（模板里没有这个装饰器） | 如果模板有则移除 |
+| 6. 再次移除 `@UseRoles` | **空操作** | — |
+| 7. 添加 `@Public()` | ✅ **唯一实际生效** | ✅ 实际生效 |
+
+**关键结论**：`setEndpointPermissions()` 对 GraphQL Resolver 的唯一作用是——当某 Action 权限类型为 Public 时，在对应方法上追加 `@Public()` 装饰器。对于非 Public 的 Resolver 方法，函数在第 2 步就直接 `return`，**不做任何修改**。
+
+#### Resolver 方法与 Action 的对应关系
+
+[create-resolver.ts L307-L338](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L307-L338) 中定义：
 
 | Resolver 方法 | `EnumEntityAction` |
 |--------------|--------------------|
@@ -302,8 +367,8 @@ const attributes = createAttributes([
 | `ENTITY_QUERY` | `View` |
 | `UPDATE_MUTATION` | `Update` |
 | `DELETE_MUTATION` | `Delete` |
-| ToOne `getXxx` 方法 | `View`（关联实体） |
-| ToMany `findXxx` 方法 | `Search`（关联实体） |
+| ToOne `getXxx` 方法 | `View`（关联实体的权限） |
+| ToMany `findXxx` 方法 | `Search`（关联实体的权限） |
 
 ---
 
@@ -361,6 +426,41 @@ Amplication 的代码生成引擎在每一个关键生成环节都暴露了 **Be
 | `CreateEntityResolverToOneRelationMethods` | `CreateEntityResolverToOneRelationMethodsParams` | Before + After | 一对一关联的 get 方法 |
 | `CreateEntityService` / `CreateEntityServiceBase` | 对应 Params | Before + After | Service 层（Resolver 调用的后端逻辑），修改 Service 会联动 Resolver 的调用签名 |
 
+#### 插件参数类型定义与实际传递的不一致（重要）
+
+以下是代码审查发现的**参数类型不一致**问题，插件开发者需特别注意：
+
+##### `CreateEntityResolverBaseParams` —— 多传了 `entityDTO`
+
+| 字段 | 类型定义 ([plugin-events-params.types.ts L321-L337](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/libs/util/code-gen-types/src/plugin-events-params.types.ts#L321-L337)) | 实际传递 ([create-resolver.ts L173-L190](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L173-L190)) | 实际接收函数签名 ([create-resolver.ts L253-L269](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/resolver/create-resolver.ts#L253-L269)) |
+|------|---------------------|------------------|-------------------|
+| `template` | ✅ | ✅ | ✅ |
+| `entityName` | ✅ | ✅ | ✅ |
+| `entityType` | ✅ | ✅ | ✅ |
+| `entityServiceModule` | ✅ | ✅ | ✅ |
+| `entity` | ✅ | ✅ | ✅ |
+| **`entityDTO`** | ❌ **类型定义中没有** | ✅ **实际被传入** | ❌ **函数不接收** |
+| `serviceId` | ✅ | ✅ | ✅ |
+| `resolverBaseId` | ✅ | ✅ | ✅ |
+| `createArgs` | ✅ | ✅ | ✅ |
+| `updateArgs` | ✅ | ✅ | ✅ |
+| `createMutationId` | ✅ | ✅ | ✅ |
+| `updateMutationId` | ✅ | ✅ | ✅ |
+| `templateMapping` | ✅ | ✅ | ✅ |
+| `moduleContainers` | ✅ | ✅ | ✅ |
+| `entityActions` | ✅ | ✅ | ✅ |
+| `dtoNameToPath` | ✅ | ✅ | ✅ |
+
+**影响**：`entityDTO` 字段通过 `as CreateEntityResolverBaseParams` 类型断言被偷偷传入 `pluginWrapper`，Before 钩子的 `eventParams` 中会包含此字段，但 TS 类型系统不感知。插件如果依赖该字段，需自行断言。
+
+##### 其他验证一致的事件
+
+| 事件 | 类型定义 vs 实际传递 |
+|------|---------------------|
+| `CreateEntityResolver` | ✅ 完全一致 |
+| `CreateDTOs` | ✅ 完全一致 |
+| `CreateEntityControllerBase` | ✅ 完全一致（对照 [create-controller.ts L176-L190](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/controller/create-controller.ts#L176-L190)） |
+
 #### 访问控制层
 
 | EventName | 参数类型 | 可介入时机 | 影响范围 |
@@ -383,7 +483,7 @@ Amplication 的代码生成引擎在每一个关键生成环节都暴露了 **Be
 1. **新增自定义 GraphQL 类型**：在 `CreateDTOs` 的 After 钩子中往 `dtos` Map 追加新的 `NamedClassDeclaration`，并更新 `dtoNameToPath` 映射
 2. **替换 Resolver 方法**：在 `CreateEntityResolverBase` 的 After 钩子中用 TS AST 遍历 `classDeclaration.body.body`，找到目标方法后替换 `ClassMethod` 节点
 3. **添加字段装饰器**：在 `CreateDTOs` 的 Before 钩子修改传入的 Entity 字段数组，或在 After 钩子直接操作 AST 为 ClassProperty 追加 Decorator
-4. **绕过默认 ACL**：在 `CreateEntityResolverBase` 的 After 钩子中删除 `@UseRoles` 装饰器或替换拦截器
+4. **为 Resolver 追加 ACL 装饰器**：由于 DSG 默认不在 Resolver 方法上生成 `@UseRoles` 和 ACL 拦截器（参见第四章 4.6 节），插件可在 `CreateEntityResolverBase` 的 After 钩子中通过 AST 手动为方法添加 `@UseInterceptors(AclFilterResponseInterceptor)`、`@UseRoles({...})` 等装饰器（需同时确保 import 语句被追加）
 5. **新增 Resolver 方法**：在 After 钩子中 push 新的 `ClassMethod`（带 `@Query`/`@Mutation` 装饰器）到 Resolver 基类
 
 ---
@@ -530,27 +630,49 @@ return Object.keys(data).filter((key) => !(key in filteredData));
 
 > **注意**：`structuredClone` 是必要的，因为 GraphQL 请求传入的对象原型为 `null`，而 `accesscontrol` 库的 `filter()` 对无原型对象处理异常。
 
-### 8.2 Public 权限的精确边界
+### 8.2 Public 权限的精确边界（Resolver vs Controller 分别讨论）
 
-`setEndpointPermissions()` 对 Public 权限的处理（[set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts#L16-L54)）是**有选择性**的：
+`setEndpointPermissions()` 对 Public 权限的处理（[set-endpoint-permission.ts](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/utils/set-endpoint-permission.ts#L16-L54)）必须**区分 GraphQL Resolver 和 REST Controller** 讨论，因为两者模板的初始装饰器状态完全不同。
 
-| Action 类型 | 移除的拦截器 | 保留的拦截器 | 移除的装饰器 | 新增的装饰器 |
-|------------|-------------|-------------|------------|------------|
-| Search / View（读） | `AclFilterResponseInterceptor` | （无） | `@UseRoles()` | `@Public()` |
-| Create / Update（写） | `AclValidateRequestInterceptor` | （无） | `@UseRoles()` | `@Public()` |
-| Delete | （不区分，代码中未做分类处理 → 不会移除任何拦截器，仅移除 `@UseRoles`，新增 `@Public`） | — | — | — |
+#### Resolver（GraphQL）上的实际行为
 
-**关键边界一：Public 权限不代表"完全无 ACL"**
+由于 Resolver Base 模板里**初始没有任何 ACL 装饰器**（`@UseRoles`、两个拦截器均不存在），`setEndpointPermissions()` 对 Resolver 的执行效果是：
 
-代码中只针对 Search/View/Create/Update 四种 Action 做了拦截器移除。**Delete Action 的两个拦截器不会被移除**，但由于 `@UseRoles` 已被删除且加了 `@Public()`，若没有额外的 Guard 处理，运行时 `permissionsRoles` 可能为 `undefined`，拦截器内部访问 `permissionsRoles.role` 会抛出 TypeError——这是一个潜在的边界问题。
+| Action | 代码分支 | 实际效果 |
+|--------|---------|---------|
+| Search | Search/View → 移除 FilterInterceptor | **空操作**（模板里没有） + 移除 @UseRoles（空操作）×2 + 添加 @Public() → **净效果：只追加 @Public()** |
+| View | Search/View → 移除 FilterInterceptor | 同上 → **净效果：只追加 @Public()** |
+| Create | Create/Update → 移除 ValidateInterceptor | **空操作**（模板里没有） + 移除 @UseRoles（空操作）×2 + 添加 @Public() → **净效果：只追加 @Public()** |
+| Update | Create/Update → 移除 ValidateInterceptor | 同上 → **净效果：只追加 @Public()** |
+| **Delete** | **两个 if 都不匹配** → 不移除任何拦截器 + 移除 @UseRoles（空操作）×2 + 添加 @Public() → **净效果：只追加 @Public()** |
 
-**关键边界二：Public 读操作绕过字段级过滤**
+**结论**：对于 GraphQL Resolver，**所有 5 种 Action（含 Delete）被设为 Public 时的最终效果完全一致**——在方法上追加 `@Public()` 装饰器，其余步骤均为空操作。不存在"Delete 拦截器残留导致 TypeError"的问题，因为 Resolver 里本来就没有这些拦截器。
 
-一旦 Search/View 被设为 Public，`AclFilterResponseInterceptor` 被移除，即使 grants.json 中对某些角色有字段限制，公开请求也会**直接返回完整 Entity DTO**（包括 id、createdAt 等所有字段）。这意味着 Public = 对 Entity 的所有字段全开放读取。
+#### Controller（REST）上的实际行为
 
-**关键边界三：密码字段的双重保险**
+对于 REST Controller，如果运行时模板或其他生成链路为方法注入了 `@UseInterceptors` 和 `@UseRoles`（with-auth-jwt 测试快照确认 Controller 上确实存在这些装饰器），则执行效果如下：
 
-密码字段已经在 Entity DTO（输出类型）层面被 `isPasswordField()` 完全排除（[create-entity-dto.ts L14](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/create-entity-dto.ts#L14)），即使 Public 权限开放读取，密码字段也不会出现在 GraphQL Schema 中，是"类型层 + ACL 层"双重保障。
+| Action | 代码分支 | 实际效果 |
+|--------|---------|---------|
+| Search / View | Search/View → 移除 FilterInterceptor | 移除 `AclFilterResponseInterceptor` + 移除 `@UseRoles` + 添加 `@Public()` |
+| Create / Update | Create/Update → 移除 ValidateInterceptor | 移除 `AclValidateRequestInterceptor` + 移除 `@UseRoles` + 添加 `@Public()` |
+| **Delete** | **两个 if 都不匹配** → **不移除任何拦截器** + 移除 `@UseRoles` + 添加 `@Public()` | **关键边界：Delete Action 在 Controller 上仍保留两个 ACL 拦截器**，但 `@UseRoles` 已被移除 |
+
+**Controller 上 Delete 的潜在边界问题**：若 Delete 被设为 Public，运行时拦截器（`AclFilterResponseInterceptor` 和 `AclValidateRequestInterceptor`）仍会执行。由于 `@UseRoles` 已被移除，拦截器内部通过 `Reflector.get("roles", handler)` 读取到的 `permissionsRoles` 可能为 `undefined`，访问 `permissionsRoles.role` 会抛出 `TypeError: Cannot read properties of undefined`。这是 Controller 端的一个潜在 bug。
+
+#### 三条关键边界总结
+
+**边界一：Resolver 的 Public = 完全开放（类型层保障范围内）**
+
+GraphQL Resolver 的 6 个 CRUD 方法和关联方法被设为 Public 时，只追加 `@Public()`。由于模板里本就没有 ACL 拦截器和 `@UseRoles`，Public 之后的方法完全不受 grants.json 的字段级过滤约束——即 Public = 返回 Entity DTO 中定义的全部字段。
+
+**边界二：Public 读操作绕过字段级过滤（Controller 端）**
+
+Controller 的 Search/View 被设为 Public 时，`AclFilterResponseInterceptor` 被显式移除，即使 grants.json 中对某些角色有字段限制，公开请求也会直接返回完整 Entity DTO。
+
+**边界三：密码字段的双重保险**
+
+密码字段已经在 Entity DTO（输出类型）层面被 `isPasswordField()` 完全排除（[create-entity-dto.ts L14](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/dto/create-entity-dto.ts#L14)），即使 Public 权限开放读取，密码字段也不会出现在 GraphQL Schema 和 REST 响应中，是"类型层 + ACL 层"双重保障。
 
 ### 8.3 Granular 字段级权限的精确算法
 
