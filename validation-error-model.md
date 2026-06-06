@@ -560,9 +560,9 @@ CommitButton 中把本地 state 置为 `true` 的调用点仅存在于三个关�
 | [CommitButton.tsx#L187](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L187) onDismiss | `setOpenLimitationDialog(false)` |
 | [CommitButton.tsx#L197](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L197) onBypass | `setOpenLimitationDialog(false)` |
 
-**不存在 `setOpenLimitationDialog(true)` 的调用。** 这意味着弹窗理论上永远打不开——只有一种例外：当开发者直接修改 MUI Dialog 的行为，或 Dialog 的默认值被改为 `true`。目前的实现依赖 **错误出现时恰好 Dialog 被 mount，同时 MUI Dialog `open={false}` 不会阻止初始渲染动画**（MUI 规范上 `open={false}` 就是隐藏的）。
+**不存在 `setOpenLimitationDialog(true)` 的调用。** 三个回调全部设置为 `false`，且组件中没有 `useEffect` 将 billing 错误的出现同步到本地 state。因此本地 `isOpenLimitationDialog` 的值始终为初始值 `false`。
 
-#### 6.5.2.3 实际可见性逻辑与修复建议
+#### 6.5.2.3 三元互斥分支导致的严重问题：用户完全看不到错误提示
 
 当前 JSX（[CommitButton.tsx#L165-L202](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L165-L202)）：
 
@@ -581,18 +581,44 @@ CommitButton 中把本地 state 置为 `true` 的调用点仅存在于三个关�
 )}
 ```
 
-修复建议（两者取其一）：
-1. **直接使用 hook 返回的 `isOpenLimitationDialog`**：`useCommits` 的 onError 已经把它设为 `true`，解构时用它即可
-2. **在 CommitButton 中加 useEffect 同步错误到本地 state**：
+⚠️ **关键结论（之前结论错误，已修正）**：这是一个**完全互斥**的三元表达式。当 billing 错误发生时：
+
+| 变量 | 值 |
+|------|-----|
+| `commitChangesError` | 存在（ApolloError） ✅ |
+| `isLimitationError` | `true`（`commitChangesLimitationError !== undefined`） ✅ |
+| `commitChangesError && isLimitationError` | `true` |
+| 进入分支 | `?` 第一个分支，**只渲染 LimitationDialog** |
+| Snackbar 是否渲染 | ❌ **完全不渲染**（互斥分支） |
+| LimitationDialog 的 `isOpen` | `false`（本地 state 初始值，从未被置 true） |
+| Dialog 外层守卫（[Dialog.tsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/Dialog/Dialog.tsx#L36)） | `isOpen ? <MuiDialog /> : null` → 返回 **null** |
+| **最终对用户可见的结果** | ❌ **null — 既无弹窗也无 Toast，用户看不到任何错误提示** |
+
+非 billing 错误路径（如 ValidationError）则正常：
+- `commitChangesError && isLimitationError` = `true && false` = `false`
+- 进入 `:` 分支，`<Snackbar open={true} message={errorMessage} />` 正常显示 ✅
+
+**修复建议（至少执行一项 + 保底）**：
+1. **修正 isOpen 同步（核心修复）**：两种方式取其一
+   - 方式 A：从 hook 解构 `isOpenLimitationDialog`（hook 已在 `onError` 中把它设为 `true`），直接透传给 LimitationDialog
+   - 方式 B：在 CommitButton 中加 `useEffect` 同步：
+     ```tsx
+     useEffect(() => {
+       if (commitChangesLimitationError) {
+         setOpenLimitationDialog(true);
+       }
+     }, [commitChangesLimitationError]);
+     ```
+2. **增加保底 Snackbar（防御性编程）**：将三元改为独立渲染，确保 billing 弹窗不可见时用户至少看到 Toast：
    ```tsx
-   useEffect(() => {
-     if (commitChangesLimitationError) {
-       setOpenLimitationDialog(true);
-     }
-   }, [commitChangesLimitationError]);
+   {commitChangesError && isLimitationError ? (
+     <LimitationDialog isOpen={isOpenLimitationDialog} ... />
+   ) : null}
+   {/* 与弹窗独立，确保任何错误至少有 Snackbar 可见 */}
+   <Snackbar open={Boolean(commitChangesError)} message={errorMessage} />
    ```
 
-**完整交互流程（Billing 路径，含 isOpen 标注）**：
+**完整交互流程（Billing 路径，修正后准确版）**：
 
 ```
 用户点击"Generate the code"
@@ -607,24 +633,33 @@ useMutation COMMIT_CHANGES ──► 服务端 throw BillingLimitationError
 onError 触发:
   setCommitRunning(false)
   setPendingChangesError(true)
-  setOpenLimitationDialog(true)    // hook 内部 state（未被消费）
+  setOpenLimitationDialog(true)     // hook 内部 state（CommitButton 未消费）
         │
         ▼
 commitChangesError 更新 → commitChangesLimitationError 被计算出
         │
         ▼
-JSX: commitChangesError && isLimitationError = true
+isLimitationError = commitChangesLimitationError !== undefined = true
         │
         ▼
-<LimitationDialog isOpen={本地 state = false}> 被挂载
-        │
-        ├─► Dialog 第一层守卫 isOpen ? ... : null
-        │       isOpen = false → return null（Dialog DOM 不渲染）
-        │
-        ├─ 用户不可见，也无法点击 onConfirm / onDismiss / onBypass
+三元条件: commitChangesError && isLimitationError = true
         │
         ▼
-（实际上只会走 Snackbar 分支，因为 Dialog 不可见）
+进入 ? 分支 ──► 渲染 <LimitationDialog isOpen={本地 state = false}>
+        │
+        ├─► : 分支的 <Snackbar> 完全不渲染（互斥）
+        │
+        ▼
+LimitationDialog → Dialog → 第一层守卫:
+  return isOpen ? <MuiDialog /> : null
+  isOpen = false → return null
+        │
+        ▼
+【用户视角】React 渲染结果 = null
+  ❌ 无弹窗
+  ❌ 无 Snackbar
+  ❌ 无任何错误提示
+  按钮仍可继续点击（仅由 commitChangesLoading 控制 disabled，错误时 loading=false）
 ```
 
 #### 6.5.3 Billing 错误在其它消费点的降级处理
@@ -659,7 +694,7 @@ const errorMessage = formatError(commitChangesError);
 | 唯一键冲突（email 已注册） | 服务端 Prisma | `PrismaClientKnownRequestError (P2002)` | `GraphQLUniqueKeyException(fields)` | `extensions.code = UNIQUE_KEY_VIOLATION` <br/> `message = "Another record with the same key already exist (...)"` | `Snackbar` 显示 message |
 | Topic name 格式非法（含禁止字符） | 前端本地 TopicNameField 组件内联 | `FormikErrors[props.name] = HELP_TEXT` | — | `formik.errors` 内联 | `<ErrorMessage name="name" />`（硬编码 "name"，详见 Bug 分析） |
 | Topic name 格式非法——前端绕过 | 服务端 ValidationPipe（@Matches） | `BadRequestException` | 原样返回 | `message` = class-validator 错误文本 | `ErrorMessage` / `Snackbar` |
-| 套餐限制（工作区数已满 / Commit 数超限） | 服务端 workspace/... | `BillingLimitationError` | `GraphQLBillingError` | `extensions.code = BILLING_LIMITATION_ERROR` <br/> `extensions.billingFeature` <br/> `extensions.bypassAllowed` | CommitButton：**`LimitationDialog` 不可见**（isOpen 永远 false，Dialog DOM 不渲染） <br/> 实际退化为外层 Snackbar / 与其它组件同级别降级显示 |
+| 套餐限制（工作区数已满 / Commit 数超限） | 服务端 workspace/... | `BillingLimitationError` | `GraphQLBillingError` | `extensions.code = BILLING_LIMITATION_ERROR` <br/> `extensions.billingFeature` <br/> `extensions.bypassAllowed` | CommitButton：**null — 用户完全看不到任何错误提示** <br/> （三元互斥分支导致 Snackbar 也不渲染；LimitationDialog 因 isOpen=false 被 Dialog 外层守卫返回 null） <br/> 其它组件：降级为 `Snackbar` 显示 `"LimitationError: ..."`（因为它们没有进入 billing 分支） |
 | 未登录 / JWT 失效 | 服务端 Passport/JwtStrategy | `UnauthorizedException` (HttpException) | 原样返回 | HTTP 401 | Apollo 透传，路由守卫跳转登录 |
 | 未预期异常 / 500 | 服务端任意位置 | 任意 Error | 生产：`GraphQLInternalServerError`<br/>开发：`ApolloError(原始message)` | `extensions.code = INTERNAL_SERVER_ERROR` | `Snackbar` 显示 "Internal server error" |
 
@@ -679,7 +714,7 @@ const errorMessage = formatError(commitChangesError);
 | **Topic name 格式** <br/> `^[a-zA-Z0-9._-]+$` | [TopicNameField.tsx#L6](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/TopicNameField.tsx#L6) <br/> `TOPIC_REGEX = /^[a-zA-Z0-9._-]+$/` | [TopicCreateInput.ts#L12](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/topic/dto/TopicCreateInput.ts#L12) <br/> `@Matches(/^[a-zA-Z0-9._-]+$/)` | ✅ 正则完全一致 |
 | **minimumValue < maximumValue** | [formikValidateJsonSchema.ts#L52-L62](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/util/formikValidateJsonSchema.ts#L52-L62) 跨字段自定义 | [entity.service.ts#L151-L152](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L151-L152) `NUMBER_WITH_INVALID_MINIMUM_VALUE` | ✅ 逻辑相同（错误文案略有差异：`greater than, or equal to,` vs `greater than or equal to,`） |
 | **错误提示字段绑定** <br/> Formik `<ErrorMessage name>` | [NameField.tsx#L43-L46](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L43-L46) <br/> [TopicNameField.tsx#L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/TopicNameField.tsx#L32-L35) <br/> 均硬编码 `name="name"` | — | ⚠️ 前端 Bug：当表单字段名不是 `"name"` 时错误提示不显示，但校验仍阻止提交 |
-| **Billing 弹窗 isOpen 状态同步** <br/> 错误出现时自动打开弹窗 | `useCommits` hook 中 `onError` → `setOpenLimitationDialog(true)` | — | ❌ 状态未消费：`CommitButton` 解构 hook 时忽略该状态，本地 state 永远 `false`，Dialog 外层守卫 `return isOpen ? ... : null` 直接返回 `null`（见 §6.5.2.1 双重守卫分析） |
+| **Billing 弹窗 isOpen 状态同步** <br/> 错误出现时自动打开弹窗 | `useCommits` hook 中 `onError` → `setOpenLimitationDialog(true)` | — | ❌ 状态未消费（三元互斥 + 双重守卫导致 **完全无提示**：`CommitButton` 解构 hook 时忽略该状态，本地 state 永远 `false`；三元表达式进入第一个分支时 Snackbar 完全不渲染（互斥）；同时 LimitationDialog 的 Dialog 外层守卫又因 isOpen=false 返回 null（见 §6.5.2.1-6.5.2.3 完整分析） |
 
 > **设计提示**：前端注释 `/** @todo share code with server */`（[NameField.tsx#L6](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L6)）明确指出 NAME_REGEX 等规则未来应抽成共享库以避免前后端漂移。
 
@@ -718,7 +753,7 @@ const errorMessage = formatError(commitChangesError);
 
 | # | 问题 | 位置 | 影响 |
 |---|------|------|------|
-| P1 | **Billing 弹窗不可见**：`CommitButton` 本地 `isOpenLimitationDialog` 永远为 `false`，且未从 hook 同步错误状态 | [CommitButton.tsx#L57-L58](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L57-L58) + [Dialog.tsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/Dialog/Dialog.tsx#L36) 双重守卫 | 套餐限制触发时用户看不到升级引导弹窗，降级为普通 Snackbar |
+| P1 | **Billing 错误完全无提示（三元互斥 + 双重守卫）**：(1) `CommitButton` 本地 `isOpenLimitationDialog` 永远为 `false`，(2) 三元互斥分支进入 billing 分支时 Snackbar 完全不渲染（互斥），(3) LimitationDialog 因 isOpen=false 被 Dialog 外层守卫返回 null | [CommitButton.tsx#L57-L58](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L57-L58) + [CommitButton.tsx#L165-L202](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L165-L202) 三元 + [Dialog.tsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/libs/ui/design-system/src/lib/components/Dialog/Dialog.tsx#L36) 双重守卫 | 套餐限制触发时 React 渲染结果为 **null** — 既无弹窗也无 Snackbar，用户完全看不到任何错误提示，按钮在无反馈可重复点击 |
 | P2 | **hook 状态冗余未消费**：`useCommits` 维护 `isOpenLimitationDialog` 并在 `onError` 中写入，但 `CommitButton` 完全忽略该返回值 | [useCommits.ts#L49](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/hooks/useCommits.ts#L49) + [CommitButton.tsx#L65-L71](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L65-L71) | 代码冗余 + P1 的根源 |
 | P3 | **NameField 错误绑定硬编码**：`<ErrorMessage name="name" />` 写死为字符串，不随 props 动态变化 | [NameField.tsx#L43-L46](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/NameField.tsx#L43-L46) | 表单字段名不是 `"name"` 时，校验仍阻止提交但错误提示不显示在字段下方 |
 | P4 | **TopicNameField 错误绑定硬编码**：同上 | [TopicNameField.tsx#L32-L35](file:///d:/fz/0601/solo-dogfeeding/code/49-amplication/packages/amplication-client/src/Components/TopicNameField.tsx#L32-L35) | 同上 |
