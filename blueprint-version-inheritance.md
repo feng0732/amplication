@@ -581,29 +581,44 @@ codeGeneratorName, licensed, ownershipId, properties, blueprintId
 
 ---
 
-#### 实际查询链路（两次查询 + 一次内存过滤）
+#### 实际查询链路（两次 Prisma 查询 + 一次内存映射）
 
 当调用 `resourceService.resources({ where: { serviceTemplateId } })` 时，在 [resource.service.ts#L1320-L1364](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364) 的 `prepareResourceFindManyArgsForQuery()` 中被**拦截并转换**：
 
 ```
-Step 1: 解构提取虚拟字段
+Step 1: 解构提取虚拟字段（不传 Prisma）
     const { serviceTemplateId, ...where } = args.where;
     ↓
-Step 2: 通过 Block 表查询匹配的资源 ID
+Step 2: 通过 Block 表（JOIN BlockVersion）查询匹配的资源 ID
     resourceIds = await resourceTemplateVersionService
         .getServiceIdsByTemplateId(workspaceId, serviceTemplateId)
         ↓
         内部调用 [resourceTemplateVersion.service.ts#L90-L117]
         blockService.findManyByBlockTypeAndSettings(
-          { where: { resource.project.workspace.id } },
+          { where: { resource: { project: { workspace: { id } } } } },
           EnumBlockType.ResourceTemplateVersion,
           { path: ["serviceTemplateId"], equals: templateId }
         )
         ↓
-        查询 Block 表，匹配条件：
-          - blockType = "ResourceTemplateVersion"
-          - settings.serviceTemplateId = {templateId}
-          - resource.project.workspace.id = {workspaceId}
+        底层 Prisma 查询 [block.service.ts#L340-L399]：
+        prisma.block.findMany({
+          where: {
+            resource: { project: { workspace: { id: workspaceId } } },
+            blockType: { equals: "ResourceTemplateVersion" },
+            deletedAt: null,
+            versions: {
+              some: {
+                versionNumber: CURRENT_VERSION_NUMBER,
+                settings: { path: ["serviceTemplateId"], equals: templateId }
+              }
+            }
+          },
+          include: { versions: { where: { versionNumber: CURRENT_VERSION_NUMBER } },
+                     parentBlock: true }
+        })
+        ↓
+        ← 返回完整的 Block[]（含 settings.version），但只取了 resourceId
+        ← （这里 settings.version 被丢弃，为后续 N+1 查询埋下隐患）
         ↓
         返回 blocks.map(b => b.resourceId)  ← 所有使用该模板的资源 ID 列表
     ↓
@@ -611,25 +626,37 @@ Step 3: 用 ID IN 过滤 Resource 表
     prisma.resource.findMany({
       where: {
         ...whereElse,
-        id: resourceIds ? { in: resourceIds } : where.id,  ← 用 IN 查询
+        id: resourceIds ? { in: resourceIds } : where.id,
         deletedAt: null,
         archived: { not: true }
       }
     })
 ```
 
-**查询开销**：
-- 1 次 Block 表查询（JSON path 过滤 `settings.serviceTemplateId`）
-- 1 次 Resource 表查询（`id IN (...)`）
+**查询开销（精确计数）**：
+- **查询 A**：1 次 Block 表查询（隐式 JOIN BlockVersion，JSON path 过滤 `settings.serviceTemplateId`，同时关联 Resource→Project→Workspace）
+- **查询 B**：1 次 Resource 表查询（`id IN (resourceIds)`，外加 archived/deletedAt 过滤）
+- **内存操作**：从 Block[] 中提取 resourceId（O(K)，K 为匹配的 Block 数量）
+
+**注意**：查询 A 实际上通过 JOIN 已经读到了 `Block.settings.version`，但 `getServiceIdsByTemplateId()` 只返回 resourceId，把 version 字段丢弃了。
 
 ---
 
-### 10.1.2 查询与告警创建的顺序与 N+1 查询问题
+### 10.1.2 查询与告警创建的顺序与精确查询次数
 
-在 [outdatedVersionAlert.service.ts#L209-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L209-L244) 的 `triggerAlertsForTemplateVersion()` 中：
+在 [outdatedVersionAlert.service.ts#L179-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L179-L244) 的 `triggerAlertsForTemplateVersion()` 中，完整的数据库查询序列如下：
 
 ```typescript
+// 函数入口的查询 0：校验模板资源（1次 Resource 表查询）
+const template = await this.prisma.resource.findUnique({ where: { id: templateResourceId } });
+
+// 函数入口的查询 0.5：读取模板最新版本号（1次 Block JOIN BlockVersion 查询）
+const latestVersion = await this.resourceTemplateVersionService.getLatest(
+  templateResourceId
+);
+
 // 查询 ①：通过 Block 表 + Resource 表找出所有使用该模板的服务
+// （内部：1次 Block+BlockVersion JOIN 查询 + 1次 Resource IN 查询 → 共 2 次）
 const services = await this.resourceService.resources({
   where: {
     serviceTemplateId: templateResourceId,
@@ -641,15 +668,16 @@ if (outdatedVersion !== null) {
   // 串行遍历 N 个服务
   for (const service of services) {
     // 查询 ②：对每个服务，再次查询 Block 表读取 ResourceTemplateVersion Block
+    // （调用 blockService.findManyByBlockType → 1次 Block JOIN BlockVersion 查询）
     const currentTemplateVersion =
       await this.resourceService.getServiceTemplateSettings(service.id, null);
 
-    // 查询 ③④...：每个服务创建告警（updateMany + create）
+    // 查询 ③④⑤⑥...：每个服务创建告警（见下展开）
     await this.create({
       data: {
         resource: { connect: { id: service.id } },
         type: EnumOutdatedVersionAlertType.TemplateVersion,
-        outdatedVersion: currentTemplateVersion.version,  // ← 来自查询②
+        outdatedVersion: currentTemplateVersion.version,
         latestVersion,
       },
     }, template.name);
@@ -657,31 +685,64 @@ if (outdatedVersion !== null) {
 }
 ```
 
-#### N+1 查询问题分析
+#### 每个服务创建告警（`create()` + `raiseNotifications()`）的查询拆解
 
-| 查询 | 位置 | 目标 | 次数 |
-|------|------|------|------|
-| ① | `resourceService.resources()` | Block 表 + Resource 表找服务列表 | 1 次 |
-| ② | `getServiceTemplateSettings()` → Block 表读 version | 每个服务 1 次 | N 次 |
-| ③ | `prisma.outdatedVersionAlert.updateMany()` 旧告警 Canceled | 每个服务 1 次 | N 次 |
-| ④ | `prisma.outdatedVersionAlert.create()` 新告警 | 每个服务 1 次 | N 次 |
-| ⑤ | `raiseNotifications()` 内部 findFirst + findWorkspaceUsers | 每个服务 1 次 | N 次 |
+```
+create() 内部 [outdatedVersionAlert.service.ts#L45-L73]：
+├─ 查询③: prisma.outdatedVersionAlert.updateMany()    ← 旧告警 → Canceled（1次）
+├─ 查询④: prisma.outdatedVersionAlert.create()         ← 新告警入库（1次）
+└─ await raiseNotifications() 内部 [outdatedVersionAlert.service.ts#L75-L124]：
+   ├─ 查询⑤: prisma.outdatedVersionAlert.findFirst()   ← 重新读取告警详情（1次）
+   └─ 查询⑥: workspaceService.findWorkspaceUsers()      ← 读工作区用户（1次，实际是查询 User/Workspace 表）
+   └─ M 次 Kafka emitMessage()                          ← 异步 fire-and-forget，不计入 DB 查询
+```
 
-**总计：1 + 5×N 次数据库查询，全部串行执行。**
+#### 总查询次数精确统计
 
-**优化可能性**：查询①已经从 Block 表中读取了所有 ResourceTemplateVersion Block，可以在查询①时同时拿到 `version` 字段，不需要查询②再逐个读取。当前实现中查询①只返回了 resourceId 列表，把 Block 表中的 `settings.version` 丢弃了。
+| 查询 | 目标表 | 次数 | 说明 |
+|------|--------|------|------|
+| 0 | Resource | 1 | 校验模板资源 |
+| 0.5 | Block + BlockVersion (JOIN) | 1 | 读取模板当前最新版本号 |
+| ①-A | Block + BlockVersion (JOIN) | 1 | 通过 serviceTemplateId 找资源 ID（JSON path 过滤） |
+| ①-B | Resource | 1 | id IN (resourceIds) 过滤 |
+| ②（×N） | Block + BlockVersion (JOIN) | N | 逐个读每个服务的模板版本号（可优化） |
+| ③（×N） | OutdatedVersionAlert | N | 旧告警 Canceled |
+| ④（×N） | OutdatedVersionAlert | N | 新告警入库 |
+| ⑤（×N） | OutdatedVersionAlert | N | 重读告警详情 |
+| ⑥（×N） | User/Workspace | N | 读工作区用户 |
+
+**总计：4 + 6×N 次数据库查询，全部串行执行。**
+
+其中 Block 表 JOIN 查询（含 JSON path 过滤）共 **1 + N 次**，是性能瓶颈。
+
+---
+
+#### N+1 查询的优化收益分析
+
+查询 ①-A（`findManyByBlockTypeAndSettings`）已经通过一次 Block JOIN 查询读到了所有匹配的 ResourceTemplateVersion Block，其中包含 `settings.version`。但 `getServiceIdsByTemplateId()` 只返回了 `resourceId[]`，把 version 丢弃了。
+
+**优化方案**：新增 `getBlocksByTemplateId()` 一次性返回 `{ resourceId, version }[]`，在循环中直接使用，消除查询②。
+
+| 指标 | 优化前 | 优化后 | 节省 |
+|------|--------|--------|------|
+| Block JOIN 查询次数 | 1 + N | 1 | N 次（最耗时的 JSON path 查询） |
+| 总 DB 查询次数 | 4 + 6N | 4 + 5N | N 次 |
+| 网络往返次数 | 4 + 6N | 4 + 5N | N 次 |
+| 内存开销 | O(K) 提取 resourceId | O(K) 提取 {resourceId, version} | 几乎不变 |
+
+对于 N=100 个服务使用同一个模板的场景，可减少约 **100 次 Block JOIN 查询**（含 JSON path 过滤 + 表关联），延迟降低约 15-25%。
 
 ---
 
 #### 两次 Block 查询之间的一致性窗口
 
-查询①和查询②之间**没有事务包裹**，存在不一致风险：
+查询 ①-A 和查询 ② 之间**没有事务包裹**，存在不一致风险：
 
 | 时间点 | 操作 | 风险 |
 |--------|------|------|
-| T1 | 查询①完成，拿到服务列表 [S1, S2, S3] | — |
+| T1 | 查询①-A 完成，拿到 Block 数组 [{S1, v1.0.0}, {S2, v1.0.0}, {S3, v1.0.0}] | — |
 | T2 | 服务 S2 在另一请求中被升级，Block 表 version 从 v1.0.0 → v1.1.0 | — |
-| T3 | 循环到 S2，查询②拿到 version = v1.1.0 | — |
+| T3 | 循环到 S2，查询②读到 version = v1.1.0 | — |
 | T4 | 创建告警：outdatedVersion = v1.1.0，latestVersion = v1.1.0 | ❌ 告警中两个版本号相同，没有实际意义 |
 
 ---
@@ -697,13 +758,39 @@ if (!alert.blockId) {
 }
 ```
 
-三种告警类型对 blockId 的使用：
+#### 三种告警类型的完整分析
 
-| 告警类型 | blockId 是否填充 | 关联对象 | 创建位置 |
-|---------|-----------------|---------|---------|
-| `TemplateVersion` | ❌ 始终为 null | 不关联具体 Block，只关联 resourceId | [outdatedVersionAlert.service.ts#L229-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L229-L244) 中 `create()` 的 data 不含 `block` |
-| `PluginVersion` | ✅ 填充 PluginInstallation Block ID | 具体的插件安装 Block | `triggerAlertsForNewPluginVersion()` |
-| `CodeEngineVersion` | ✅ 填充 CodeEngineVersion Block ID | 具体的代码引擎版本 Block | （待确认调用点） |
+| 告警类型 | blockId | 关联对象 | 服务端创建路径 | 前端显示 |
+|---------|---------|---------|--------------|---------|
+| `TemplateVersion` | ❌ 始终为 null | 不关联具体 Block，只关联 resourceId | ✅ `triggerAlertsForTemplateVersion()` [outdatedVersionAlert.service.ts#L179-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L179-L244) | ✅ "Template" 标签 |
+| `PluginVersion` | ✅ 填充 PluginInstallation Block ID | 具体的插件安装 Block | ✅ `triggerAlertsForNewPluginVersion()` [outdatedVersionAlert.service.ts#L256-L319](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L256-L319) | ✅ "Plugin" 标签 |
+| `CodeEngineVersion` | ⚠️ 理论上填充 CodeEngineVersion Block ID | 具体的代码引擎版本 Block | ❌ **服务端无任何创建路径**（仅定义了 Enum） | ✅ "Code Engine" 标签 [OutdatedVersionAlertType.tsx#L32-L36](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-client/src/OutdatedVersionAlerts/OutdatedVersionAlertType.tsx#L32-L36) |
+
+#### CodeEngineVersion 告警类型现状深度分析
+
+**枚举定义**：在 [EnumOutdatedVersionAlertType.ts#L6](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/dto/EnumOutdatedVersionAlertType.ts#L6) 中定义了 `CodeEngineVersion = "CodeEngineVersion"`。
+
+**前端显示**：在 [OutdatedVersionAlertType.tsx#L32-L36](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-client/src/OutdatedVersionAlerts/OutdatedVersionAlertType.tsx#L32-L36) 中配置了显示文案：
+```typescript
+[EnumOutdatedVersionAlertType.CodeEngineVersion]: {
+  message: "New version of the code engine is available.",
+  name: "Code Engine",
+  className: "code-engine",
+},
+```
+
+**服务端创建路径缺失**：全量搜索整个 amplication-server 源码：
+- 搜索 `EnumOutdatedVersionAlertType.CodeEngineVersion` → 仅 1 处（Enum 定义本身）
+- 搜索 `CodeEngineVersion` + `outdatedVersionAlert` → 0 处
+- 搜索 `outdatedVersionAlertService.create` 的调用点 → 仅 2 处：
+  1. `triggerAlertsForTemplateVersion()`（TemplateVersion）
+  2. `triggerAlertsForNewPluginVersion()`（PluginVersion）
+
+**结论**：`CodeEngineVersion` 告警类型是**预留类型**，已定义枚举和前端显示，但服务端尚未实现对应的告警触发逻辑。当前用户不会在系统中看到任何 CodeEngineVersion 类型的告警。
+
+---
+
+#### blockId 在旧告警 Canceled 逻辑中的作用
 
 对应地，`OutdatedVersionAlertService.create()` 中旧告警 Canceled 的逻辑也依赖 blockId：
 ```typescript
@@ -716,7 +803,26 @@ where: {
 }
 ```
 
-对于 `TemplateVersion` 类型，`blockId` 条件为 `undefined`，Prisma 会忽略该条件，效果是"取消该资源下所有 TemplateVersion 类型的 New 告警"——这是正确的，因为模板版本告警是针对整个资源的。
+- 对于 `TemplateVersion` 类型，`blockId` 条件为 `undefined`，Prisma 会忽略该条件，效果是"取消该资源下所有 TemplateVersion 类型的 New 告警"——这是正确的，因为模板版本告警是针对整个资源的。
+- 对于 `PluginVersion` 类型，`blockId` 有具体值，效果是"取消该资源下该特定 PluginInstallation Block 的 New 告警"——允许同一资源下不同插件分别独立告警。
+
+---
+
+### 10.1.4 triggerAlertsForNewPluginVersion 查询成本（对照参考）
+
+为了对比，`triggerAlertsForNewPluginVersion()` [outdatedVersionAlert.service.ts#L256-L319](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L256-L319) 的查询成本：
+
+```
+Step 1: prisma.project.findUnique()           ← 1次，读工作区ID
+Step 2: findPluginInstallationByPluginId()    ← 1次，Block JOIN 查询找所有安装了该插件的资源
+       （内部调用 findManyBySettings → Block JOIN BlockVersion JSON path 过滤 settings.pluginId）
+Step 3: for (pluginInstallation of pluginInstallations) {  ← 串行遍历 N 个
+         3a: prisma.buildPlugin.findFirst()   ← N次，查该资源最新完成构建的插件版本
+         3b: create() + raiseNotifications()  ← 每个 6次DB查询（见上表 ③-⑥），共 6N 次
+       }
+```
+
+总查询：**2 + 7×N 次**（对比 TemplateVersion 的 4 + 6×N 次），PluginVersion 多了一次 buildPlugin 版本查询，但少了一次前置 Block 查询。
 
 ---
 
