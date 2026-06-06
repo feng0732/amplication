@@ -34,21 +34,44 @@ Workspace（工作区）
 | 工作区图视图 | `/:workspace/graph` | [WorkspaceGraph.tsx](packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) | `CatalogGraph` |
 
 核心复用链：
+
 ```
-CatalogGrid / CatalogGraph
-    └── useCatalogContext  (CatalogContext.tsx)
-          └── useCatalog   (hooks/useCatalog.ts)
-                └── SEARCH_CATALOG (GraphQL)
+┌────────────────────────────────────────────────────────────────┐
+│  表格视图（共享 Context 实例）                                   │
+│  CatalogGrid (工作区 Catalog / 项目 ResourceList)               │
+│      └── useCatalogContext()   ← CatalogContextProvider        │
+│            └── useCatalog()    (Context 内部的共享实例)          │
+│                 └── SEARCH_CATALOG GraphQL (分页模式)           │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  图视图（独立实例，不经过 Context）                               │
+│  CatalogGraph (WorkspaceGraph)                                 │
+│      └── useCatalogGraph({ initialPageSize: 1000 })            │
+│            └── useCatalog({ initialPageSize: 1000 })           │
+│                 └── SEARCH_CATALOG GraphQL (一次拉 1000 条)     │
+│                      └── resourcesToNodesAndEdges() → nodes/edges
+└────────────────────────────────────────────────────────────────┘
 ```
+
+**关键差异**：表格视图和图视图各自拥有独立的 `useCatalog` 实例，数据状态和筛选条件互不共享（详见 4.5 节）。
 
 ### 1.2 前端数据流
 
-#### (1) CatalogContextProvider —— 全局挂载点
+#### (1) CatalogContextProvider —— 仅服务于表格视图
 
-Catalog 的所有状态（分页、搜索、过滤、数据）都挂在 [CatalogContext.tsx](packages/amplication-client/src/Catalog/CatalogContext.tsx#L45-L77) 下。
+Catalog 的筛选、分页、搜索、数据状态都挂在 [CatalogContext.tsx](packages/amplication-client/src/Catalog/CatalogContext.tsx#L45-L77) 下。
 
-它在 [WorkspaceLayout.tsx](packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L245-L297) 第 245 行被包裹在整个工作区布局内部，意味着：
-- 同一个 Workspace 下，切换 Project / Catalog / Graph 页面，**Catalog 的筛选、分页状态会被保留**。
+它在 [WorkspaceLayout.tsx](packages/amplication-client/src/Workspaces/WorkspaceLayout.tsx#L245-L297) 第 245 行被包裹在整个工作区布局内部，但**只被表格视图消费**：
+
+| 消费者 | 代码位置 | 用法 |
+|---|---|---|
+| CatalogGrid | `CatalogGrid.tsx` L59-L67 | `useCatalogContext()` 获取共享状态 |
+| CatalogGraph（图视图） | `useCatalogGraph.tsx` L42-L45 | **不使用 Context**，直接调用 `useCatalog({ initialPageSize: 1000 })` |
+
+Context 实例的行为：
+- 同一个 Workspace 下，切换 `工作区 Catalog` ↔ `项目 ResourceList`，**共享同一个表格实例**，筛选和分页状态会保留
+- 图视图有自己独立的 `useCatalog` 实例，完全不受 Context 影响（详见 4.5 节）
 
 #### (2) useCatalog Hook —— 业务逻辑核心
 
@@ -198,21 +221,35 @@ query findProjects {
 
 注意：这里只拉取了 resources 的**极简字段**（不含 builds / owner 等），因为概览页只需要用来计数和判断 Git 连接状态。进入具体项目后，才会通过 `useResources` / `useCatalog` 拉取完整字段。
 
-### 2.5 WorkspaceGraph —— 工作区关系图
+### 2.5 WorkspaceGraph —— 工作区关系图（独立 useCatalog 实例）
 
 [WorkspaceGraph.tsx](packages/amplication-client/src/Workspaces/WorkspaceGraph.tsx#L9-L19) 本身是个空壳，直接渲染 `<CatalogGraph />`。
 
-[CatalogGraph.tsx](packages/amplication-client/src/Catalog/CatalogGraph/CatalogGraph.tsx#L51-L246) 的数据链路：
+[CatalogGraph.tsx](packages/amplication-client/src/Catalog/CatalogGraph/CatalogGraph.tsx#L51-L246) 的数据链路——**注意：它完全绕过 CatalogContextProvider**：
 
 ```
-CatalogGraph
-└── useCatalogGraph (initialPageSize: 1000)   # 一次性拉 1000 条
-      └── useCatalog (SEARCH_CATALOG)
-            └── resourcesToNodesAndEdges()    # 把 Resource[] 转成 ReactFlow nodes/edges
-                  └── 按 groupByFields (project / blueprint / owner) 生成分组节点
+CatalogGraph.tsx L73
+  └── useCatalogGraph({ onMessage })          (CatalogGraph/hooks/useCatalogGraph.tsx)
+        │
+        ├── 独立实例化：useCatalog({ initialPageSize: 1000 })
+        │     └── 不调用 useCatalogContext()，和表格视图无任何状态共享
+        │     └── SEARCH_CATALOG GraphQL：一次拉 1000 条
+        │           └── 用于前端一次性生成所有节点和边
+        │
+        ├── 自己管理状态：groupByFields / layoutOptions / nodes / edges
+        │     └── 持久化到 localStorage：`catalogGraphLayout-${workspaceId}`
+        │
+        └── resourcesToNodesAndEdges()
+              └── 按 groupByFields (project / blueprint / owner) 生成分组节点
 ```
 
-图视图的筛选、搜索 **和表格视图共用同一套 `useCatalog` 逻辑**，只是在前端把结果从行转成了节点。
+**为什么图视图不共享 Context？**
+- 图视图需要一次性加载大量资源（1000 条）来生成完整拓扑
+- 表格视图是分页加载（默认 20 条/页）
+- 两者的筛选条件也各自持久化：
+  - 表格 → `fixedFiltersKey` 决定（`workspace-catalog` 或项目 ID）
+  - 图视图 → 固定为 `"catalog-graph"`（CatalogGraph.tsx L178）
+- 图视图还需要管理图特有的状态：布局参数、分组方式、节点位置等，不需要也不应该影响表格
 
 ---
 
@@ -462,45 +499,75 @@ WorkspaceLayout (L109)
 
 这是因为自定义属性存在 `Resource.properties` JSON 列里，不能走普通的关系过滤。
 
+### 4.5 双实例模型：表格视图 vs 图视图的数据所有权与筛选边界
+
+`useCatalog` 是一个工厂 hook，**每次调用都创建独立的状态副本**。表格视图和图视图分别调用了两次，形成两个平行实例：
+
+| 维度 | 表格视图实例（Context 共享） | 图视图实例（独立） |
+|---|---|---|
+| 实例化位置 | `CatalogContextProvider` 内：`CatalogContext.tsx` L58 | `useCatalogGraph` 内：`useCatalogGraph.tsx` L42-L45 |
+| 消费者 | `CatalogGrid.tsx` L59-L67 通过 `useCatalogContext()` | `CatalogGraph.tsx` L73 通过 `useCatalogGraph()` |
+| 页面场景 | 工作区 Catalog / 项目 ResourceList（同一实例，场景切换保留状态） | 工作区总图 WorkspaceGraph |
+| pageSize | 默认 20（分页加载） | 1000（一次性加载） |
+| 筛选持久化 key | `fixedFiltersKey`：`"workspace-catalog"` 或 `currentProject.id` | 固定 `"catalog-graph"`（CatalogGraph.tsx L178） |
+| 搜索词 | 内存状态（Context 内部），不跨实例共享 | 内存状态（useCatalogGraph 内部），不跨实例共享 |
+| 附加状态 | 分页 / 排序 | 分组方式 / 布局参数 / 节点位置（持久化到 `catalogGraphLayout-${workspaceId}`） |
+| Apollo 缓存 | 共享同一 Apollo Client，但因为 pageSize/变量不同，缓存条目独立 | 共享同一 Apollo Client，缓存条目独立 |
+
+**筛选边界结论：**
+- 在工作区 Catalog 页输入搜索词 → 切到项目 ResourceList：搜索词会保留（同一个 Context 实例）
+- 在 Catalog 页输入搜索词 → 切到 Graph 总图：搜索词**不会**保留（两个独立实例）
+- 在 Graph 总图调整布局参数 / 分组方式 → 回到表格页：不产生任何影响
+- 两者唯一共享的是同一个后端 resolver 和 Apollo Client 缓存层，但因为查询变量不同，缓存不会互相复用
+
 ---
 
 ## 5. 总结：数据流向总图
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        WorkspaceLayout                              │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐    │
-│  │useWorkspaceSel. │  │useProjectSelector│  │usePendingChanges│    │
-│  └────────┬────────┘  └────────┬─────────┘  └────────┬────────┘    │
-│           │                    │                     │             │
-│  ┌────────▼────────────────────▼─────────────────────▼────────┐    │
-│  │                      AppContextProvider                    │    │
-│  │  currentWorkspace / projectsList / pendingChanges / ...    │    │
-│  └──────────────────────────┬─────────────────────────────────┘    │
-│                             │                                      │
-│  ┌──────────────────────────▼─────────────────────────────────┐    │
-│  │                   CatalogContextProvider                    │    │
-│  │  └─ useCatalog() ── SEARCH_CATALOG (GraphQL)               │    │
-│  └───────┬───────────────────────────────┬────────────────────┘    │
-│          │                               │                         │
-│    ┌─────▼──────┐                 ┌──────▼───────┐                │
-│    │CatalogGrid │                 │CatalogGraph  │                │
-│    │(表格视图)  │                 │(关系图视图)  │                │
-│    └────────────┘                 └──────────────┘                │
-│                                                                     │
-│    ┌─────────────────────────────────────────────────────────┐     │
-│    │                   后端 (amplication-server)             │     │
-│    │  resource.resolver.catalog()                            │     │
-│    │    └─ resource.service.searchResourcesWithCount()       │     │
-│    │         └─ prepareResourceFindManyArgsForQuery()        │     │
-│    │              └─ prisma.resource.count + findMany        │     │
-│    │         └─ @ResolveField 按需解析 project/owner/builds..│     │
-│    └─────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│                           WorkspaceLayout                                  │
+│  ┌───────────────┐  ┌──────────────────┐  ┌─────────────────┐              │
+│  │useWorkspaceSel│  │useProjectSelector│  │usePendingChanges│              │
+│  └───────┬───────┘  └────────┬─────────┘  └────────┬────────┘              │
+│          │                   │                     │                        │
+│  ┌───────▼───────────────────▼─────────────────────▼───────────┐            │
+│  │                    AppContextProvider                       │            │
+│  │  currentWorkspace / projectsList / pendingChanges / ...    │            │
+│  └───────────────────────────┬─────────────────────────────────┘            │
+│                              │                                              │
+│    ┌─────────────────────────┴───────────────────────────┐                  │
+│    │                                                       │                  │
+│    ▼                                                       ▼                  │
+│  ┌─────────────────────────────┐          ┌─────────────────────────────┐  │
+│  │   CatalogContextProvider    │          │     useCatalogGraph          │  │
+│  │  ┌───────────────────────┐  │          │  ┌───────────────────────┐  │  │
+│  │  │  useCatalog()         │  │          │  │ useCatalog(1000/page)  │  │  │
+│  │  │  (默认 20/page)       │  │          │  │ (独立实例，不经Context) │  │  │
+│  │  └──────────┬────────────┘  │          │  └──────────┬────────────┘  │  │
+│  └─────────────┼───────────────┘          └─────────────┼───────────────┘  │
+│                │                                        │                  │
+│                ▼                                        ▼                  │
+│      ┌──────────────────┐                  ┌──────────────────────────┐   │
+│      │   CatalogGrid    │                  │      CatalogGraph        │   │
+│      │ (工作区/项目表格) │                  │  (WorkspaceGraph 总图)   │   │
+│      └──────────────────┘                  │ nodes / edges / 分组/布局 │   │
+│                                             └──────────────────────────┘   │
+│                                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │                   后端 (amplication-server)                         │    │
+│  │  resource.resolver.catalog()                                        │    │
+│  │    └─ resource.service.searchResourcesWithCount()                   │    │
+│  │         └─ prepareResourceFindManyArgsForQuery()                    │    │
+│  │              └─ prisma.resource.count + findMany                    │    │
+│  │         └─ @ResolveField 按需解析 project/owner/builds...           │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 关键设计原则：
-1. **一次拉取，多处复用**：Catalog 状态通过 Context 在工作区全局共享
-2. **视图复用，参数区分**：CatalogGrid / CatalogGraph 复用 useCatalog，通过 `fixedFiltersKey` 隔离上下文
+1. **表格内部共享，图表各自独立**：表格视图通过 CatalogContextProvider 共享一个 useCatalog 实例；图视图绕过 Context，自己独立实例化 useCatalog
+2. **视图复用，参数隔离**：都复用 `useCatalog` 工厂 hook，但通过不同的 `pageSize`、`fixedFiltersKey`、localStorage key 实现状态完全隔离
 3. **字段按需分级**：概览用内嵌轻量资源，列表走完整 catalog 查询
 4. **状态解耦**：Pending Changes、Build 状态等暂态/派生数据走独立链路
+5. **总图独立建模**：图视图需要一次性加载 1000 条资源做拓扑，不与分页表格共享数据是合理的设计
