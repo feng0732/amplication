@@ -1,511 +1,1031 @@
-# Preview Artifact 与生成结果检查代码梳理
+# Preview Artifact 与生成结果检查链路梳理
 
-## 1. 核心概念与关系总览
+本文档从代码实现角度，端到端梳理 Preview Artifact 的完整检查链路，包含前端确认入口、提交策略、后端 Build 创建、生成成功/失败回调、Preview PR 生成与结果状态展示六个阶段。
 
-整个流程涉及三个核心维度：**产物元数据**、**任务状态**、**用户确认流程**。它们的关系如下：
+---
+
+## 总览：端到端流程
 
 ```
-用户确认(PendingChange → Commit)
-        ↓
-创建 Build(Running, Waiting)
-        ↓
-Action/ActionStep 执行(Waiting → Running → Success/Failed)
-        ↓
-生成 Artifact (BUILD_ARTIFACTS_BASE_FOLDER/{resourceId}/{buildId})
-        ↓
-Push to Git / Preview PR
-        ↓
-Build 状态更新(Completed, Completed)
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                                前端 (amplication-client)                              │
+│                                                                                      │
+│  [PendingChangesPage] → [Commit组件] → [提交策略选择] → [COMMIT_CHANGES mutation]    │
+│         ↑                    ↑                                                       │
+│         │                    │ useCommits hook                                       │
+│         │                    │                                                       │
+│  [LastCommit状态展示] ← [轮询 GET_LAST_COMMIT] ← [useBuildWatchStatus轮询GET_BUILD] │
+│         │                    │                                                       │
+│         ▼                    ▼                                                       │
+│  [CommitsPage]          [BuildPage + ActionLog]                                      │
+│  [CommitPage]           [BuildGitLink → PR链接]                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                                      │ GraphQL
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                               后端 (amplication-server)                               │
+│                                                                                      │
+│  [ProjectResolver.commit()] → [ProjectService.commit()]                              │
+│                                     │                                                │
+│                                     ▼                                                │
+│                            1. 计费限制校验                                            │
+│                            2. 获取Changed Entities/Blocks                             │
+│                            3. 创建Commit记录                                          │
+│                            4. 创建EntityVersion/BlockVersion                          │
+│                            5. 释放Entity/Block锁                                      │
+│                            6. 根据commitStrategy筛选resources                         │
+│                            7. 级联关联resource筛选                                    │
+│                            8. 为每个resource调用BuildService.create()                 │
+│                                     │                                                │
+│                                     ▼                                                │
+│                           [BuildService.create()]                                     │
+│                                     │                                                │
+│                                     ▼                                                │
+│                         status=Running, gitStatus=Waiting                            │
+│                         创建Action + ADD_TO_QUEUE步骤                                 │
+│                                     │                                                │
+│                              下载私有插件？ ──是──► DOWNLOAD_PRIVATE_PLUGINS步骤       │
+│                                     │否                                              │
+│                                     ▼                                                │
+│                         [BuildService.generate()]                                     │
+│                                     │                                                │
+│                                     ▼                                                │
+│                      序列化DSGResourceData到共享存储                                   │
+│                      发送Kafka: CODE_GENERATION_REQUEST_TOPIC                         │
+│                      GENERATE_APPLICATION步骤保持Running                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                                      │ Kafka
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                           Build Manager (amplication-build-manager)                   │
+│                                                                                      │
+│   [BuildRunnerService] → 读取DSGResourceData → 拆分子Job(server/admin-ui)            │
+│                               │                                                      │
+│                               ▼                                                      │
+│                    每个子Job执行DSG → 产物复制到 BUILD_ARTIFACTS_BASE_FOLDER          │
+│                               │                                                      │
+│                     全部子Job成功？                                                    │
+│                          /        \                                                   │
+│                        是          否                                                  │
+│                        ▼           ▼                                                  │
+│          CODE_GENERATION_SUCCESS_TOPIC   CODE_GENERATION_FAILURE_TOPIC                │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                                      │ Kafka
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                              后端回调 (amplication-server)                             │
+│                                                                                      │
+│  ┌─ 成功回调: handleCodeGenerationSuccess()                                           │
+│  │    1. GENERATE_APPLICATION步骤 → Success                                            │
+│  │    2. 发送Kafka: USER_BUILD_TOPIC                                                   │
+│  │    3. 调用saveToGitProvider()                                                       │
+│  │         │                                                                          │
+│  │         ▼                                                                          │
+│  │   project.useDemoRepo ?                                                            │
+│  │       /         \                                                                  │
+│  │     是            否                                                                │
+│  │     ▼             ▼                                                                │
+│  │  Preview PR    用户仓库PR                                                           │
+│  │  标题固定        标题: "{commit.message} (Amplication build {id})"                  │
+│  │  PREVIEW_PR_BODY 包含Build链接                                                      │
+│  │         │                                                                          │
+│  │         ▼                                                                          │
+│  │   创建PUSH_TO_GIT_PROVIDER步骤(Running)                                             │
+│  │   发送Kafka: CREATE_PR_REQUEST_TOPIC                                                │
+│  │         │                                                                          │
+│  │         ▼                                                                          │
+│  │   PR创建成功回调 → PUSH步骤Success                                                  │
+│  │                   → Build.status=Completed                                         │
+│  │                   → Build.gitStatus=Completed                                      │
+│  │                   → 更新代码行数统计                                                │
+│  │                                                                                    │
+│  │   PR创建失败回调 → PUSH步骤Failed                                                   │
+│  │                   → Build.status=Failed                                            │
+│  │                   → Build.gitStatus=Failed                                         │
+│  │                                                                                    │
+│  └─ 失败回调: handleCodeGenerationFailure()                                           │
+│       1. GENERATE_APPLICATION步骤 → Failed                                             │
+│       2. Build.status=Failed                                                           │
+│       3. Build.gitStatus=Canceled                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. 产物元数据定义
+## 阶段一：前端确认入口
 
-### 2.1 Build - 主构建记录
+### 1.1 Pending Changes 页面
 
-**定义位置**: [Build.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/dto/Build.ts)
+**文件**: `packages/amplication-client/src/VersionControl/PendingChangesPage.tsx`
 
+用户查看所有待确认变更的入口页面：
+
+- 通过 `usePendingChanges()` hook 获取按资源分组的变更列表
+- 每个变更使用 `PendingChangeWithCompare` 组件展示差异对比
+- 变更类型包括 Entity 和 Block 两种
+- 支持 Platform 控制台和 Services 两种资源类型分组
+
+```tsx
+const PendingChangesPage = ({ match }: Props) => {
+  const { pendingChangesByResource } = usePendingChanges(
+    currentProject,
+    isPlatformConsole
+      ? EnumResourceTypeGroup.Platform
+      : EnumResourceTypeGroup.Services
+  );
+  // 按资源分组展示变更列表
+};
+```
+
+### 1.2 Commit 组件
+
+**文件**: `packages/amplication-client/src/VersionControl/Commit.tsx`
+
+核心提交组件，提供用户输入提交消息和选择提交策略的交互：
+
+- 使用 Formik 管理表单状态
+- 支持 `Ctrl+Enter` 快捷键提交
+- 提供下拉菜单选择三种提交策略（见阶段二）
+- 选择 Specific 策略时弹窗让用户选择具体服务
+
+关键交互逻辑：
+```tsx
+const handleCommit = (message, commitStrategy, selectedServiceId?) => {
+  commitChanges({
+    message,
+    project: { connect: { id: currentProject?.id } },
+    bypassLimitations,
+    commitStrategy,
+    resourceIds: selectedServiceId ? [selectedServiceId] : null,
+    resourceTypeGroup,
+  });
+};
+```
+
+### 1.3 Commit Button
+
+**文件**: `packages/amplication-client/src/VersionControl/CommitButton.tsx`
+
+按钮组件，根据上下文展示不同样式：
+
+- `CommitBtnType.Button`: 常规按钮，Services 显示 "Generate the code"，Platform 显示 "Publish Changes"
+- `CommitBtnType.JumboButton`: 大按钮，用于引导页 "Generate the code for my new architecture"
+
+按钮点击时的默认策略选择逻辑：
 ```typescript
-class Build {
-  id: string;                           // 构建唯一标识
-  createdAt: Date;                      // 创建时间
-  resourceId: string;                   // 关联资源ID
-  userId: string;                       // 创建用户ID
-  status: EnumBuildStatus;              // 构建状态（见3.1）
-  gitStatus: EnumBuildGitStatus;        // Git同步状态（见3.2）
-  archiveURI?: string;                  // 产物归档ZIP下载路径
-  version: string;                      // 构建版本号（取自commitId后8位）
-  message?: string;                     // 构建消息
-  actionId: string;                     // 关联Action ID
-  commitId: string;                     // 关联Commit ID
-  codeGeneratorVersion?: string;        // 代码生成器版本
-  linesOfCodeAdded?: number;            // 新增代码行数
-  linesOfCodeDeleted?: number;          // 删除代码行数
-  filesChanged?: number;                // 变更文件数
-}
-```
-
-**archiveURI 解析逻辑**: [build.resolver.ts#L73-L76](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.resolver.ts#L73-L76)
-```typescript
-archiveURI(@Parent() build: Build): string {
-  return `/generated-apps/${build.id}.zip`;
-}
-```
-
-### 2.2 DSGResourceData - 代码生成资源数据
-
-**定义位置**: [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts)
-
-这是传递给 Data Service Generator 的完整资源数据，在构建执行前序列化到共享存储：
-
-```typescript
-class DSGResourceData {
-  resourceType: EnumResourceType;         // 资源类型 (Service/Component等)
-  resourceInfo?: AppInfo;                 // 应用信息
-  buildId: string;                        // 构建ID
-  entities?: Entity[];                    // 实体列表
-  roles?: Role[];                         // 角色列表
-  pluginInstallations: PluginInstallation[]; // 插件安装列表
-  packages?: Package[];                   // 包列表
-  moduleContainers?: ModuleContainer[];   // 模块容器
-  moduleActions?: ModuleAction[];         // 模块动作
-  moduleDtos?: ModuleDto[];               // 模块DTO
-  resourceSettings?: ResourceSettings;    // 资源设置
-  relations?: Relation[];                 // 实体关系
-  serviceTopics?: ServiceTopics[];        // 服务主题
-  topics?: Topic[];                       // 主题列表
-  otherResources?: DSGResourceData[];     // 关联其他资源
-}
-```
-
-**存储位置**: [build.service.ts#L541-L559](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L541-L559)
-- Server 端保存路径: `{DSG_RESOURCE_DATA_BASE_FOLDER}/{buildId}/resource-data.json`
-
-### 2.3 BuildPlugin - 构建插件信息
-
-**关联位置**: [build.service.ts#L389-L421](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L389-L421)
-
-```typescript
-{
-  buildId: string;
-  packageName: string;
-  packageVersion: string;
-  requestedFullPackageName: string;  // 如 "@scope/plugin@1.0.0"
-}
-```
-
-### 2.4 UserBuild - Schema Registry 用户构建事件
-
-**定义位置**: [user-build/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/libs/schema-registry/src/lib/user-build/value.ts)
-
-代码生成成功后通过 Kafka 发送的事件数据：
-
-```typescript
-class Value {
-  buildId: string;
-  commitId: string;
-  commitMessage: string;
-  projectId: string;
-  resourceId: string;
-  resourceName: string;
-  workspaceId: string;
-  projectName: string;
-  externalId: string;        // 加密后的用户ID
-  createdAt: number;         // 时间戳
-  envBaseUrl: string;        // 客户端基础URL
-}
-```
-
-### 2.5 产物物理存储路径
-
-**代码位置**: [build-runner.service.ts#L372-L396](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L372-L396)
-
-```
-Job 工作目录:     {DSG_JOBS_BASE_FOLDER}/{jobBuildId}/{DSG_JOBS_CODE_FOLDER}
-产物归档目录:     {BUILD_ARTIFACTS_BASE_FOLDER}/{resourceId}/{buildId}
-DSG资源数据:      {DSG_RESOURCE_DATA_BASE_FOLDER}/{buildId}/resource-data.json
-DSG Job资源数据:  {DSG_JOBS_BASE_FOLDER}/{jobBuildId}/{DSG_JOBS_RESOURCE_DATA_FILE}
+const strategy = hasPendingChanges
+  ? EnumCommitStrategy.AllWithPendingChanges   // 有变更时默认只提交有变更的
+  : hasMultipleServices && onCommitSpecificService
+  ? EnumCommitStrategy.Specific                 // 多服务且无变更时让用户选择
+  : EnumCommitStrategy.All;                     // 单服务时全量提交
 ```
 
 ---
 
-## 3. 任务状态体系
+## 阶段二：提交策略
 
-### 3.1 EnumBuildStatus - 构建整体状态
+### 2.1 EnumCommitStrategy 定义
 
-**定义位置**: [EnumBuildStatus.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/dto/EnumBuildStatus.ts)
+**文件**: `packages/amplication-server/src/core/resource/dto/EnumCommitStrategy.ts`
 
 ```typescript
-enum EnumBuildStatus {
-  Running = "Running",     // 构建进行中
-  Completed = "Completed", // 构建完成（代码生成+Git推送均成功）
-  Failed = "Failed",       // 构建失败
-  Invalid = "Invalid",     // 构建无效
-  Unknown = "Unknown",     // 状态未知（需重新计算）
-  Canceled = "Canceled",   // 构建已取消
+enum EnumCommitStrategy {
+  All = "all",                               // 所有资源
+  AllWithPendingChanges = "allWithPendingChanges",  // 仅包含有变更的资源（默认）
+  Specific = "specific",                     // 指定资源ID
 }
 ```
 
-**状态计算逻辑**: [build.resolver.ts#L78-L88](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.resolver.ts#L78-L88)
-- 若构建"过期"（超过STALE_BUILD_HOURS=5小时），重新计算
-- 若状态为 Unknown，重新计算
+### 2.2 前端策略选项
 
-### 3.2 EnumBuildGitStatus - Git同步状态
-
-**定义位置**: [EnumBuildGitStatus.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/dto/EnumBuildGitStatus.ts)
+**文件**: `packages/amplication-client/src/VersionControl/Commit.tsx`
 
 ```typescript
-enum EnumBuildGitStatus {
-  NotConnected = "NotConnected", // 未连接Git仓库
-  Waiting = "Waiting",           // 等待Git同步
-  Completed = "Completed",       // Git同步完成（PR创建成功）
-  Failed = "Failed",             // Git同步失败
-  Canceled = "Canceled",         // Git同步已取消
-  Unknown = "Unknown",           // 状态未知
+const COMMIT_STRATEGY_OPTIONS = [
+  { strategyType: EnumCommitStrategy.All, label: "All services" },
+  { strategyType: EnumCommitStrategy.AllWithPendingChanges, label: "Pending changes (default)" },
+  { strategyType: EnumCommitStrategy.Specific, label: "Specific service" },
+];
+```
+
+- `AllWithPendingChanges` 选项在无 pending changes 时不显示
+- 选择 `Specific` 时会弹出服务选择对话框
+
+### 2.3 CommitCreateInput 结构
+
+**文件**: `packages/amplication-server/src/core/resource/dto/CommitCreateInput.ts`
+
+```typescript
+class CommitCreateInput {
+  message!: string;                                    // 提交消息
+  project!: WhereParentIdInput;                        // 关联项目
+  resourceTypeGroup!: EnumResourceTypeGroup;           // Services / Platform
+  bypassLimitations? = false;                          // 是否绕过计费限制
+  commitStrategy?: EnumCommitStrategy;                 // 提交策略
+  resourceIds?: string[];                              // strategy=Specific时的资源ID列表
+  resourceVersions?: CommitResourceVersionCreateInput[]; // Platform模式下的版本号
+  user!: WhereParentIdInput;                           // 提交用户（从上下文注入，不暴露GraphQL）
 }
 ```
 
-### 3.3 EnumActionStepStatus - 操作步骤状态
+### 2.4 后端策略应用
 
-**定义位置**: [EnumActionStepStatus.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/action/dto/EnumActionStepStatus.ts)
-
-```typescript
-enum EnumActionStepStatus {
-  Waiting = "Waiting",   // 等待执行
-  Running = "Running",   // 执行中
-  Failed = "Failed",     // 执行失败
-  Success = "Success",   // 执行成功
-}
-```
-
-**完成逻辑**: [action.service.ts#L97-L111](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/action/action.service.ts#L97-L111)
-- 步骤完成时会设置 `status` 为 Success/Failed，并记录 `completedAt` 时间
-
-### 3.4 EnumJobStatus - Build Manager Job状态
-
-**定义位置**: [types.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/types.ts)
+**文件**: `packages/amplication-server/src/core/project/project.service.ts` (commit方法)
 
 ```typescript
-enum EnumJobStatus {
-  InProgress = "in-progress",  // Job进行中
-  Success = "success",         // Job成功
-  Failure = "failure",         // Job失败
+// 策略1: AllWithPendingChanges - 只保留有实际变更的资源
+if (args.data.commitStrategy === EnumCommitStrategy.AllWithPendingChanges) {
+  resourcesToBuild = resources.filter((resource) => {
+    return (
+      changedEntities.some((c) => c.resource.id === resource.id) ||
+      changedBlocks.some((c) => c.resource.id === resource.id)
+    );
+  });
+}
+
+// 策略2: Specific - 只保留指定的资源ID
+if (args.data.commitStrategy === EnumCommitStrategy.Specific) {
+  if (!args.data.resourceIds?.length) {
+    throw new Error("resourceIds are required for specific commit strategy");
+  }
+  resourcesToBuild = resources.filter((r) =>
+    args.data.resourceIds.includes(r.id)
+  );
+}
+
+// 策略3: All - 使用全部资源（默认）
+
+// Services模式下额外处理：级联关联资源
+if (resourceTypeGroup === EnumResourceTypeGroup.Services) {
+  const cascadingBuildableResourceIds =
+    await this.relationService.getCascadingBuildableResourceIds(resourceIds);
+  // 对每个级联后的resourceId创建Build
 }
 ```
-
-**Job ID 格式**: `{buildId}-server` 或 `{buildId}-admin-ui`（拆分构建时）
-**聚合逻辑**: [build-job-handler.service.ts#L101-L122](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L101-L122)
-- 所有子Job成功 → 整体 Success
-- 任一子Job失败 → 整体 Failure
-- 任一子Job进行中 → 整体 InProgress
-
-状态存储在 Redis 中，Key 为 `buildId`，Value 为各子Job的状态映射。
-
-### 3.5 EnumUserActionStatus - 用户操作状态
-
-**定义位置**: [types.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/userAction/types.ts)
-
-```typescript
-enum EnumUserActionStatus {
-  Running = "Running",     // 进行中
-  Completed = "Completed", // 完成
-  Failed = "Failed",       // 失败
-  Invalid = "Invalid",     // 无效（无steps）
-}
-```
-
-**状态评估逻辑**: [userAction.service.ts#L69-L96](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/userAction/userAction.service.ts#L69-L96)
-- 所有step Success → Completed
-- 任一step Failed → Failed
-- 否则 → Running
 
 ---
 
-## 4. 用户确认流程详解
+## 阶段三：后端创建 Build
 
-### 4.1 PendingChange - 待确认变更
+### 3.1 GraphQL 入口
 
-**定义位置**: [PendingChange.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/resource/dto/PendingChange.ts)
+**文件**: `packages/amplication-server/src/core/project/project.resolver.ts`
 
 ```typescript
-class PendingChange {
-  action: EnumPendingChangeAction;           // Create/Update/Delete
-  originType: EnumPendingChangeOriginType;   // Block/Entity
-  originId: string;                          // 变更来源ID
-  origin: Entity | Block;                    // 变更来源对象
-  versionNumber: number;                     // 版本号
-  resource: Resource;                        // 所属资源
+@Mutation(() => Commit, { nullable: true })
+@AuthorizeContext(AuthorizableOriginParameter.ProjectId, "data.project.connect.id")
+@InjectContextValue(InjectableOriginParameter.UserId, "data.user.connect.id")
+async commit(
+  @UserEntity() currentUser: User,
+  @Args() args: CreateCommitArgs
+): Promise<Commit | null> {
+  return await this.projectService.commit(args, currentUser);
 }
 ```
 
-**变更来源**:
-- Entity 变更: [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/entity/entity.service.ts)
-- Block 变更: [block.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/block/block.service.ts)
+### 3.2 ProjectService.commit() 完整流程
 
-### 4.2 Commit - 提交（用户确认入口）
+**文件**: `packages/amplication-server/src/core/project/project.service.ts`
 
-**核心数据模型**（GraphQL Schema）: [models.ts#L388-L396](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/libs/util/code-gen-types/src/models.ts#L388-L396)
+```
+1. 计费限制校验
+   ├── shouldBlockBuild(userId) → 检查BlockBuild权限
+   ├── billingService.isBillingEnabled
+   │   ├── calculateMeteredUsage → 计算计量用量
+   │   ├── billingService.resetUsage → 重置用量
+   │   ├── validateSubscriptionPlanLimitationsForWorkspace → 订阅计划限制
+   │   └── validateProjectLimitations → 项目级限制（实体数等）
+   └── BillingLimitationError → 抛出异常终止流程
+
+2. 获取变更列表
+   ├── entityService.getChangedEntities() → 变更的Entity列表
+   └── blockService.getChangedBlocks() → 变更的Block列表
+
+3. 创建Commit记录
+   ├── prisma.commit.create({ message, project, user })
+   └── billingService.reportUsage(CodeGenerationBuilds)
+
+4. 创建版本 & 释放锁（并行）
+   ├── 对每个Changed Entity:
+   │   ├── entityService.createVersion({ commit, entity })
+   │   └── entityService.releaseLock(entityId)
+   └── 对每个Changed Block:
+       ├── blockService.createVersion({ commit, block })
+       └── blockService.releaseLock(blockId)
+
+5. 根据commitStrategy筛选resourcesToBuild
+   ├── All → 全部资源
+   ├── AllWithPendingChanges → 仅含变更的资源
+   └── Specific → 指定resourceIds
+
+6. Services模式: 级联关联 + 创建Build
+   ├── relationService.getCascadingBuildableResourceIds() → 包含依赖资源
+   └── 对每个resourceId调用 buildService.create()
+
+7. Platform模式: 创建ResourceVersion
+   └── 对每个resource调用 resourceVersionService.create()
+```
+
+### 3.3 BuildService.create()
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
 
 ```typescript
-type Commit = {
-  id: string;
-  message: string;                   // 提交消息
-  createdAt: DateTime;
-  userId: string;                    // 提交用户
-  changes?: PendingChange[];         // 本次提交包含的变更
-  builds?: Build[];                  // 本次提交触发的构建
+async create(args: CreateOneBuildArgs): Promise<Build> {
+  // 1. 创建Action和初始步骤
+  const action = await this.actionService.create(
+    createInitialAction(message, version)
+    // 初始步骤: ADD_TO_QUEUE (状态=Success, 含3条Info日志)
+  );
+
+  // 2. 创建Build记录
+  const build = await this.prisma.build.create({
+    data: {
+      resource: ...connect,
+      commit: ...connect,
+      createdBy: ...connect,
+      status: EnumBuildStatus.Running,       // 初始状态
+      gitStatus: EnumBuildGitStatus.Waiting, // 初始Git状态
+      version,                               // commitId后8位
+      message,
+      action: { connect: { id: action.id } },
+    },
+  });
+
+  // 3. 关联BuildPlugin记录
+  await Promise.all(
+    pluginInstallations.map((plugin) =>
+      this.prisma.buildPlugin.create({
+        data: {
+          build: { connect: { id: build.id } },
+          packageName,
+          packageVersion,
+          requestedFullPackageName,
+        },
+      })
+    )
+  );
+
+  // 4. 仅Service/Component类型触发生成流程
+  if (resourceType === Service || resourceType === Component) {
+    const hasPrivatePlugins = pluginInstallations.some(...);
+    if (hasPrivatePlugins) {
+      await this.downloadPrivatePlugins(build.id, resourceId);
+      // 私有插件下载成功后自动调用 this.generate()
+    } else {
+      await this.generate(build.id, resourceId);
+    }
+  }
+
+  return build;
 }
 ```
 
-**Commit创建输入**: [models.ts#L406-L417](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/libs/util/code-gen-types/src/models.ts#L406-L417)
+### 3.4 初始 Action & Steps
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
 ```typescript
-type CommitCreateInput = {
-  message: string;
-  project: WhereParentIdInput;
-  commitStrategy?: EnumCommitStrategy;  // All / AllWithPendingChanges / Specific
-  resourceIds?: string[];               // strategy=Specific时指定
-  resourceTypeGroup: EnumResourceTypeGroup;
-  bypassLimitations?: boolean;
+function createInitialAction(message: string, version: string): Action {
+  return {
+    steps: {
+      create: [
+        {
+          name: "ADD_TO_QUEUE",
+          message: "Adding task to queue",
+          status: EnumActionStepStatus.Success,  // 立即标记成功
+          logs: {
+            create: [
+              { level: Info, message: "Create build generation task" },
+              { level: Info, message: `Build version: ${version}` },
+              { level: Info, message: `Build message: ${message}` },
+            ],
+          },
+        },
+      ],
+    },
+  };
 }
 ```
 
-### 4.3 Build 创建流程
+---
 
-**代码位置**: [build.service.ts#L268-L352](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L268-L352)
+## 阶段四：生成成功或失败回调
+
+### 4.1 代码生成触发
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts` (generate方法)
 
 ```
-1. 创建 Build 记录
-   ├── status: Running
-   ├── gitStatus: Waiting
-   ├── version: commitId后8位
-   ├── 关联 entityVersions (最新版本)
-   └── 创建 Action + 初始步骤 ADD_TO_QUEUE (Success)
-
-2. 检查资源类型（仅Service和Component触发生成）
-
-3. 检查私有插件
-   ├── 有私有插件 → 先执行 downloadPrivatePlugins
-   └── 无私有插件 → 直接执行 generate
+generate(buildId, resourceId):
+  1. 组装DSGResourceData（完整资源快照）
+  2. 序列化为JSON
+  3. 保存到共享存储: {DSG_RESOURCE_DATA_BASE_FOLDER}/{buildId}/resource-data.json
+  4. ActionService.run():
+     - 创建步骤 GENERATE_APPLICATION (Running)
+     - 发送Kafka消息 CODE_GENERATION_REQUEST_TOPIC
+       key: null
+       value: { resourceId, buildId }
+     - leaveStepOpen = true (保持Running状态等待Kafka回调)
 ```
 
-**初始步骤创建**: [build.service.ts#L179-L210](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L179-L210)
-- 步骤名: `ADD_TO_QUEUE`
-- 状态: `Success`（立即完成，表示已加入队列）
+### 4.2 Build Manager 处理
 
-### 4.4 Build 执行步骤 (Action Steps)
+**文件**: `packages/amplication-build-manager/src/build-runner/build-runner.service.ts`
 
-每个 Build 关联一个 Action，Action 包含多个 ActionStep，标准步骤序列：
+```
+收到CODE_GENERATION_REQUEST_TOPIC消息:
+  1. 从共享存储读取DSGResourceData
+  2. 决定代码生成器版本
+  3. 判断是否拆分Job:
+     ├── hasAdminUiSections → 拆分为 server + admin-ui 两个子Job
+     └── 否则 → 仅 server 一个子Job
+  4. 每个子Job:
+     ├── 准备工作目录: {DSG_JOBS_BASE_FOLDER}/{jobBuildId}/code
+     ├── 写入DSGResourceData到工作目录
+     ├── 调用DSG Runner执行代码生成
+     └── 成功后复制产物: {DSG_JOBS_BASE_FOLDER}/{jobBuildId}/code/**
+                        → {BUILD_ARTIFACTS_BASE_FOLDER}/{resourceId}/{buildId}
+  5. 子Job状态写入Redis (key=buildId)
+  6. 聚合所有子Job状态:
+     ├── 全部Success → 发送 CODE_GENERATION_SUCCESS_TOPIC
+     └── 任一Failure → 发送 CODE_GENERATION_FAILURE_TOPIC
+```
 
-| 步骤名 | 消息 | 触发条件 |
-|--------|------|----------|
-| `ADD_TO_QUEUE` | Adding task to queue | 创建Build时自动创建 |
-| `DOWNLOAD_PRIVATE_PLUGINS` | Downloading private plugins | 资源有私有插件时 |
-| `GENERATE_APPLICATION` | Generating Application | 必有 |
-| `PUSH_TO_GIT_PROVIDER` | Push changes to {provider} | 代码生成成功后 |
+### 4.3 成功回调 - handleCodeGenerationSuccess()
 
-**步骤执行引擎**: [action.service.ts#L275-L295](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/action/action.service.ts#L275-L295)
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
 ```typescript
-async run<T>(
-  actionId, stepName, message,
-  stepFunction,
-  leaveStepOpenAfterSuccessfulExecution = false
-) {
-  创建Step (Running)
-  try {
-    result = await stepFunction(step)
-    if (!leaveStepOpen) 标记Step Success
-    return result
-  } catch {
-    记录错误日志
-    标记Step Failed
-    抛出异常
+async handleCodeGenerationSuccess(resourceId: string, buildId: string) {
+  // 1. 标记GENERATE_APPLICATION步骤成功
+  await this.actionService.completeStep(
+    build.actionId,
+    "GENERATE_APPLICATION",
+    EnumActionStepStatus.Success
+  );
+
+  // 2. 发送USER_BUILD_TOPIC事件（产物通知下游服务）
+  await this.kafkaService.emitMessage(USER_BUILD_TOPIC, {
+    value: {
+      buildId,
+      commitId,
+      commitMessage,
+      projectId,
+      resourceId,
+      resourceName,
+      workspaceId,
+      projectName,
+      externalId,  // 加密用户ID
+      createdAt,
+      envBaseUrl,
+    },
+  });
+
+  // 3. 触发Git推送流程
+  await this.saveToGitProvider(buildId);
+}
+```
+
+### 4.4 失败回调 - handleCodeGenerationFailure()
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
+```typescript
+async handleCodeGenerationFailure(buildId: string, error: string) {
+  // 1. 记录错误日志到ActionStep
+  await this.actionService.createLog(
+    build.actionId,
+    "GENERATE_APPLICATION",
+    {
+      level: EnumActionLogLevel.Error,
+      message: error,
+      meta: {},
+    }
+  );
+
+  // 2. 标记GENERATE_APPLICATION步骤失败
+  await this.actionService.completeStep(
+    build.actionId,
+    "GENERATE_APPLICATION",
+    EnumActionStepStatus.Failed
+  );
+
+  // 3. 更新Build状态
+  await this.prisma.build.update({
+    where: { id: buildId },
+    data: {
+      status: EnumBuildStatus.Failed,
+      gitStatus: EnumBuildGitStatus.Canceled, // Git推送取消
+    },
+  });
+}
+```
+
+---
+
+## 阶段五：Preview PR 生成
+
+### 5.1 saveToGitProvider() - Git推送入口
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
+```typescript
+async saveToGitProvider(buildId: string) {
+  // 1. 创建PUSH_TO_GIT_PROVIDER步骤（Running）
+  await this.actionService.createStep(build.actionId, {
+    name: `PUSH_TO_GIT_${gitProvider}`,  // e.g. PUSH_TO_GIT_Github
+    message: `Push changes to ${gitProvider}`,
+    status: EnumActionStepStatus.Running,
+  });
+
+  // 2. 判断是否使用Demo/Preview仓库
+  if (project.useDemoRepo) {
+    // ==== Preview PR 模式 ====
+    const organizationName = config.get(GITHUB_DEMO_REPO_ORGANIZATION_NAME);
+    const installationId = config.get(GITHUB_DEMO_REPO_INSTALLATION_ID);
+    const buildLink = `${clientHost}/${workspaceId}/${projectId}/${resourceId}/git-sync`;
+
+    const commitBody = PREVIEW_PR_BODY.replace("[link]", buildLink);
+
+    gitSettings = {
+      gitOrganizationName: organizationName,
+      gitRepositoryName: project.demoRepoName,
+      gitProvider: EnumGitProvider.Github,
+      gitProviderProperties: { installationId },
+      commit: {
+        title: "Preview PR from Amplication",
+        body: commitBody,
+      },
+    };
+    kafkaEventKey = project.demoRepoName;
+  } else {
+    // ==== 用户自有仓库模式 ====
+    const resourceGitRepo = resourceService.gitRepository(resourceId);
+    gitSettings = {
+      gitOrganizationName: resourceGitRepo.gitOrganizationName,
+      gitRepositoryName: resourceGitRepo.gitRepositoryName,
+      baseBranchName: resourceGitRepo.baseBranchName,
+      gitProvider: resourceGitRepo.gitProvider,
+      isBranchPerResource: resourceGitRepo.isBranchPerResource,
+      gitResourceMeta: {
+        serverPath: resourceGitRepo.gitRepository?.serverPath,
+        adminUIPath: resourceGitRepo.gitRepository?.adminUIPath,
+      },
+      overrideCustomizableFilesInGit: ...,
+      commit: {
+        title: `${commit.message} (Amplication build ${truncatedBuildId})`,
+        body: `Build link: ${buildLink}\n\n${commit.message}`,
+      },
+    };
+  }
+
+  // 3. 发送Kafka消息创建PR
+  await this.kafkaService.emitMessage(CREATE_PR_REQUEST_TOPIC, {
+    key: kafkaEventKey,
+    value: { ...createPrRequest, gitSettings },
+  });
+}
+```
+
+### 5.2 PREVIEW_PR_BODY 模板
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
+```
+Welcome to your first sync with Amplication's Preview Repo! 🚀
+
+You've taken the first step in supercharging your development.
+This Preview Repo is a sandbox for you to see what Amplication can do.
+
+Remember, by connecting to your own repository, you'll have even more power -
+like customizing the code to fit your needs.
+
+Now, head back to Amplication, connect to your own repo and keep building!
+Define data entities, set up roles, and extend your service's functionality
+with our versatile plugin system. The possibilities are endless.
+
+[{buildLink}]
+
+Thank you, and let's build something amazing together! 🚀
+```
+
+### 5.3 PR 创建成功回调
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
+```typescript
+async handleCreatePrSuccess(buildId: string, githubUrl: string, diffStat: DiffStat) {
+  // 1. 记录PR URL到步骤日志
+  await this.actionService.createLog(
+    build.actionId,
+    `PUSH_TO_GIT_${provider}`,
+    {
+      level: Info,
+      message: `PR was successfully created at ${githubUrl}`,
+      meta: { githubUrl },  // 前端通过meta.githubUrl提取PR链接
+    }
+  );
+
+  // 2. 更新Build代码统计（仅当有实际Entity/Block变更时）
+  if (pendingChanges.length > 0) {
+    await this.prisma.build.update({
+      where: { id: buildId },
+      data: {
+        linesOfCodeAdded: diffStat.insertions,
+        linesOfCodeDeleted: diffStat.deletions,
+        filesChanged: diffStat.filesChanged,
+      },
+    });
+  }
+
+  // 3. 标记PUSH步骤成功
+  await this.actionService.completeStep(
+    build.actionId,
+    `PUSH_TO_GIT_${provider}`,
+    EnumActionStepStatus.Success
+  );
+
+  // 4. 更新Build最终状态
+  await this.prisma.build.update({
+    where: { id: buildId },
+    data: {
+      status: EnumBuildStatus.Completed,
+      gitStatus: EnumBuildGitStatus.Completed,
+    },
+  });
+
+  // 5. 上报计费事件
+  await this.billingService.reportUsage(workspaceId, BillingFeature.CodePushToGit);
+}
+```
+
+### 5.4 PR 创建失败回调
+
+**文件**: `packages/amplication-server/src/core/build/build.service.ts`
+
+```typescript
+async handleCreatePrFailure(buildId: string, error: string) {
+  // 1. 记录资源同步错误
+  await this.resourceSyncService.setResourceSyncError(resourceId, error);
+
+  // 2. 标记PUSH步骤失败
+  await this.actionService.completeStep(
+    build.actionId,
+    `PUSH_TO_GIT_${provider}`,
+    EnumActionStepStatus.Failed
+  );
+
+  // 3. 更新Build最终状态
+  await this.prisma.build.update({
+    where: { id: buildId },
+    data: {
+      status: EnumBuildStatus.Failed,
+      gitStatus: EnumBuildGitStatus.Failed,
+    },
+  });
+
+  // 4. 上报分析事件
+  await this.analytics.trackWithContext({
+    event: EnumEventType.GitSyncError,
+    properties: { error, buildId, resourceId },
+  });
+}
+```
+
+---
+
+## 阶段六：结果状态展示
+
+### 6.1 前端轮询机制
+
+#### useCommits Hook - Commit 级别轮询
+
+**文件**: `packages/amplication-client/src/VersionControl/hooks/useCommits.ts`
+
+```typescript
+// 轮询间隔: 1000ms (仅当有Running状态的Build时)
+const POLL_INTERVAL = 1000;
+
+// GET_LAST_COMMIT查询包含完整Commit+Builds+Action+Steps+Logs
+useEffect(() => {
+  const hasRunningBuilds = lastCommit?.builds?.some(
+    (b) => b.status === EnumBuildStatus.Running
+  );
+  if (hasRunningBuilds) {
+    startPolling(POLL_INTERVAL);
+  } else {
+    stopPolling();
+  }
+}, [lastCommit]);
+```
+
+GraphQL查询: `COMMIT_FIELDS_FRAGMENT`
+```graphql
+fragment CommitFields on Commit {
+  id message createdAt
+  user { account { firstName lastName } }
+  changes { originId action originType versionNumber origin resource }
+  builds {
+    id version status gitStatus archiveURI
+    resource { id name resourceType codeGenerator }
+    action {
+      steps {
+        id name message status completedAt
+        logs { id createdAt message meta level }
+      }
+    }
   }
 }
 ```
 
-### 4.5 代码生成流程
+#### useBuildWatchStatus - Build 级别轮询
 
-**代码位置**: [build.service.ts#L568-L618](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L568-L618)
+**文件**: `packages/amplication-client/src/VersionControl/useBuildWatchStatus.tsx`
 
-```
-1. 获取DSGResourceData（完整资源数据）
-2. 保存到共享存储: {DSG_RESOURCE_DATA_BASE_FOLDER}/{buildId}/resource-data.json
-3. 发送Kafka消息: CODE_GENERATION_REQUEST_TOPIC
-   ├── key: null
-   └── value: { resourceId, buildId }
-4. Step保持Running状态（leaveStepOpen=true）
-```
+```typescript
+// 轮询间隔: 5000ms (仅当Build=Running时)
+const POLL_INTERVAL = 5000;
 
-**Build Manager 接收处理**: [build-runner.service.ts#L109-L159](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L159)
-```
-1. 从共享存储读取DSGResourceData
-2. 决定代码生成器版本
-3. 按条件拆分Job（Server + AdminUI）
-4. 每个Job调用DSG Runner执行
-5. Job完成后复制产物到 BUILD_ARTIFACTS_BASE_FOLDER/{resourceId}/{buildId}
-6. 所有Job成功后发送 CODE_GENERATION_SUCCESS_TOPIC
-```
+function shouldReload(build: Build): boolean {
+  return build?.status === EnumBuildStatus.Running;
+}
 
-### 4.6 代码生成成功回调
-
-**代码位置**: [build.service.ts#L450-L495](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L450-L495)
-
-```
-1. 标记 GENERATE_APPLICATION 步骤为 Success
-2. 发送 USER_BUILD_TOPIC Kafka事件（含产物元数据）
-3. 触发 saveToGitProvider（推送代码到Git）
+// GET_BUILD查询包含Build+Action+Steps+Logs
+useEffect(() => {
+  if (!shouldReload(data?.build)) {
+    stopPolling();
+  } else {
+    startPolling(POLL_INTERVAL);
+  }
+  // 实时更新commitUtils中的build状态
+  data && commitUtils.updateBuildStatus(data.build);
+}, [data]);
 ```
 
-### 4.7 Push to Git / Preview PR 流程
+### 6.2 Commit 状态聚合
 
-**代码位置**: [build.service.ts#L1130-L1342](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L1130-L1342)
+**文件**: `packages/amplication-client/src/VersionControl/hooks/useCommitStatus.ts`
 
-**两种模式**:
+```typescript
+// 基于所有Build状态聚合Commit状态
+const commitStatus = useMemo(() => {
+  if (!commitBuilds?.length) return;
+  const buildsInProgress = commitBuilds.some(b => b.status === Running);
+  const buildsFailed = commitBuilds.some(b => b.status === Failed);
+  const buildsCompleted = commitBuilds.some(b => b.status === Completed);
 
-#### 模式A: Demo/Preview 仓库 (`useDemoRepo=true`)
-- **触发条件**: `project.useDemoRepo === true`
-- **PR标题**: `"Preview PR from Amplication"`
-- **PR内容**: 使用 `PREVIEW_PR_BODY` 模板，包含引导用户连接自己仓库的说明
-- **Git配置**: 使用配置的 GITHUB_DEMO_REPO_ORGANIZATION_NAME 和 demoRepoName
-- **模板定义**: [build.service.ts#L210](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L210)
+  if (buildsInProgress) return Running;   // 任一进行中 → Running
+  if (buildsFailed) return Failed;         // 任一失败 → Failed
+  if (buildsCompleted) return Completed;   // 全部完成 → Completed
+}, [commitBuilds]);
 
-#### 模式B: 用户自有仓库
-- **触发条件**: 资源已配置 gitRepository
-- **PR标题**: `"{commit.message} (Amplication build {buildId后8位})"`
-- **PR内容**: 包含Build链接和提交消息
-- **Git配置**: 使用用户配置的仓库信息
-
-#### 公共流程
-```
-1. 创建 PUSH_TO_GIT_PROVIDER 步骤 (Running)
-2. 组装 CreatePrRequest
-   ├── git组织/仓库名
-   ├── 基础分支
-   ├── commit标题/内容
-   ├── newBuildId / oldBuildId（用于增量diff）
-   ├── gitResourceMeta（serverPath/adminUIPath）
-   ├── isBranchPerResource
-   └── overrideCustomizableFilesInGit
-3. 发送Kafka消息: CREATE_PR_REQUEST_TOPIC
+// 获取Commit最后一条错误信息
+const commitLastError = useMemo(() => {
+  if (commitStatus !== Failed) return;
+  const failedBuild = commitBuilds.find(b => b.status === Failed);
+  const failedStep = failedBuild?.action.steps.find(s => s.status === Failed);
+  const failedLog = failedStep?.logs.find(l => l.level === Error);
+  return failedLog?.message;
+}, [commitBuilds, commitStatus]);
 ```
 
-### 4.8 Git推送成功/失败回调
+### 6.3 Last Commit 展示
 
-**成功回调**: [build.service.ts#L851-L915](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L851-L915)
-```
-1. 获取本Commit的变更列表(PendingChange)
-2. 若有变更，更新 Build 统计: linesOfCodeAdded/Deleted, filesChanged
-3. 记录日志: GitHub PR URL, diffStat
-4. 标记 PUSH_TO_GIT_PROVIDER 步骤 Success
-5. 更新 Build 状态: status=Completed, gitStatus=Completed
-6. 上报计费: BillingFeature.CodePushToGit
+**文件**: `packages/amplication-client/src/VersionControl/LastCommit.tsx`
+
+位于 Workspace Footer，展示最近一次 Commit 的状态：
+
+- **状态图标**: `CommitBuildsStatusIcon` - Running显示旋转加载器，其他显示对应图标
+- **错误展示**: 若有错误，显示红色错误文本 + "View details" 链接
+- **Git链接**: 单Build时直接显示 `BuildGitLink` 按钮，多Build时显示 "View code (multiple builds)" 按钮
+- **Commit ID**: 可点击跳转到 Commits 页面
+
+### 6.4 Build 状态图标与样式映射
+
+**文件**: `packages/amplication-client/src/VersionControl/constants.ts`
+
+```typescript
+// 图标映射
+BUILD_STATUS_TO_ICON = {
+  Completed: "check",
+  Failed: "close",
+  Invalid: "circle_loader",
+  Running: "",          // 显示CircularProgress
+  Canceled: "",
+  Unknown: "",
+};
+
+// 颜色映射
+BUILD_STATUS_TO_COLOR = {
+  Completed: ThemeGreen,
+  Failed: ThemeRed,
+  Invalid: ThemeRed,
+  Running: White,
+  Canceled: Black20,
+  Unknown: White,
+};
+
+// 步骤状态样式
+STEP_STATUS_TO_STYLE = {
+  Waiting:  { style: Warning,  icon: "refresh_cw" },
+  Running:  { style: Warning,  icon: "refresh_cw" },
+  Failed:   { style: Negative, icon: "info_i" },
+  Success:  { style: Positive, icon: "check" },
+};
 ```
 
-**失败回调**: [build.service.ts#L917-L968](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L917-L968)
-```
-1. 记录资源同步错误消息
-2. 标记 PUSH_TO_GIT_PROVIDER 步骤 Failed
-3. 更新 Build 状态: status=Failed, gitStatus=Failed
-4. 上报分析事件: EnumEventType.GitSyncError
+### 6.5 Git PR 链接提取
+
+**文件**: `packages/amplication-client/src/VersionControl/useBuildGitUrl.tsx`
+
+```typescript
+// 从PUSH_TO_GIT_*步骤的log meta中提取githubUrl
+const PUSH_TO_GIT_STEP_NAME = "PUSH_TO_";
+
+const gitUrl = useMemo(() => {
+  const stepGithub = build?.action?.steps?.find((step) =>
+    step.name.startsWith(PUSH_TO_GIT_STEP_NAME)
+  );
+  const log = stepGithub?.logs?.find(
+    (log) => !isEmpty(log.meta) && !isEmpty(log.meta.githubUrl)
+  );
+  return log?.meta?.githubUrl || null;
+}, [build?.action]);
+
+// 根据URL判断Git平台并显示按钮标题
+const gitPrTitle = useMemo(() => {
+  if (gitUrl?.includes("github"))   return `View code (PR #${prNumber})`;
+  if (gitUrl?.includes("gitlab"))   return `View code (MR #${prNumber})`;
+  if (gitUrl?.includes("bitbucket"))return `View code (PR #${prNumber})`;
+  if (gitUrl?.includes("azure"))    return `View code (PR #${prNumber})`;
+  return "View code";
+}, [gitUrl]);
 ```
 
-### 4.9 代码生成失败回调
+### 6.6 CommitResourceListItem - 构建列表项
 
-**代码位置**: [build.service.ts#L511-L534](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts#L511-L534)
+**文件**: `packages/amplication-client/src/VersionControl/CommitResourceListItem.tsx`
+
+每个 Build 在 Commit 详情页中的展示项：
+
 ```
-1. 写入错误日志
-2. 标记 GENERATE_APPLICATION 步骤 Failed
-3. 更新 Build 状态: status=Failed, gitStatus=Canceled
+┌──────────────────────────────────────────────────────────────────┐
+│  [状态图标] Build ID [截断ID]   资源名称  [代码生成器图标]   >  │
+│  [变更数 N changes]    [步骤最后一条日志]   [View code (PR #123)] │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- 使用 `useBuildWatchStatus` 实时更新状态
+- 失败时显示红色 "Error. See logs for details"
+- 变更数量链接跳转到 Changes 对比页面
+- 整个卡片可点击跳转到 Build 详情页
+
+### 6.7 BuildPage - 构建详情页
+
+**文件**: `packages/amplication-client/src/VersionControl/BuildPage.tsx`
+
+Build 详情页展示完整的执行日志：
+
+```
+┌─ Header ──────────────────────────────────────────────────────┐
+│ ← Return to Commit [commitId]                                  │
+│ [资源图标] 资源名称    Commit [commitId]         [View code PR] │
+└────────────────────────────────────────────────────────────────┘
+┌─ ActionLog ───────────────────────────────────────────────────┐
+│ ┌─ Step 1: ADD_TO_QUEUE (✓ Success) ───────────────────────┐  │
+│ │ • Create build generation task                            │  │
+│ │ • Build version: abc12345                                 │  │
+│ └───────────────────────────────────────────────────────────┘  │
+│ ┌─ Step 2: GENERATE_APPLICATION (✓ Success) ───────────────┐  │
+│ │ ...生成日志...                                             │  │
+│ └───────────────────────────────────────────────────────────┘  │
+│ ┌─ Step 3: PUSH_TO_GIT_Github (✓ Success) ─────────────────┐  │
+│ │ • PR was successfully created at https://github.com/...   │  │
+│ └───────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+- `ActionLog` 组件垂直展示所有步骤及日志
+- 每个步骤有状态图标（等待/运行中/成功/失败）
+- 步骤按时间顺序展开，支持动态高度调整
+
+### 6.8 CommitsPage & CommitPage
+
+**文件**: `packages/amplication-client/src/VersionControl/CommitsPage.tsx`
+**文件**: `packages/amplication-client/src/VersionControl/CommitPage.tsx`
+
+- **CommitsPage**: 左侧显示 Commit 历史列表（按时间倒序），右侧显示当前选中 Commit 的 Build 列表
+- **CommitPage**: 显示单个 Commit 的所有 Build 资源列表
+- 路由结构: `/{workspace}/{project}/commits/{commitId}/builds/{buildId}`
+
+---
+
+## 状态枚举汇总
+
+### EnumBuildStatus (Build整体状态)
+
+| 值 | 含义 | 前端颜色 | 前端图标 |
+|----|------|----------|----------|
+| Running | 构建进行中 | White | 旋转加载器 |
+| Completed | 构建完成 | ThemeGreen | check |
+| Failed | 构建失败 | ThemeRed | close |
+| Invalid | 构建无效 | ThemeRed | circle_loader |
+| Canceled | 构建已取消 | Black20 | 无 |
+| Unknown | 状态未知 | White | 无 |
+
+### EnumBuildGitStatus (Git同步状态)
+
+| 值 | 含义 |
+|----|------|
+| NotConnected | 未连接Git仓库 |
+| Waiting | 等待Git同步 |
+| Completed | Git同步完成 |
+| Failed | Git同步失败 |
+| Canceled | Git同步已取消 |
+| Unknown | 状态未知 |
+
+### EnumActionStepStatus (步骤状态)
+
+| 值 | 含义 | 样式 | 图标 |
+|----|------|------|------|
+| Waiting | 等待执行 | Warning | refresh_cw |
+| Running | 执行中 | Warning | refresh_cw |
+| Failed | 执行失败 | Negative | info_i |
+| Success | 执行成功 | Positive | check |
+
+### EnumCommitStrategy (提交策略)
+
+| 值 | 含义 | 适用场景 |
+|----|------|----------|
+| All | 所有资源 | 单服务时默认 |
+| AllWithPendingChanges | 仅含变更的资源 | 有变更时默认 |
+| Specific | 指定资源ID | 多服务无变更时用户选择 |
+
+---
+
+## 关键 Kafka Topic 清单
+
+| Topic | 生产者 | 消费者 | 触发时机 |
+|-------|--------|--------|----------|
+| `CODE_GENERATION_REQUEST_TOPIC` | BuildService | BuildRunnerService | Build.create()中generate()时 |
+| `CODE_GENERATION_SUCCESS_TOPIC` | BuildRunnerService | BuildService | 所有子Job代码生成成功 |
+| `CODE_GENERATION_FAILURE_TOPIC` | BuildRunnerService | BuildService | 任一子Job代码生成失败 |
+| `CREATE_PR_REQUEST_TOPIC` | BuildService | GitSyncManager | saveToGitProvider()组装PR请求后 |
+| `CREATE_PR_SUCCESS_TOPIC` | GitSyncManager | BuildService | PR创建成功 |
+| `CREATE_PR_FAILURE_TOPIC` | GitSyncManager | BuildService | PR创建失败 |
+| `USER_BUILD_TOPIC` | BuildService | 下游服务 | 代码生成成功后产物通知 |
+| `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | BuildService | 插件服务 | 有私有插件时 |
+| `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC` | 插件服务 | BuildService | 私有插件下载成功 |
+| `DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC` | 插件服务 | BuildService | 私有插件下载失败 |
+
+---
+
+## Build 完整状态流转
+
+```
+                    BuildService.create()
+                            │
+                            ▼
+              ┌─────────────────────────────┐
+              │  status: Running             │
+              │  gitStatus: Waiting          │
+              └──────────────┬───────────────┘
+                             │
+              代码生成失败？ / \ 代码生成成功？
+               (handleCodeGenerationFailure) (handleCodeGenerationSuccess)
+                      │                  │
+                      ▼                  ▼
+           ┌──────────────┐    ┌──────────────────────┐
+           │ status:      │    │ 触发 saveToGitProvider│
+           │ Failed       │    │ 创建PUSH步骤(Running) │
+           │ gitStatus:   │    └──────────┬───────────┘
+           │ Canceled     │               │
+           └──────────────┘       PR失败？/ \ PR成功？
+                                     (handleCreatePrFailure) (handleCreatePrSuccess)
+                                           │          │
+                                           ▼          ▼
+                                  ┌────────────┐ ┌──────────────┐
+                                  │ status:    │ │ status:      │
+                                  │ Failed     │ │ Completed    │
+                                  │ gitStatus: │ │ gitStatus:   │
+                                  │ Failed     │ │ Completed    │
+                                  └────────────┘ └──────────────┘
 ```
 
 ---
 
-## 5. 完整状态流转图
+## 核心服务职责清单
 
-### 5.1 Build 状态流转
-
-```
-创建Build
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  status: Running                         │
-│  gitStatus: Waiting                      │
-└────────────────┬────────────────────────┘
-                 │
-         代码生成成功?
-            /        \
-          否          是
-          │           │
-          ▼           ▼
-┌────────────┐  ┌───────────────────┐
-│status:     │  │  开始Push to Git   │
-│Failed      │  └─────────┬─────────┘
-│gitStatus:  │            │
-│Canceled    │      Git推送成功?
-└────────────┘         /     \
-                      否      是
-                      │       │
-                      ▼       ▼
-              ┌──────────┐ ┌──────────────┐
-              │status:   │ │status:       │
-              │Failed    │ │Completed     │
-              │gitStatus:│ │gitStatus:    │
-              │Failed    │ │Completed     │
-              └──────────┘ └──────────────┘
-```
-
-### 5.2 ActionStep 状态流转
-
-```
-                     createStep()
-                         │
-                         ▼
-                  ┌───────────┐
-                  │  Waiting  │
-                  └─────┬─────┘
-                        │
-                  stepFunction执行
-                        │
-                        ▼
-                  ┌───────────┐
-                  │  Running  │
-                  └─────┬─────┘
-                        │
-              执行成功? /     \ 执行失败?
-                    是 /       \ 否
-                      ▼         ▼
-               ┌─────────┐  ┌────────┐
-               │ Success │  │ Failed │
-               └─────────┘  └────────┘
-               (设置completedAt)
-```
-
----
-
-## 6. 关键服务文件索引
-
-| 服务 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| BuildService | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.service.ts) | 构建创建、代码生成触发、Git推送、状态更新 |
-| ActionService | [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/action/action.service.ts) | 步骤创建、执行、状态管理、日志记录 |
-| CommitService | [commit.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/commit/commit.service.ts) | 提交查询、变更列表获取 |
-| UserActionService | [userAction.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/userAction/userAction.service.ts) | 用户操作创建、状态评估、元数据更新 |
-| BuildRunnerService | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts) | Job执行、产物复制、成功/失败事件发送 |
-| BuildJobsHandlerService | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts) | Build拆分Job、Job状态聚合（Redis） |
-| BuildResolver | [build.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/build/build.resolver.ts) | GraphQL查询接口、状态动态计算、archiveURI解析 |
-| CommitResolver | [commit.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/51-amplication/packages/amplication-server/src/core/commit/commit.resolver.ts) | Commit/Changes GraphQL查询接口 |
-
----
-
-## 7. 关键 Kafka Topic
-
-| Topic | 生产者 | 消费者 | 说明 |
-|-------|--------|--------|------|
-| `CODE_GENERATION_REQUEST_TOPIC` | BuildService | BuildRunnerService | 请求代码生成 |
-| `CODE_GENERATION_SUCCESS_TOPIC` | BuildRunnerService | BuildService | 代码生成成功 |
-| `CODE_GENERATION_FAILURE_TOPIC` | BuildRunnerService | BuildService | 代码生成失败 |
-| `CREATE_PR_REQUEST_TOPIC` | BuildService | GitSyncManager | 请求创建PR |
-| `USER_BUILD_TOPIC` | BuildService | 下游服务 | 用户构建事件（产物通知） |
-| `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | BuildService | 插件服务 | 请求下载私有插件 |
+| 服务 | 所在包 | 核心职责 |
+|------|--------|----------|
+| ProjectResolver | amplication-server | GraphQL commit mutation入口，授权校验 |
+| ProjectService | amplication-server | Commit创建完整流程：计费校验→变更获取→版本创建→Build创建 |
+| BuildService | amplication-server | Build CRUD、代码生成触发、Git推送、状态更新、Kafka回调处理 |
+| ActionService | amplication-server | Action/ActionStep/ActionLog CRUD，步骤执行引擎run() |
+| CommitService | amplication-server | Commit查询、变更列表(PendingChange)聚合 |
+| CommitResolver | amplication-server | Commit/Changes GraphQL查询接口 |
+| BuildResolver | amplication-server | Build GraphQL查询接口，archiveURI/status动态计算 |
+| BuildRunnerService | amplication-build-manager | 代码生成Job执行、产物复制、状态聚合 |
+| BuildJobsHandlerService | amplication-build-manager | Build拆分子Job、Redis状态存储与聚合 |
+| UserActionService | amplication-server | 用户操作状态评估、元数据更新 |
