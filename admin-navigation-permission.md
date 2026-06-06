@@ -65,10 +65,12 @@ export interface RouteDef {
   iconName?: string;      // 导航图标
   tabRoutes?: RouteDef[]; // 子 Tab 路由
   isAnalytics?: boolean;  // 是否埋点
-  permission?: boolean;   // 是否需要权限
+  permission?: boolean;   // 仅控制是否需要登录认证（非细粒度权限）
   // ...
 }
 ```
+
+> **重要事实纠正**：`RouteDef.permission` 字段**不用于**按权限过滤 Tab 显示。它仅在 [routesUtil.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/routes/routesUtil.tsx#L69-L84) 中用于判断路由是否需要登录认证（未登录则重定向到 `/login`），属于路由级的认证门控，不是细粒度权限控制。
 
 **Settings 页面导航生成** ([WorkspaceSettingsPage.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/WorkspaceSettingsPage.tsx#L19-L60))：
 
@@ -100,6 +102,8 @@ const WorkspaceSettingsPage: React.FC<Props> = ({ match, tabRoutes, tabRoutesDef
   );
 };
 ```
+
+> **重要事实纠正**：Settings 页面的子标签（Users、Teams、Roles、Properties、API Tokens）**不按权限过滤**。`useTabRoutes` Hook ([useTabRoutes.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Layout/useTabRoutes.ts#L9-L42)) 仅做路由配置到 TabItem 的纯映射（`tabRoutes?.map(...)`），没有调用任何 `canPerformTask()` 或权限过滤逻辑。所有已登录用户都能看到全部 Settings 子标签，权限过滤仅发生在标签页内部的操作按钮级别。
 
 ### 2.3 前端权限可见性控制
 
@@ -321,6 +325,39 @@ export class GqlAuthGuard extends AuthGuard("jwt") {
 }
 ```
 
+> **重要事实纠正**：`if (!parameters) return Promise.resolve(true)` 是后端授权的**第一个也是最大的例外分支**。只要 Resolver 方法上没有添加 `@AuthorizeContext` 装饰器，守卫就会直接放行，跳过所有工作区归属校验和权限校验。
+
+### 4.2.1 无装饰器的例外 Resolver 方法清单
+
+以下关键方法**没有** `@AuthorizeContext` 装饰器，仅依赖 JWT 认证即放行：
+
+**WorkspaceResolver** ([workspace.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts))：
+
+| 方法 | 类型 | 说明 | 数据来源 |
+|------|------|------|---------|
+| `currentWorkspace()` | Query | 获取当前工作区 | 直接从 JWT Token 的 `user.workspace` 返回，不查数据库 |
+| `workspaceMembers()` | Query | 获取工作区成员列表 | 用 `currentUser.workspace.id` 查询，无额外权限校验 |
+| `workspaceUsers()` | Query | 获取工作区用户列表 | 用 `currentUser.workspace.id` 查询，无额外权限校验 |
+| `createWorkspace()` | Mutation | 创建新工作区 | 无工作区归属校验（新建操作），内部逻辑自行校验 |
+| `provisionSubscription()` | Mutation | 配置订阅 | 无装饰器 |
+| `redeemCoupon()` | Mutation | 兑换优惠券 | 仅有 `@UseGuards(GqlAuthGuard)`，无 `@AuthorizeContext` |
+| `projects` (ResolveField) | ResolveField | 工作区下的项目列表 | 用 `@Parent() workspace.id` 查询，由父级查询的授权保证 |
+| `subscription` (ResolveField) | ResolveField | 工作区订阅信息 | 同上 |
+| `gitOrganizations` (ResolveField) | ResolveField | 工作区 Git 组织 | 同上 |
+
+**AuthResolver** ([auth.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/auth/auth.resolver.ts))：
+
+| 方法 | 类型 | 装饰器 | 说明 |
+|------|------|--------|------|
+| `me()` | Query | `@UseGuards(GqlAuthGuard)` 但无 `@AuthorizeContext` | 直接返回当前用户 |
+| `permissions()` | Query | 同上 | 直接返回 `user.permissions`（来自 JWT） |
+| `resourcePermissions()` | Query | 同上 | 仅有 GqlAuthGuard，无来源参数校验 |
+| `userApiTokens()` | Query | 同上 | 用 `user.id` 查询 |
+| `changePassword()` | Mutation | 同上 | 用 `user.account` |
+| `setCurrentWorkspace()` | Mutation | 同上 | 切换工作区，需重新生成 Token，内部自行校验 |
+| `completeInvitation()` | Mutation | 同上 | 完成邀请，内部自行校验 |
+| `signup()` / `login()` / `signupWithBusinessEmail()` | Mutation | **连 `@UseGuards(GqlAuthGuard)` 都没有** | 匿名访问的认证端点 |
+
 ### 4.3 @AuthorizeContext 装饰器
 
 **装饰器定义** ([authorizeContext.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/decorators/authorizeContext.decorator.ts#L21-L37))：
@@ -366,19 +403,40 @@ async inviteUser(@UserEntity() currentUser: User, @Args() args: InviteUserArgs):
 
 ### 4.4 AuthorizableOriginParameter：可授权的资源类型
 
-[AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts#L7-L34) 定义了 **33 种** 可授权参数类型，每种类型都有对应的数据库验证函数：
+> **重要事实纠正**：枚举实际定义了 **26 种**（索引 0~25）可授权参数类型，不是 33 种。每种类型都有对应的数据库验证函数。
 
-| 参数类型 | 验证逻辑 | 返回字段 |
-|---------|---------|---------|
-| `None` | 直接放行 | - |
-| `WorkspaceId` | `originId === workspace.id` | - |
-| `ProjectId` | 检查项目是否属于当前工作区 | `requestedProjectId` |
-| `ResourceId` | 检查资源（未删除/未归档）是否属于当前工作区的项目 | `requestedResourceId` |
-| `TeamId` / `RoleId` / `BlueprintId` | 检查是否属于当前工作区 | - |
-| `EntityId` / `BlockId` / `BuildId` | 通过 resource 关联到工作区 | `requestedResourceId` |
-| `CommitId` | 通过 project 关联到工作区 | `requestedProjectId` |
-| `EntityFieldId` | 通过 entityVersion → entity → resource 关联 | `requestedResourceId` |
-| `ApiTokenId` | 检查是否属于当前用户 | - |
+[AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts#L7-L34) 完整枚举列表：
+
+| 索引 | 参数类型 | 验证逻辑 | 返回字段 |
+|-----|---------|---------|---------|
+| 0 | `None` | 直接放行，不查数据库 | - |
+| 1 | `WorkspaceId` | `originId === workspace.id` | - |
+| 2 | `ResourceId` | 检查资源（未删除/未归档）属于当前工作区的项目 | `requestedResourceId` |
+| 3 | `EntityId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 4 | `EntityFieldId` | 通过 entityVersion → entity → resource 关联 | `requestedResourceId` |
+| 5 | `EntityPermissionFieldId` | 通过 field → entityVersion → entity → resource | `requestedResourceId` |
+| 6 | `BlockId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 7 | `ResourceRoleId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 8 | `BuildId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 9 | `ResourceVersionId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 10 | `ActionId` | 通过 deployments/builds/userAction → build/resource → workspace | - |
+| 11 | `EnvironmentId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 12 | `DeploymentId` | 通过 environment → resource 关联到工作区 | - |
+| 13 | `CommitId` | 通过 project 关联到工作区 | `requestedProjectId` |
+| 14 | `ApiTokenId` | 检查是否属于当前用户（非 workspace） | - |
+| 15 | `GitOrganizationId` | 检查是否属于当前工作区 | - |
+| 16 | `GitRepositoryId` | 仅检查记录存在，不限定 workspace | - |
+| 17 | `InvitationId` | 检查是否属于当前工作区 | - |
+| 18 | `ProjectId` | 检查项目（未删除）属于当前工作区 | `requestedProjectId` |
+| 19 | `UserActionId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 20 | `OutdatedVersionAlertId` | 通过 resource 关联到工作区 | `requestedResourceId` |
+| 21 | `TeamId` | 检查团队（未删除）属于当前工作区 | - |
+| 22 | `CustomPropertyId` | 检查属性（未删除）属于当前工作区 | - |
+| 23 | `BlueprintId` | 检查蓝图（未删除）属于当前工作区 | - |
+| 24 | `RoleId` | 检查角色（未删除）属于当前工作区 | - |
+| 25 | `UserId` | 检查用户是否属于当前工作区 | - |
+
+> **额外发现**：`GitRepositoryId` (索引16) 的验证函数仅 `prisma.gitRepository.count({ where: { id: originId } })`，**没有限定 workspaceId**，这是一个潜在的安全漏洞（跨工作区可以访问任意仓库 ID）。
 
 **验证函数实现** ([validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L30-L508))：
 
@@ -415,15 +473,44 @@ const checkByResourceParameters = (originId: string, workspaceId: string) => ({
 
 **权限验证流程** ([permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/permissions.service.ts#L18-L210))：
 
+> **重要事实纠正**：`validateAccess` 中存在多个例外分支，并非所有请求都会执行完整的工作区归属校验。
+
 ```
 validateAccess(user, originType, originId, requiredPermissions)
         │
+        ├─── 例外分支 1: originId 为空且 originType !== None
+        │       │
+        │       ▼
+        │     return false ❌  （缺少必要的资源 ID，直接拒绝）
+        │       │  代码: if (!originId && originType !== AuthorizableOriginParameter.None) { return false; }
+        │
         ▼
 Step 1: VALIDATION_FUNCTIONS[originType]()  →  检查资源归属
-        │  canAccessWorkspace = false ?  →  直接拒绝
-        │  提取 requestedResourceId / requestedProjectId
+        │
+        ├─── 例外分支 2: originType === None
+        │       │
+        │       ▼
+        │     VALIDATION_FUNCTIONS[None]()  →  直接返回 { canAccessWorkspace: true }
+        │       │  不执行任何数据库查询，无条件放行归属校验
+        │       │
+        │       ▼
+        │     跳到 Step 2（仅校验权限，不校验归属）
+        │
+        ├─── 例外分支 3: GitRepositoryId (索引16)
+        │       │
+        │       ▼
+        │     仅 count({ where: { id: originId } })，不限定 workspaceId
+        │       │  可能存在跨工作区访问漏洞
+        │
+        └─── 常规分支: 其他 23 种类型
+                │
+                ▼
+              校验资源是否属于 user.workspace.id
+                │  canAccessWorkspace = false ?  →  直接拒绝 ❌
+                │  提取 requestedResourceId / requestedProjectId
+                │
         ▼
-validatePermissions(user, requiredPermissions, resourceId, projectId)
+Step 2: validatePermissions(user, requiredPermissions, resourceId, projectId)
         │
         ├─── 无 requiredPermissions ?  →  放行 ✅
         │
@@ -443,6 +530,39 @@ validatePermissions(user, requiredPermissions, resourceId, projectId)
 **核心代码**：
 
 ```typescript
+async validateAccess(
+  user: AuthUser,
+  originType: AuthorizableOriginParameter,
+  originId: string | undefined,
+  requiredPermissions: RolesPermissions[] | RolesPermissions | undefined
+): Promise<boolean> {
+  const { workspace } = user;
+
+  // 例外分支 1: originId 为空且类型不是 None → 直接拒绝
+  if (!originId && originType !== AuthorizableOriginParameter.None) {
+    return false;
+  }
+
+  // Step 1: 资源归属校验
+  let validateAccessResult = await VALIDATION_FUNCTIONS[originType](
+    this.prismaService,
+    originId,
+    workspace.id
+  );
+
+  if (!validateAccessResult.canAccessWorkspace) {
+    return false;
+  }
+
+  // Step 2: 权限校验
+  return this.validatePermissions(
+    user,
+    Array.isArray(requiredPermissions) ? requiredPermissions : requiredPermissions ? [requiredPermissions] : undefined,
+    validateAccessResult.requestedResourceId,
+    validateAccessResult.requestedProjectId
+  );
+}
+
 async validatePermissions(
   user: AuthUser,
   requiredPermissions: RolesPermissions[] | undefined,
@@ -582,17 +702,26 @@ private matchPermissions(permissionsToMatch: string[], userPermissions: string[]
 
 ## 6. 关键设计洞察
 
-### 6.1 前端可见性 ≠ 后端安全
+### 6.1 前端可见性 ≠ 后端安全，但两端都不完整
 
-- **前端**：`canPerformTask()` 仅控制 UI 可见性，是 UX 优化手段
-- **后端**：`GqlAuthGuard` + `@AuthorizeContext` 是真正的安全边界，每个 GraphQL 操作都独立校验
-- 即使前端绕过 UI 限制直接发起 GraphQL 请求，后端仍会拒绝未授权操作
+- **前端**：`canPerformTask()` 仅控制 UI 按钮可见性，是 UX 优化手段。Settings 的 Tab 导航、RolesPage、TeamsPage 等页面级容器组件**均不做权限过滤**，所有已登录用户均可访问
+- **后端**：`GqlAuthGuard` + `@AuthorizeContext` 是安全边界，但**并非每个 GraphQL 操作都独立校验**——有 16+ 个 Resolver 方法未加 `@AuthorizeContext` 装饰器，直接放行（详见 4.2.1 节）
+- 即使前端绕过 UI 限制直接发起 GraphQL 请求，对于添加了装饰器的方法，后端仍会拒绝未授权操作
 
-### 6.2 工作区作为授权锚点
+### 6.2 工作区作为授权锚点（但存在多处例外）
 
-- 所有资源（Project、Resource、Entity、Role、Team 等）都必须归属于某个 Workspace
-- 授权的第一步永远是 **验证目标资源是否属于当前用户的 active workspace**
-- 这通过 `AuthorizableOriginParameter` + `VALIDATION_FUNCTIONS` 实现，杜绝跨工作区访问
+- **原则**：所有资源（Project、Resource、Entity、Role、Team 等）都必须归属于某个 Workspace，授权的第一步是验证目标资源是否属于当前用户的 active workspace
+- **实现机制**：通过 `AuthorizableOriginParameter` + `VALIDATION_FUNCTIONS` 实现
+- **存在的例外分支**（完整清单）：
+
+| 例外类型 | 触发条件 | 结果 | 安全影响 |
+|---------|---------|------|---------|
+| 无装饰器放行 | Resolver 方法无 `@AuthorizeContext` | 跳过全部校验，直接放行 | `currentWorkspace`、`workspaceMembers`、`workspaceUsers`、`permissions`、`me`、`setCurrentWorkspace` 等方法不受保护 |
+| `AuthorizableOriginParameter.None` | 装饰器参数为 None（如创建操作） | VALIDATION_FUNCTIONS 直接返回 `canAccessWorkspace: true`，不查数据库 | 仅校验权限字符串，不校验资源归属（符合预期，因为新建操作没有资源） |
+| originId 为空且类型 ≠ None | `parameterPath` 解析出的 ID 为 `undefined` | `validateAccess` 直接返回 `false` | 保护性拒绝，属于安全加固 |
+| `GitRepositoryId` | 来源参数类型为 GitRepositoryId | 仅 `count({ where: { id } })`，不限定 `workspaceId` | ⚠️ **潜在漏洞**：可跨工作区访问任意仓库 ID |
+| `ApiTokenId` | 来源参数类型为 ApiTokenId | 校验 `userId === currentUser.id`，不校验 workspace | 按用户维度隔离，非 workspace 维度（符合 API Token 的用户私有语义） |
+| `ResolveField` | 父级查询的字段解析器 | 依赖父级查询的授权结果，自身无装饰器 | 由父级 Query/Mutation 的装饰器保证安全性 |
 
 ### 6.3 三级权限模型
 
@@ -607,7 +736,8 @@ private matchPermissions(permissionsToMatch: string[], userPermissions: string[]
 后端使用装饰器 `@AuthorizeContext(OriginType, paramPath, permissions)` 声明式定义授权规则，与业务逻辑解耦：
 
 - **优点**：Resolver 代码纯净、授权逻辑统一、易审计
-- **不足**：需要确保每个需要保护的 Resolver 方法都正确添加了装饰器（目前有 34 个 resolver 文件使用）
+- **不足**：需要确保每个需要保护的 Resolver 方法都正确添加了装饰器——目前至少有 16+ 个方法（WorkspaceResolver 和 AuthResolver 中）未添加装饰器而直接放行，这是授权的主要盲区
+- **风险点**：新增 Resolver 方法时遗漏装饰器会导致该方法完全不受授权保护，且无任何编译时或运行时告警
 
 ---
 
@@ -619,14 +749,18 @@ private matchPermissions(permissionsToMatch: string[], userPermissions: string[]
 | | [WorkspaceHeader.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/WorkspaceHeader/WorkspaceHeader.tsx) | 顶部导航栏 |
 | | [WorkspaceNavigation.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/WorkspaceHeader/WorkspaceNavigation.tsx) | 面包屑导航 |
 | | [WorkspaceSettingsPage.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/WorkspaceSettingsPage.tsx) | 设置页侧边导航 |
+| | [useTabRoutes.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Layout/useTabRoutes.ts) | 路由配置→TabItem 的纯映射（无权限过滤） |
 | | [appRoutes.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/routes/appRoutes.tsx) | 路由配置（驱动导航生成） |
+| | [routesUtil.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/routes/routesUtil.tsx) | `RouteDef.permission` 仅控制登录认证，不做细粒度权限 |
 | **前端权限** | [usePermissions.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/hooks/usePermissions.ts) | 权限 Hook |
 | | [appContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/context/appContext.tsx) | 全局上下文定义 |
 | | [workspaceQueries.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-client/src/Workspaces/queries/workspaceQueries.ts) | GraphQL 查询 |
-| **后端授权** | [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts) | GraphQL 守卫 |
+| **后端授权** | [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts) | GraphQL 守卫，含无装饰器放行的例外分支 |
 | | [authorizeContext.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/decorators/authorizeContext.decorator.ts) | 授权装饰器 |
-| | [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/permissions.service.ts) | 权限验证服务 |
-| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | 来源参数验证 |
-| | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | 可授权参数枚举 |
-| | [auth/types.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/auth/types.ts) | AuthUser 类型 |
+| | [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/permissions.service.ts) | 权限验证服务，含 3 个 validateAccess 例外分支 |
+| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | 26 种来源参数验证函数（含 GitRepositoryId 潜在漏洞） |
+| | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | 26 种可授权参数枚举 |
+| | [workspace.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts) | 9 个无 @AuthorizeContext 装饰器的方法 |
+| | [auth.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/auth/auth.resolver.ts) | 7+ 个无 @AuthorizeContext 装饰器的方法 |
+| | [auth/types.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/packages/amplication-server/src/core/auth/types.ts) | AuthUser 类型（含 workspace + permissions[]） |
 | **共享类型** | [roles-permissions.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/48-amplication/libs/util/roles-types/src/lib/roles-permissions.types.ts) | 权限字符串定义 |
