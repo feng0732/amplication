@@ -296,7 +296,309 @@ Blueprint 的 `codeGeneratorName` 仅作为**校验约束**存在——更新 Bl
 
 ---
 
-## 八、涉及的核心文件清单
+## 九、CodeEngineVersion 合并的异步执行顺序深度分析
+
+### 9.1 代码位置
+
+模板升级的核心逻辑在 [serviceTemplate.service.ts#L498-L599](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L498-L599) 的 `upgradeServiceToLatestTemplateVersion()` 方法中。
+
+### 9.2 期望的执行流程（设计意图）
+
+```typescript
+// 步骤 A: 收集所有异步操作
+const createdPromises = changes.createdBlocks.map(...);   // 新增的 Blocks
+const deletedPromises = changes.deletedBlocks.map(...);   // 删除的 Blocks
+const updatedPromises = changes.updatedBlocks.map(...);   // 更新的 Blocks ← 含 CodeEngineVersion
+
+// 步骤 B: 等待所有合并操作完成
+await Promise.all([...createdPromises, ...deletedPromises, ...updatedPromises]);
+
+// 步骤 C: 更新 ResourceTemplateVersion Block（标记资源已升级到新版本）
+await this.resourceTemplateVersionService.updateResourceTemplateVersion(...);
+
+// 步骤 D: 将升级提示标记为 Resolved
+await this.outdatedVersionAlertService.resolvesServiceTemplateUpdated(...);
+```
+
+**设计意图是串行顺序：A → B（并行合并） → C → D**
+
+---
+
+### 9.3 实际代码中的 Bug
+
+#### Bug 1：`updatedPromises` 使用了 `forEach` 而非 `map`
+
+在 [serviceTemplate.service.ts#L575-L577](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L575-L577)：
+
+```typescript
+// ❌ 错误写法：forEach 返回 undefined
+const updatedPromises = changes.updatedBlocks.forEach(async (diff) => {
+  return this.handleMergeUpdatedBlock(resourceId, diff, user, mergeOptions);
+});
+```
+
+`Array.prototype.forEach()` 的返回值是 **`undefined`**。
+
+这意味着：
+- `updatedPromises` 的值是 `undefined`，而不是 Promise 数组
+- `changes.updatedBlocks` 中的所有异步操作（**包括 CodeEngineVersion 的更新**）被启动后，**没有任何机制等待它们完成**
+- 这些异步操作会以"失控"的方式在后台继续执行
+
+#### Bug 2：`Promise.all` 接收的是嵌套数组而非扁平数组
+
+在 [serviceTemplate.service.ts#L579](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L579)：
+
+```typescript
+// ❌ 错误写法：传入的是 [Promise[], Promise[], undefined]
+await Promise.all([createdPromises, deletedPromises, updatedPromises]);
+```
+
+这里有两层问题：
+1. `createdPromises` 和 `deletedPromises` 本身是 `Promise[]`（数组），被当作元素传入，而不是被展开
+2. `updatedPromises` 是 `undefined`
+
+`Promise.all` 的行为是：传入的可迭代对象中的每个值如果不是 Promise，会被 `Promise.resolve()` 包装后立即 resolve。
+
+所以 `Promise.all([createdPromises, deletedPromises, undefined])` 实际上：
+- `Promise.resolve(createdPromises)` → 立即 resolve（因为数组不是 Promise）
+- `Promise.resolve(deletedPromises)` → 立即 resolve
+- `Promise.resolve(undefined)` → 立即 resolve
+
+**结果：`Promise.all` 几乎是立即返回的，没有任何一个实际的合并操作被等待。**
+
+---
+
+### 9.4 实际执行时序图（有 Bug 的情况）
+
+```
+用户调用 upgradeServiceToLatestTemplateVersion()
+    │
+    ├─ 步骤1: 读取资源、校验版本 ──────────────────────── ✅ 正确 await
+    │
+    ├─ 步骤2: compareResourceVersions ─────────────────── ✅ 正确 await
+    │
+    ├─ 步骤3: createdBlocks.map(async ...) ──── 启动 N 个 Promise（不等待）
+    │       ├─ handleMergeCreatedBlock(PluginInstallation)
+    │       └─ handleMergeCreatedBlock(CodeEngineVersion)
+    │
+    ├─ 步骤4: deletedBlocks.map(async ...) ──── 启动 M 个 Promise（不等待）
+    │       └─ handleMergeDeletedBlock(全部 no-op)
+    │
+    ├─ 步骤5: updatedBlocks.forEach(async ...) ─ 启动 K 个 Promise（不等待，返回 undefined）
+    │       ├─ handleMergeUpdatedBlock(PluginInstallation)
+    │       └─ handleMergeUpdatedBlock(CodeEngineVersion)
+    │              └─ resourceService.updateCodeGeneratorVersion()
+    │                     ├─ prisma.resource.update({ codeGeneratorVersion, codeGeneratorStrategy })
+    │                     └─ [如果是模板] templateCodeEngineVersionService.update()
+    │
+    ├─ 步骤6: await Promise.all([数组, 数组, undefined]) ──────── ❌ 立即返回，什么都没等
+    │
+    ├─ 步骤7: updateResourceTemplateVersion() ──────── ✅ await，此时 ResourceTemplateVersion 已更新为新版本
+    │       └─ blockService.update<ResourceTemplateVersion>({ version: latestVersion.version })
+    │
+    ├─ 步骤8: resolvesServiceTemplateUpdated() ──────── ✅ await，OutdatedVersionAlert → Resolved
+    │       └─ prisma.outdatedVersionAlert.updateMany({ status: Resolved })
+    │
+    └─ return resource ──────────────────────────────── 函数返回给用户
+                      
+          ╔══════════════════════════════════════════════════════════╗
+          ║  此时后台还在运行：                                        ║
+          ║  - PluginInstallation 的创建/更新                          ║
+          ║  - CodeEngineVersion 导致的 Resource 表字段更新            ║
+          ║  （这些操作可能成功，也可能失败，用户完全感知不到）          ║
+          ╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
+### 9.5 CodeEngineVersion 覆盖局部字段的具体时序
+
+当 CodeEngineVersion 出现在 `updatedBlocks` 中时（即模板修改了代码生成器版本），执行路径是：
+
+```
+handleMergeUpdatedBlock()
+    └─ resourceService.updateCodeGeneratorVersion()
+           ├─ billing 权限校验 ................................ (1)
+           ├─ analytics.trackWithContext() .................... (2)
+           ├─ prisma.resource.update() → 覆盖 codeGeneratorVersion
+           │    和 codeGeneratorStrategy 字段 .................. (3)
+           └─ [如果是 ServiceTemplate]
+                templateCodeEngineVersionService.update() ..... (4)
+```
+
+由于 Bug 1 + Bug 2，步骤 (3) 对 `Resource` 表字段的覆盖**发生在函数返回之后**。
+
+这造成一个**不一致窗口**：
+| 时间点 | ResourceTemplateVersion Block | Resource.codeGeneratorVersion | OutdatedVersionAlert |
+|--------|-------------------------------|-------------------------------|----------------------|
+| 升级前 | v1.0.0 | 用户自定义值（如 v2.0.0 Specific） | New |
+| 函数刚返回时 | v1.1.0 ✅ 已更新 | 用户自定义值 ❌ 尚未覆盖 | Resolved ✅ 已解决 |
+| 若干毫秒后 | v1.1.0 | v1.1.0 对应的模板值 ✅ 被覆盖 | Resolved |
+
+**在不一致窗口内**：
+- 用户看到告警已解决、模板版本已升级
+- 但实际构建时使用的 codeGeneratorVersion 仍然是旧值
+- 如果步骤 (3) 的数据库更新失败，用户也不会收到任何错误
+
+---
+
+## 十、局部覆盖字段与升级提示状态的执行顺序分析
+
+### 10.1 涉及的四类数据变更
+
+模板升级过程中共发生四类数据写入操作，它们之间存在时序依赖：
+
+| # | 操作 | 写入位置 | 被谁触发 |
+|---|------|---------|---------|
+| ① | CodeEngineVersion 合并 → 覆盖局部字段 | `Resource` 表 `codeGeneratorVersion` / `codeGeneratorStrategy` | `handleMergeCreatedBlock` 或 `handleMergeUpdatedBlock` |
+| ② | PluginInstallation 合并 | `PluginInstallation` Block | `handleMergeCreatedBlock` 或 `handleMergeUpdatedBlock` |
+| ③ | 更新 ResourceTemplateVersion Block | `Block` 表（blockType=ResourceTemplateVersion） | `resourceTemplateVersionService.updateResourceTemplateVersion()` |
+| ④ | 告警状态 New → Resolved | `OutdatedVersionAlert` 表 | `outdatedVersionAlertService.resolvesServiceTemplateUpdated()` |
+
+### 10.2 正确的依赖关系应该是
+
+```
+① CodeEngineVersion 覆盖 Resource 字段 ──┐
+② PluginInstallation 合并 ───────────────┼── 必须全部完成
+                                          │
+                                          ▼
+                         ③ ResourceTemplateVersion 更新
+                                          │
+                                          ▼
+                         ④ OutdatedVersionAlert → Resolved
+```
+
+**理由**：
+- 只有 ①② 全部成功完成，才说明"升级"真正生效，此时才能把 ③ 中的版本号推进
+- 只有 ③ 版本号推进了，才能把 ④ 告警标记为已解决
+
+如果 ①② 中有任何一项失败，应该：
+1. 整体回滚或标记失败
+2. 不推进 ③ 中的版本号
+3. 不修改 ④ 中的告警状态
+
+---
+
+### 10.3 当前代码实际的执行顺序
+
+由于 Bug 1 和 Bug 2，**实际执行顺序变成了并行且不可预测**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 函数主流程（串行）                                            │
+│    ③ ResourceTemplateVersion 更新                            │
+│    ④ OutdatedVersionAlert → Resolved                        │
+│    return                                                    │
+└─────────────────────────────────────────────────────────────┘
+          ▲
+          │ 完全独立，不等待下面的操作
+          │
+┌─────────┴───────────────────────────────────────────────────┐
+│ 后台并发（fire-and-forget，无错误处理）                        │
+│    ① CodeEngineVersion 覆盖 Resource 字段                    │
+│    ② PluginInstallation 合并                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**竞态场景举例**：
+
+| 场景 | 结果 |
+|------|------|
+| ① 在 ③ 之前完成 | 看起来正常，但仍然是偶然的（依赖数据库延迟） |
+| ① 在 ③ 之后、④ 之前完成 | ResourceTemplateVersion 先升级，CodeEngineVersion 后写入，告警此时仍为 New，随后被 ④ 置为 Resolved |
+| ① 在 ④ 之后完成 | 用户看到告警已解决、版本已升级，但 Resource 表字段在某个时刻才被覆盖。如果构建在此刻发生，使用的是旧版本 |
+| ① 抛出异常（如数据库超时） | 异常被吞掉，用户看到升级成功，但 CodeEngineVersion 实际上从未更新 |
+| ① 和 ③ 同时写同一张 Resource 表 | 不涉及同一条记录（③ 写 Block 表，① 写 Resource 表），但存在数据一致性语义冲突 |
+
+---
+
+### 10.4 OutdatedVersionAlert.create() 的内部时序
+
+当模板发布新版本时（[outdatedVersionAlert.service.ts#L45-L73](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L45-L73)），告警创建的内部顺序是正确的：
+
+```typescript
+async create(args, alertInitiator) {
+  // 步骤 1: 先将同资源同类型的 New 告警 → Canceled
+  await this.prisma.outdatedVersionAlert.updateMany({
+    where: { resourceId, blockId, type, status: New },
+    data: { status: Canceled }
+  });
+
+  // 步骤 2: 创建新的 New 告警
+  const alert = await this.prisma.outdatedVersionAlert.create({
+    data: { ...args.data, status: New }
+  });
+
+  // 步骤 3: 发送 Kafka 通知（fire-and-forget，不等待）
+  this.raiseNotifications(alert.id, alertInitiator);  // 没有 await!
+
+  return alert;
+}
+```
+
+**注意**：`raiseNotifications()` 中的 Kafka 消息发送是 **fire-and-forget** 的——没有 `await`，失败时只打日志不抛出异常：
+
+```typescript
+// [outdatedVersionAlert.service.ts#L96-L123]
+for (const user of workspaceUsers) {
+  this.kafkaProducerService
+    .emitMessage(...)    // ❌ 没有 await
+    .catch((error) => this.logger.error(...));
+}
+```
+
+这意味着告警数据库记录创建成功后，函数立即返回，而 Kafka 通知可能仍在发送中（或发送失败）。
+
+---
+
+### 10.5 triggerAlertsForTemplateVersion 中的串行遍历
+
+在 [outdatedVersionAlert.service.ts#L222-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L222-L244)：
+
+```typescript
+for (const service of services) {
+  const currentTemplateVersion = await this.resourceService.getServiceTemplateSettings(...);
+  await this.create({...}, template.name);
+}
+```
+
+使用 `for...of` + `await` 逐个服务串行创建告警。如果有 N 个服务使用该模板，将产生 N 次数据库读取 + N 次告警创建，全部串行执行，时间复杂度为 O(N)。
+
+---
+
+## 十一、Bug 修复建议
+
+### 修复 1：将 `forEach` 改为 `map`
+
+```typescript
+// ❌ 旧代码
+const updatedPromises = changes.updatedBlocks.forEach(async (diff) => {
+  return this.handleMergeUpdatedBlock(resourceId, diff, user, mergeOptions);
+});
+
+// ✅ 修复后
+const updatedPromises = changes.updatedBlocks.map(async (diff) => {
+  return this.handleMergeUpdatedBlock(resourceId, diff, user, mergeOptions);
+});
+```
+
+### 修复 2：将嵌套数组展开传入 `Promise.all`
+
+```typescript
+// ❌ 旧代码
+await Promise.all([createdPromises, deletedPromises, updatedPromises]);
+
+// ✅ 修复后
+await Promise.all([...createdPromises, ...deletedPromises, ...updatedPromises]);
+```
+
+### 修复 3（可选增强）：使用事务保证一致性
+
+将 ①②③④ 纳入同一个数据库事务中，确保要么全部成功，要么全部回滚。当前所有操作都是独立的 `prisma.update()` / `prisma.updateMany()` 调用，没有事务包裹。
+
+---
+
+## 十二、涉及的核心文件清单
 
 | 文件 | 职责 |
 |------|------|
