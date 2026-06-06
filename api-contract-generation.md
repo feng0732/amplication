@@ -455,30 +455,58 @@ DTOs {
 
 ##### CreateDTOs Before / After 钩子的真实介入方式
 
-`CreateDTOs` 事件由 [create-dtos.ts L36-L44](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L36-L44) 中的 `createDTOModules()` 触发：
+`CreateDTOs` 事件由 [create-dtos.ts L36-L44](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L36-L44) 中的 `createDTOModules()` 触发。
+
+对照 [plugin-wrapper.ts L59-L99](file:///d:/fz/0601/solo-dogfeeding/code/44-amplication/packages/data-service-generator/src/plugin-wrapper.ts#L59-L99) 的实际执行流程：
 
 ```
 createDTOs(entities)           // 1. 先根据 Entity[] 生成 DTOs（AST 节点集合）
 getDTONameToPath(dtos)         // 2. 生成 dtoName → 文件路径映射
          │
          ▼
-pluginWrapper(
-  createDTOModulesInternal,
-  EventNames.CreateDTOs,
-  { dtos, dtoNameToPath }      // ◀─ Before 钩子在这里介入
+原始 args = { dtos, dtoNameToPath }
+         │
+         ▼
+beforeEventsPipe(原始 args)    // ◀─ Before 钩子接收原始 args，可返回修改后对象
+         │
+         ▼
+updatedEventParams             // 3. Before 钩子链式处理后的最终参数（可能是全新对象）
+         │
+         ▼
+defaultBehavior(updatedEventParams)
+  └── createDTOModulesInternal()  // 4. 用 updatedEventParams 中的 AST 编译成 Module{path, code}
+         │
+         ▼
+defaultBehaviorModules = ModuleMap   // 5. 已生成的文件集合（存的是 code 字符串，不是 AST）
+         │
+         ▼
+afterEventsPipe(
+  context,
+  原始 args,        // ◀─ 关键：After 钩子收到的是原始 args，不是 updatedEventParams
+  defaultBehaviorModules
 )
-         │
-         ▼
-createDTOModulesInternal()     // 3. 遍历 DTOs 中的所有 AST，生成 Module（文件）
-         │
-         ▼
-返回 ModuleMap                  // ◀─ After 钩子在这里介入
 ```
 
-| 钩子 | 可操作对象 | 能做什么 | 不能做什么 |
-|------|-----------|---------|-----------|
-| **Before** | `dtos`（AST 节点集合）、`dtoNameToPath`（路径映射） | 修改已有 ClassProperty 的装饰器/类型；往已有 ClassDeclaration 追加/删除 ClassProperty；往 `dtos` 中新增自定义 NamedClassDeclaration；更新路径映射 | 访问原始 Entity（参数中没有）；直接操作最终文件 |
-| **After** | `ModuleMap`（文件集合） | 修改已有文件代码；新增/替换/删除文件模块 | 访问 DTO AST（已被编译成字符串） |
+| 钩子 | 接收的 eventParams | 可操作对象 | 能做什么 | 不能做什么 / 边界 |
+|------|------------------|-----------|---------|------------------|
+| **Before** | 原始 `{ dtos, dtoNameToPath }`，返回值传递给下一个 Before 钩子，最终传给 defaultBehavior | `dtos`（AST 节点集合）、`dtoNameToPath`（路径映射） | 修改已有 ClassProperty 的装饰器/类型；往已有 ClassDeclaration 追加/删除 ClassProperty；往 `dtos` 中新增自定义 NamedClassDeclaration；返回全新的 dtos 对象替换参数 | 访问原始 Entity（参数中没有）；直接操作最终文件 |
+| **After** | **原始 `{ dtos, dtoNameToPath }`**（plugin-wrapper.ts L88 传的是原始 `args`，不是 `updatedEventParams`） | **主要是** `ModuleMap`（文件集合） | 修改已有文件代码；新增/替换/删除文件模块；通过 `moduleMap.replaceModulesCode()` 批量修改代码字符串 | **关键边界**：虽然 After 钩子能**读到** `eventParams.dtos`，但修改它**不会自动改变已生成的 ModuleMap**——因为 `defaultBehavior` 已经用 updatedEventParams 把 AST 编译成了字符串存入 ModuleMap，两者之间没有引用关系。要让 DTO AST 的修改生效，必须**手动重新编译 AST 为 code 字符串并调用 `moduleMap.set()` 覆盖**，或改用 Before 钩子修改。 |
+
+##### DTO AST 与 ModuleMap 的生效时机边界（重要）
+
+这是插件开发中最容易踩坑的点，必须明确区分：
+
+| 阶段 | 数据形态 | 存储形式 | 修改是否自动生效 |
+|------|---------|---------|---------------|
+| Before 钩子期间 | `dtos` 中的 AST 节点（NamedClassDeclaration / ClassProperty / Decorator 等） | 内存中的 `ast-types` AST 对象引用 | ✅ 自动生效——Before 钩子的返回值会直接传给 `defaultBehavior`，后续编译会用到修改后的 AST |
+| defaultBehavior 执行期间 | AST → 字符串的编译过程 | 调用 `createDTOModule()` / `createEnumDTOModule()` 将每个 AST 节点通过 TS printer 渲染为 `code: string`，封装成 Module | — |
+| After 钩子期间 | `ModuleMap` 中的 Module | `{ path: string, code: string }` 的纯数据结构，字符串里是完整的 TS 文件代码 | ✅ 通过 `moduleMap.set()` / `moduleMap.replaceModulesCode()` 修改自动生效 |
+| After 钩子期间（陷阱） | `eventParams.dtos` 中的 AST 节点 | 原始内存引用 | ❌ **不自动生效**——AST 和 ModuleMap 之间已断开引用。即使原地修改了某个 ClassProperty，已生成的 `code` 字符串不会随之变化 |
+
+> **正确做法示例**：
+> - 想修改某个字段的装饰器 → 在 **Before** 钩子中操作 `dtos.Customer.entity.body.body[i].decorators.push(...)`
+> - 想替换某个已生成 DTO 的文件内容 → 在 **After** 钩子中调用 `moduleMap.replaceModulesCode((path, code) => path.includes('customer.dto') ? newCode : code)`
+> - 想新增一个完全自定义的 GraphQL 类型 → 要么在 **Before** 钩子中往 `dtos` push 新 AST + 更新 `dtoNameToPath`（让 defaultBehavior 编译它），要么在 **After** 钩子中直接构造 Module 对象并 `moduleMap.set(module)` 注入
 
 ##### ModuleMap 数据结构与操作方式
 
