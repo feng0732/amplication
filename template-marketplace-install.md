@@ -707,6 +707,195 @@ const saveResourceSettings = async (
 1. **职责分离**：`createResourceFromTemplate` 的后端逻辑只关注模板本身（复制 serviceSettings、拷贝插件、记录版本关联等），不处理可变的自定义属性。
 2. **创建时序**：Resource 必须先存在（拿到 `resource.id`），才能更新其 `properties` 或创建关联的 `ResourceSettings` 记录——后者依赖前者的主键。
 
+### 7.5 保存失败时的行为（静默吞错 + 无回滚）
+
+模板安装主流程与属性保存是**完全解耦**的异步 Promise 链，保存阶段失败不会导致主流程回滚，也不会中断跳转。具体逻辑在 [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L43-L93)：
+
+```typescript
+// 模板主 Mutation
+createServiceFromTemplateInternal(...)
+  .then(async (result) => {
+    if (result.data?.createResourceFromTemplate) {
+      // ⚠️ await 在这里，但 catch 在最外层
+      await saveResourceSettings(
+        result.data.createResourceFromTemplate,
+        catalogProperties,
+        settings
+      );
+      // ⚠️ 即便 saveResourceSettings throw，onResourceCreated 仍会执行
+      onResourceCreated &&
+        onResourceCreated(result.data.createResourceFromTemplate);
+    }
+  })
+  .catch(console.error);  // ⚠️ 所有错误最终只会 console.error，不影响用户
+```
+
+#### 7.5.1 saveResourceSettings 内部的失败传播
+
+`saveResourceSettings` 用 `Promise.all(promises)` 并行执行两个更新：
+
+```typescript
+return Promise.all(promises);   // 任一 promise reject → 整体 reject
+```
+
+- 如果 `UPDATE_RESOURCE`（保存自定义属性）失败 → `Promise.all` reject
+- 如果 `UPDATE_RESOURCE_SETTINGS`（保存资源设置）失败 → `Promise.all` reject
+- **两个都失败** → `Promise.all` reject（以最先失败的为准）
+
+#### 7.5.2 失败后的实际后果
+
+| 失败场景 | 资源是否已创建 | 自定义属性 | 资源设置 | 是否跳转 | 用户是否感知 |
+|---------|--------------|-----------|---------|---------|------------|
+| 主 Mutation 失败（如 blueprint 禁用） | ❌ 未创建 | - | - | ❌ 不跳转 | ✅ Snackbar 显示错误 |
+| 主 Mutation 成功，自定义属性保存失败 | ✅ 已创建 | ❌ 未保存 | ✅ 已保存（如果没失败） | ✅ **仍跳转** | ❌ **不提示，静默失败** |
+| 主 Mutation 成功，资源设置保存失败 | ✅ 已创建 | ✅ 已保存（如果没失败） | ❌ 未保存 | ✅ **仍跳转** | ❌ **不提示，静默失败** |
+| 主 Mutation 成功，两个保存都失败 | ✅ 已创建 | ❌ 未保存 | ❌ 未保存 | ✅ **仍跳转** | ❌ **不提示，静默失败** |
+
+#### 7.5.3 后端无事务回滚机制
+
+后端 [serviceTemplate.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L242-L371) 的 `createResourceFromTemplate` 内部没有使用 Prisma `$transaction`，步骤之间是串行 await：
+
+```
+Step1 权限校验
+  ↓
+Step2 获取版本
+  ↓
+Step3 校验 Blueprint
+  ↓
+Step4-5 创建资源 (prisma.resource.create) ← 如果后续步骤失败，资源已落库，不会回滚
+  ↓
+Step6 写 ResourceTemplateVersion Block
+  ↓
+Step7 copyPluginInstallations (逐个创建 PluginInstallation)
+  ↓
+Step8 commit（可选）
+```
+
+如果 Step 6、7、8 中的任何一步失败，**之前已创建的 Resource 及已安装的插件都不会被删除或回滚**，数据库处于"半成品"状态。
+
+### 7.6 跳转时机：主 Mutation 成功即跳转，不等保存完成
+
+跳转逻辑在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L168-L174) 的 `handleResourceCreated` 回调中：
+
+```typescript
+const handleResourceCreated = useCallback(
+  (component: models.Resource) => {
+    reloadCatalog();                          // 刷新 catalog 列表
+    history.push(`${baseUrl}/${component.id}`);  // 跳转到新资源页面
+  },
+  [baseUrl, history, reloadCatalog]
+);
+```
+
+调用时序在 [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L61-L71)：
+
+```typescript
+// 模板创建分支
+createServiceFromTemplateInternal(...)
+  .then(async (result) => {
+    if (result.data?.createResourceFromTemplate) {
+      await saveResourceSettings(...);      // 先 await 保存
+      onResourceCreated &&                   // 保存完成后才触发回调
+        onResourceCreated(result.data.createResourceFromTemplate);
+    }
+  })
+```
+
+**执行顺序**：
+1. `createServiceFromTemplateInternal` resolve → 主 Mutation 成功，拿到 resource 对象
+2. `await saveResourceSettings(...)` → **等待**两个属性保存请求完成（或失败）
+3. `onResourceCreated(...)` → 触发 `handleResourceCreated` → `reloadCatalog()` + `history.push(...)`
+
+**关键点**：
+- `saveResourceSettings` 用 `await`，所以跳转**确实会等**保存完成（或失败）
+- 但因为没有 `.catch` 处理保存的 reject，保存失败只是被静默吞掉，跳转仍会执行
+- **跳转的触发条件只有一个**：主 Mutation 返回了 `createResourceFromTemplate.id`
+
+#### 7.6.1 对比：useResources 中的另一套跳转逻辑
+
+项目中还有一处从模板创建资源的 Hook 在 [useResources.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Workspaces/hooks/useResources.ts#L314-L337)：
+
+```typescript
+const createServiceFromTemplate = (data) => {
+  return new Promise<models.Resource>((resolve, reject) => {
+    createServiceFromTemplateInternal({ variables: { data } })
+      .then((result) => {
+        if (result.data?.createResourceFromTemplate.id) {
+          reloadResources().then(() => {          // 先 reloadResources
+            resourceRedirect(result.data.createResourceFromTemplate.id);  // 再跳转
+            addBlock(result.data.createResourceFromTemplate.id);
+            resolve(result.data?.createResourceFromTemplate);
+          });
+        } else {
+          resolve(null);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+        reject(error);  // ✅ 这里显式 reject 了
+      });
+  });
+};
+```
+
+这套 Hook **不处理自定义属性和资源设置的保存**，且错误会 `reject` 出来，与 `useCreateResource` 的静默吞错策略不同。两套 Hook 的存在说明模板安装在不同页面有不同实现。
+
+### 7.7 与模板安装主 Mutation 的关系总结
+
+整个流程可以概括为「**1 + 2 + 1**」四个独立请求：
+
+```
+请求 1：createResourceFromTemplate（主 Mutation，服务端处理 8 步）
+  ↓ 成功返回 resource.id
+  ├─ 请求 2：UPDATE_RESOURCE（保存 catalogProperties 到 Resource.properties）
+  ├─ 请求 3：UPDATE_RESOURCE_SETTINGS（保存 settings 到 ResourceSettings）
+  ↓ 请求 2 & 3 无论成败
+请求 4（可选）：reloadCatalog / reloadResources（刷新前端列表缓存）
+  ↓
+跳转 history.push(/newResourceId)
+```
+
+| 请求 | 失败是否中断流程 | 失败是否回滚已创建资源 | 用户是否感知 |
+|------|----------------|---------------------|------------|
+| 请求 1（主 Mutation） | ✅ 中断（无后续请求，不跳转） | - | ✅ Snackbar 显示 GraphQL 错误 |
+| 请求 2（自定义属性） | ❌ 不中断 | ❌ 不回滚 | ❌ 静默失败 |
+| 请求 3（资源设置） | ❌ 不中断 | ❌ 不回滚 | ❌ 静默失败 |
+| 请求 4（刷新缓存） | ❌ 不中断（失败仍跳转） | - | ❌ 静默失败 |
+
+#### 7.7.1 主 Mutation 的错误展示路径
+
+只有主 Mutation（`createResourceFromTemplate`）的错误会通过 `errorCreateResource` 暴露给 UI：
+
+```typescript
+// useCreateResource.ts:129-134
+return {
+  errorCreateResource:
+    errorCreateComponent ||
+    updateError ||                    // UPDATE_RESOURCE_SETTINGS 的错误（来自 useResourceSettings）
+    updateResourceError ||            // UPDATE_RESOURCE 的错误
+    errorCreateServiceFromTemplate,   // 主 Mutation 的错误
+  // ...
+};
+```
+
+在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L216-L217) 和 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L497-L501)：
+
+```typescript
+const errorMessage = formatError(errorCreateResource);
+
+// ...
+
+<Snackbar
+  messageType={EnumMessageType.Error}
+  open={Boolean(errorCreateResource)}
+  message={errorMessage}
+/>
+```
+
+`formatError` 的实现见 [error.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/util/error.ts#L4-L23)，会提取 Apollo `graphQLErrors[0].message` 展示给用户。
+
+**注意**：虽然 `errorCreateResource` 也拼接了 `updateError` 和 `updateResourceError`（理论上保存阶段的错误也应该被显示），但由于 `saveResourceSettings` 内部没有 `await` 之后的错误传播处理，实际运行时这些错误可能不会正确冒泡到 Snackbar——因为 Promise 被 `.catch(console.error)` 吞掉了，这是一个潜在的 UX Bug。
+
 ---
 
 ## 八、禁用 Blueprint 的模板为何前端仍显示及后端拒绝机制
