@@ -28,10 +28,14 @@ Amplication 中存在两条方向相反、彼此独立的转换流水线：
 - [create-server.ts](packages/data-service-generator/src/server/create-server.ts) — 服务器代码生成总调度（L128-L129 调用 Prisma schema 生成）
 - [prisma.service.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) — 静态模板：NestJS `PrismaService`（继承 PrismaClient）
 - [prisma.module.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) — 静态模板：全局 PrismaModule
+- [Dockerfile](packages/data-service-generator/src/server/static/Dockerfile) — 容器构建中自动执行 `npm run prisma:generate`
+- [README.md](packages/data-service-generator/src/server/static/README.md) — 入门指引中显式提示 `npm run prisma:generate`
 
 **反向导入（平台运行时）：**
 
 - [prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) — Prisma schema → Entity/Field 的七步规范化管线
+- [schema-utils.ts](packages/amplication-server/src/core/prismaSchemaParser/schema-utils.ts) — 属性序列化、customAttributes 生成、枚举 @map 处理等工具
+- [helpers.ts](packages/amplication-server/src/core/prismaSchemaParser/helpers.ts) — 已语义化属性过滤（filterOutAmplicationAttributesBasedOnFieldDataType）、命名格式化
 - [dbSchemaImport.service.ts](packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) — 用户导入流程调度（Kafka 异步处理）
 
 **共享类型定义（仅正向生成使用）：**
@@ -331,6 +335,29 @@ export class CustomerService extends CustomerServiceBase {
 - 每次 `schema.prisma` 发生变更之后
 - CI/CD 流水线中，在 `nest build` 之前
 
+除了 `package.json` 脚本入口外，项目在以下静态模板中也内置了 `prisma:generate` 的自动触发或显式提示：
+
+**Dockerfile（容器构建自动执行）**
+
+生成的 [Dockerfile](packages/data-service-generator/src/server/static/Dockerfile) 在多阶段构建的 base 阶段明确执行 `prisma:generate`，确保容器镜像中包含强类型 Client：
+
+```dockerfile
+COPY prisma/schema.prisma ./prisma/
+RUN npm run prisma:generate    # 在 COPY . . 与 npm run build 之间执行
+RUN npm run build
+```
+
+**README.md（用户操作提示）**
+
+生成的 [README.md](packages/data-service-generator/src/server/static/README.md) 在 "Step 2.1: Scripts - pre-requisites" 中显式提示用户在 `npm install` 之后执行 `prisma:generate`：
+
+```sh
+# installation of the dependencies
+$ npm install
+# generate the prisma client
+$ npm run prisma:generate
+```
+
 **迁移脚本与 Client 生成的关系：** `db:migrate-save`（即 `prisma migrate dev`）在生成迁移文件的同时会自动触发 `prisma generate`；但 `db:migrate-up`（`prisma migrate deploy`）只执行迁移 SQL，不会重新生成 Client。
 
 ### 5.5 链路总览
@@ -410,6 +437,40 @@ Id → Boolean → CreatedAt → UpdatedAt → DateTime
 
 `isManyToManyRelation()`（L1137-L1238）逻辑：当前字段是 `type[]` 数组 + 对端也存在指向本方 model 的数组类型字段 → 判定为多对多，双方仅各保留一个 Lookup 字段（`allowMultipleSelection: true`）。
 
+#### 6.2.4 customAttributes 保留与过滤机制
+
+反向导入会将 Prisma 属性序列化后按字段数据类型过滤，最终写入实体和字段的 `customAttributes` 字段：
+
+**实体级 customAttributes**（[prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) `convertModelToEntity` L1280-L1285）：
+- 收集 model 上所有 block attribute（`@@unique`、`@@index`、`@@map` 等）
+- 经 [schema-utils.ts](packages/amplication-server/src/core/prismaSchemaParser/schema-utils.ts) 的 `prepareModelAttributes()` 序列化为 `@@xxx(...)` 字符串数组
+- 以空格拼接后写入 `entity.customAttributes`
+
+**字段级 customAttributes**（[schema-utils.ts](packages/amplication-server/src/core/prismaSchemaParser/schema-utils.ts) `createOneEntityFieldCommonProperties` L78-L123）：
+1. `prepareFieldAttributes(field.attributes)` 将属性 AST 序列化为 `@xxx(...)` 字符串数组
+2. `filterOutAmplicationAttributesBasedOnFieldDataType(fieldDataType, ...)`（定义于 [helpers.ts](packages/amplication-server/src/core/prismaSchemaParser/helpers.ts) L79-L96）按字段类型过滤已被 Amplication 语义化的属性：
+
+| 字段数据类型 | 过滤掉的属性 |
+|-------------|-------------|
+| `Id` | `@id`、`@id()`、`@default(now())`、`@default(cuid())`、`@default(uuid())`、`@default(autoincrement())`；MongoDB 额外过滤 `@map("_id")`、`@db.ObjectId` |
+| `CreatedAt` | `@default(now())` |
+| `UpdatedAt` | 以 `@updatedAt` 开头的所有属性 |
+| `Lookup` | 以 `@relation` 开头的所有属性 |
+| 其余标量类型 | 以 `@unique` 开头的所有属性 |
+
+3. 额外过滤空值 `@default()`
+4. 剩余属性以空格拼接写入 `field.customAttributes`
+
+#### 6.2.5 枚举 @map / @@map 的跳过与告警
+
+处理 `OptionSet` / `MultiSelectOptionSet` 时，[schema-utils.ts](packages/amplication-server/src/core/prismaSchemaParser/schema-utils.ts) 的 `handleEnumMapAttribute()`（L432-L500）对枚举映射做如下处理：
+
+| 位置 | 处理方式 | 用户日志级别 | 日志内容 |
+|------|---------|-------------|---------|
+| 枚举块级 `@@map` | 跳过，不写入选项集 | Warning | "The enum '{name}' has been created, but it has not been mapped. Mapping an enum name is not supported." |
+| 枚举项级 `@map` | 跳过该属性，选项 label/value 均使用枚举项原始名称 | Warning | "The option '{name}' has been created in the enum '{name}', but its value has not been mapped" |
+| 普通枚举项 | 正常加入选项集 | Info | "The option '{name}' has been created in the enum '{name}'" |
+
 ---
 
 ## 7. 正向生成与反向导入的边界
@@ -439,7 +500,9 @@ Id → Boolean → CreatedAt → UpdatedAt → DateTime
 | `displayName` / `description` / `searchable` | ❌ 完全丢失 | Prisma schema 不承载这些元数据 |
 | 实体权限配置（`EntityPermission`） | ❌ 完全丢失 | Prisma schema 不承载权限信息 |
 | `permanentId`（跨版本稳定 ID） | ❌ 生成新的 UUID | Prisma schema 中没有该概念 |
-| `customAttributes` | ⚠️ 不还原为 customAttributes，而作为字段特征解析 | 反向导入将自定义 Prisma 属性视为字段的一部分 |
+| `customAttributes`（字段级） | ✅ 保留过滤后的属性 | 先通过 `prepareFieldAttributes()` 序列化为 `@xxx(...)` 字符串数组，再由 `filterOutAmplicationAttributesBasedOnFieldDataType()` 按字段数据类型过滤掉已被 Amplication 语义化的属性（如 Id 类型过滤 `@id`/`@default(cuid/uuid/autoincrement())`、CreatedAt 过滤 `@default(now())`、UpdatedAt 过滤 `@updatedAt`、Lookup 过滤 `@relation`、其余标量过滤 `@unique`），并去除空值 `@default()`，剩余属性以空格拼接存入 `field.customAttributes` |
+| `customAttributes`（实体级） | ✅ 完整保留 model 块属性 | 通过 `prepareModelAttributes()` 将 model 上的 block attribute（如 `@@unique`、`@@index`、`@@map`）序列化为 `@@xxx(...)` 字符串，以空格拼接存入 `entity.customAttributes` |
+| 枚举（OptionSet/MultiSelectOptionSet）的 `@map`/`@@map` | ❌ 跳过并告警 | `handleEnumMapAttribute()` 中枚举块级 `@@map` 和枚举项级 `@map` 均被跳过，同时向用户 emit Warning 级日志（"Mapping an enum name is not supported" / "its value has not been mapped"） |
 
 ### 7.3 不共享代码的设计原因
 
@@ -501,12 +564,16 @@ export type EntityField = Omit<
 | 服务器代码生成总调度（调用入口） | [create-server.ts](packages/data-service-generator/src/server/create-server.ts) |
 | PrismaService 静态模板 | [prisma.service.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.service.ts) |
 | PrismaModule 静态模板 | [prisma.module.ts](packages/data-service-generator/src/server/static/src/prisma/prisma.module.ts) |
+| Dockerfile（容器构建自动执行 prisma:generate） | [Dockerfile](packages/data-service-generator/src/server/static/Dockerfile) |
+| README（显式提示 prisma:generate） | [README.md](packages/data-service-generator/src/server/static/README.md) |
 | 枚举命名规则 | [dto-util.ts](libs/util/dsg-utils/src/lib/dto-util.ts) |
 | EnumDataType 定义（19 个值） | [models.ts#L991-L1011](libs/util/code-gen-types/src/models.ts#L991-L1011) |
 | Entity/EntityField/Relation 类型 | [code-gen-types.ts](libs/util/code-gen-types/src/code-gen-types.ts) |
 | Lookup 属性 JSON Schema | [lookup.json](libs/util/code-gen-types/src/schemas/lookup.json) |
 | 生成服务的迁移脚本与 Prisma 依赖 | [package.json](packages/data-service-generator/src/server/package-json/package.json) |
 | Prisma Schema 反向解析管线 | [prismaSchemaParser.service.ts](packages/amplication-server/src/core/prismaSchemaParser/prismaSchemaParser.service.ts) |
+| 反向导入工具（属性过滤、枚举映射处理等） | [schema-utils.ts](packages/amplication-server/src/core/prismaSchemaParser/schema-utils.ts) |
+| 反向导入辅助（属性过滤、命名格式化） | [helpers.ts](packages/amplication-server/src/core/prismaSchemaParser/helpers.ts) |
 | Schema Import 调度 | [dbSchemaImport.service.ts](packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.service.ts) |
 | 主平台参考 schema | [schema.prisma](packages/amplication-prisma-db/prisma/schema.prisma) |
 | 单元测试（字段映射验证） | [create-prisma-schema.spec.ts](packages/data-service-generator/src/server/prisma/create-prisma-schema.spec.ts) |
