@@ -64,7 +64,6 @@ BlockService.create<ProjectConfigurationSettings>()
 
 #### 1) 项目创建入口
 
-
 ```typescript
 async createProject(args: ProjectCreateArgs, userId: string): Promise<Project> {
   // 1. 计费限制校验
@@ -83,7 +82,6 @@ async createProject(args: ProjectCreateArgs, userId: string): Promise<Project> {
 ```
 
 #### 2) 创建 ProjectConfiguration 类型的 Resource
-
 
 ```typescript
 async createProjectConfiguration(
@@ -119,7 +117,6 @@ async createProjectConfiguration(
 
 #### 3) 创建默认配置 Block
 
-
 默认配置常量：
 ```typescript
 export const DEFAULT_PROJECT_CONFIGURATION_SETTINGS = {
@@ -142,16 +139,17 @@ export const DEFAULT_PROJECT_CONFIGURATION_SETTINGS = {
 
 模板快照机制围绕以下几个核心服务协同工作：
 
-| 服务 | 职责 | 文件 | — |------|------|------| — | ServiceTemplateService | 模板的 CRUD、从模板创建资源、模板升级 | — |
-| ResourceVersionService | 资源版本管理、版本差异对比 | — |
-| ResourceTemplateVersionService | 记录资源使用的模板版本 | — |
-| TemplateCodeEngineVersionService | 记录模板使用的代码引擎版本历史 | — |
-| PluginInstallationService | 插件安装配置及合并到目标资源 | — |
+| 服务 | 职责 | 文件 |
+|------|------|------|
+| ServiceTemplateService | 模板的 CRUD、从模板创建资源、模板升级 | packages/amplication-server/src/core/resource/serviceTemplate.service.ts |
+| ResourceVersionService | 资源版本管理、版本差异对比 | packages/amplication-server/src/core/resourceVersion/resourceVersion.service.ts |
+| ResourceTemplateVersionService | 记录资源使用的模板版本 | packages/amplication-server/src/core/resourceTemplateVersion/resourceTemplateVersion.service.ts |
+| TemplateCodeEngineVersionService | 记录模板使用的代码引擎版本历史 | packages/amplication-server/src/core/templateCodeEngineVersion/templateCodeEngineVersion.service.ts |
+| PluginInstallationService | 插件安装配置及合并到目标资源 | packages/amplication-server/src/core/pluginInstallation/pluginInstallation.service.ts |
 
 ### 3.1 模板创建流程
 
 #### 方式一：直接创建服务模板
-
 
 ```typescript
 async createServiceTemplate(args: CreateServiceTemplateArgs, user: User): Promise<Resource> {
@@ -175,7 +173,6 @@ async createServiceTemplate(args: CreateServiceTemplateArgs, user: User): Promis
 ```
 
 #### 方式二：从现有资源创建模板
-
 
 ```typescript
 async createTemplateFromExistingResource(args: CreateTemplateFromResourceArgs, user: User): Promise<Resource> {
@@ -202,7 +199,6 @@ async createTemplateFromExistingResource(args: CreateTemplateFromResourceArgs, u
 ### 3.2 模板版本发布（快照）
 
 当模板发布新版本时，会对当前所有 Block 和 Entity 进行快照：
-
 
 ```typescript
 async create(args: CreateResourceVersionArgs, userId: string): Promise<ResourceVersion> {
@@ -247,7 +243,6 @@ async create(args: CreateResourceVersionArgs, userId: string): Promise<ResourceV
 ### 3.3 从模板创建资源（导入流程）
 
 从模板创建资源时会依次执行以下校验，任何一步失败都会导致整个迁移过程中断：
-
 
 ```typescript
 async createResourceFromTemplate(args: CreateResourceFromTemplateArgs, user: User): Promise<Resource> {
@@ -332,7 +327,6 @@ async createResourceFromTemplate(args: CreateResourceFromTemplateArgs, user: Use
 
 ### 3.4 插件复制流程
 
-
 ```typescript
 async copyPluginInstallations(
   sourceResourceId: string,
@@ -367,7 +361,6 @@ async copyPluginInstallations(
 ```
 
 插件创建时的校验：
-
 
 ```typescript
 async validatePluginConfiguration(
@@ -488,7 +481,11 @@ T7/T8 插件/代码引擎版本同步这时才可能完成（或因异常永远�
 
 **具体影响**：
 
-| 状态 | 提前更新的后果 | — |------|---------------| — | 模板版本记录 | 系统显示资源已升级，但实际插件/代码引擎版本可能还在后台同步中，甚至因异步异常永远未完成 | — | 告警状态 | 所有 `TemplateVersion` 类型告警已通过 `updateMany` 批量标记为 `Resolved`，前端不再提示 | — | 代码引擎版本同步 | 可能在 HTTP 响应返回后才完成，也可能因 `forEach` 中异常未捕获而完全丢失 |
+| 状态 | 提前更新的后果 |
+|------|---------------|
+| 模板版本记录 | 系统显示资源已升级，但实际插件/代码引擎版本可能还在后台同步中，甚至因异步异常永远未完成 |
+| 告警状态 | 所有 `TemplateVersion` 类型告警已通过 `updateMany` 批量标记为 `Resolved`，前端不再提示 |
+| 代码引擎版本同步 | 可能在 HTTP 响应返回后才完成，也可能因 `forEach` 中异常未捕获而完全丢失 |
 
 #### 其他问题
 
@@ -518,7 +515,6 @@ await Promise.all([
 ```
 
 ### 3.6 Block 合并处理
-
 
 模板升级时只处理两种 Block 类型：`PluginInstallation` 和 `CodeEngineVersion`。
 
@@ -553,7 +549,6 @@ async handleMergeCreatedBlock(
 ```
 
 插件合并逻辑：
-
 
 ```typescript
 async mergeVersionIntoLatest(
@@ -598,7 +593,6 @@ async mergeVersionIntoLatest(
 ```
 
 ### 3.7 版本差异对比算法
-
 
 ```typescript
 async compareResourceVersions(args: CompareResourceVersionsArgs): Promise<ResourceVersionsDiff> {
@@ -646,7 +640,6 @@ async compareResourceVersions(args: CompareResourceVersionsArgs): Promise<Resour
 
 每个资源使用的模板版本以 `ResourceTemplateVersion` Block 形式存储：
 
-
 ```typescript
 // DTO: ResourceTemplateVersion { serviceTemplateId, version }
 
@@ -667,7 +660,6 @@ async updateResourceTemplateVersion(args, user) {
 
 默认值定义：
 
-
 ```typescript
 export const DEFAULT_RESOURCE_TEMPLATE_VERSION = {
   blockType: EnumBlockType.ResourceTemplateVersion,
@@ -679,7 +671,6 @@ export const DEFAULT_RESOURCE_TEMPLATE_VERSION = {
 ```
 
 ### 3.9 模板代码引擎版本记录
-
 
 ```typescript
 // DTO: TemplateCodeEngineVersion { codeGeneratorVersion?, codeGeneratorStrategy? }
@@ -721,7 +712,6 @@ Resource (Service 类型)
 
 **1) 模板更新代码引擎时同步写入 TemplateCodeEngineVersion Block**
 
-
 ```typescript
 async updateCodeGeneratorVersion(args: UpdateCodeGeneratorVersionArgs, user: User): Promise<Resource | null> {
   const resource = await this.resource({ where: { id: args.where.id } });
@@ -760,7 +750,6 @@ async updateCodeGeneratorVersion(args: UpdateCodeGeneratorVersionArgs, user: Use
 
 **2) 从模板创建资源时，代码引擎版本的传递**
 
-
 ```typescript
 private async internalCreateServiceFromTemplate(args, template, user) {
   const serviceSettings = await this.serviceSettingsService.getServiceSettingsValues(...);
@@ -793,17 +782,19 @@ private async internalCreateServiceFromTemplate(args, template, user) {
 
 从模板导入资源的过程中存在多个校验节点，每个节点的失败都会对迁移产生不同程度的影响：
 
-| 校验阶段 | 校验内容 | 失败影响 | 抛出异常位置 | — |----------|----------|----------|--------------| — | 模板可用性校验 | 模板在当前项目中是否可用 | **硬失败**：迁移完全中断，资源尚未创建 | — |
-| 模板版本存在校验 | 模板至少有一个已发布版本 | **硬失败**：迁移完全中断，资源尚未创建 | — |
-| Blueprint 存在校验 | 模板关联的 Blueprint 存在且已启用 | **硬失败**：迁移完全中断，资源尚未创建 | — |
-| Blueprint 资源类型校验 | Blueprint 类型必须是 Service 或 Component | **硬失败**：迁移完全中断，资源尚未创建 | — |
-| 计费配额校验 | 工作区服务数量未超过套餐限制 | **硬失败**：资源创建前中断 | — |
-| 项目配置存在校验 | 项目必须存在 ProjectConfiguration | **硬失败**：资源创建前中断 | — |
-| 代码生成器 License 校验 | 用户套餐是否支持所选代码生成器 | **硬失败**：资源创建前中断 | — |
-| 资源名称重复校验 | 同项目下资源名称不重复（自动追加序号） | 不会失败，自动重命名 | — |
-| 插件重复安装校验 | 目标资源已安装同名插件 | **部分失败**：资源已创建但插件安装中断 | — |
-| 插件配置校验 | 插件要求认证实体但资源未配置 | **部分失败**：资源已创建但插件安装中断 | — |
-| Block 父节点类型校验 | Block 的父节点类型合法性 | **硬失败**：Block 创建失败导致整个操作失败 | — |
+| 校验阶段 | 校验内容 | 失败影响 | 抛出异常位置 |
+|----------|----------|----------|--------------|
+| 模板可用性校验 | 模板在当前项目中是否可用 | **硬失败**：迁移完全中断，资源尚未创建 | serviceTemplate.service.ts |
+| 模板版本存在校验 | 模板至少有一个已发布版本 | **硬失败**：迁移完全中断，资源尚未创建 | serviceTemplate.service.ts |
+| Blueprint 存在校验 | 模板关联的 Blueprint 存在且已启用 | **硬失败**：迁移完全中断，资源尚未创建 | serviceTemplate.service.ts |
+| Blueprint 资源类型校验 | Blueprint 类型必须是 Service 或 Component | **硬失败**：迁移完全中断，资源尚未创建 | serviceTemplate.service.ts |
+| 计费配额校验 | 工作区服务数量未超过套餐限制 | **硬失败**：资源创建前中断 | resource.service.ts |
+| 项目配置存在校验 | 项目必须存在 ProjectConfiguration | **硬失败**：资源创建前中断 | resource.service.ts |
+| 代码生成器 License 校验 | 用户套餐是否支持所选代码生成器 | **硬失败**：资源创建前中断 | resource.service.ts |
+| 资源名称重复校验 | 同项目下资源名称不重复（自动追加序号） | 不会失败，自动重命名 | resource.service.ts |
+| 插件重复安装校验 | 目标资源已安装同名插件 | **部分失败**：资源已创建但插件安装中断 | pluginInstallation.service.ts |
+| 插件配置校验 | 插件要求认证实体但资源未配置 | **部分失败**：资源已创建但插件安装中断 | pluginInstallation.service.ts |
+| Block 父节点类型校验 | Block 的父节点类型合法性 | **硬失败**：Block 创建失败导致整个操作失败 | block.service.ts |
 
 ### 4.2 硬失败 vs 部分失败
 
@@ -852,7 +843,6 @@ private async internalCreateServiceFromTemplate(args, template, user) {
 
 ### 5.1 版本号校验（Semver）
 
-
 ```typescript
 async validateVersion(version: string, resourceId): Promise<void> {
   if (!version) throw new Error("Version is required");
@@ -874,7 +864,6 @@ async validateVersion(version: string, resourceId): Promise<void> {
 
 ### 5.2 Blueprint 引擎类型校验
 
-
 ```typescript
 const VALID_TYPES_AND_GENERATORS: Partial<Record<EnumResourceType, (keyof typeof EnumCodeGenerator)[]>> = {
   [EnumResourceType.Component]: [EnumCodeGenerator.Blueprint],
@@ -882,7 +871,6 @@ const VALID_TYPES_AND_GENERATORS: Partial<Record<EnumResourceType, (keyof typeof
   [EnumResourceType.MessageBroker]: [EnumCodeGenerator.Blueprint],
 };
 ```
-
 
 ```typescript
 async updateBlueprintEngine(args: UpdateBlueprintEngineArgs): Promise<Blueprint> {
@@ -904,7 +892,6 @@ async updateBlueprintEngine(args: UpdateBlueprintEngineArgs): Promise<Blueprint>
 ```
 
 ### 5.3 自定义属性校验（JSON Schema）
-
 
 ```typescript
 async validateCustomProperties(
@@ -952,7 +939,6 @@ getValidationSchema(customProperties: CustomProperty[]): JSONSchema {
 
 ### 5.4 资源设置属性校验
 
-
 ```typescript
 async validateResourceSettingsProperties(resourceId: string, properties: Record<string, unknown>): Promise<void> {
   const resource = await this.resourceService.resource({ where: { id: resourceId } });
@@ -974,7 +960,6 @@ async validateResourceSettingsProperties(resourceId: string, properties: Record<
 
 ### 5.5 资源通用属性校验
 
-
 ```typescript
 async validateResourceProperties(values: Record<string, unknown>, user: User): Promise<void> {
   // 获取工作区中所有启用的自定义属性
@@ -993,7 +978,6 @@ async validateResourceProperties(values: Record<string, unknown>, user: User): P
 
 ### 5.6 Block 父节点类型校验
 
-
 ```typescript
 blockTypeAllowedParents: { [key in EnumBlockType]: Set<EnumBlockType | null> } = {
   [EnumBlockType.ServiceSettings]: ALLOW_NO_PARENT_ONLY,
@@ -1010,7 +994,6 @@ if (!this.canUseParentType(EnumBlockType[blockType], parentBlock && EnumBlockTyp
 ```
 
 ### 5.7 代码生成器可用性校验
-
 
 ```typescript
 async getAndValidateCodeGeneratorName(codeGenerator, user): Promise<string | null> {
@@ -1050,7 +1033,6 @@ const CODE_GENERATOR_ENUM_TO_NAME_AND_LICENSE = {
 ### 6.1 告警触发
 
 当模板发布新版本时触发告警：
-
 
 ```typescript
 async triggerAlertsForTemplateVersion(templateResourceId, outdatedVersion, latestVersion) {
@@ -1100,11 +1082,15 @@ await this.outdatedVersionAlertService.resolvesServiceTemplateUpdated({ resource
 
 ### 7.1 GraphQL 查询定义
 
-
-| 查询/Mutation | 用途 | — |--------------|------| — | `GET_SERVICE_TEMPLATES` | 获取项目中的模板列表 | — | `CREATE_SERVICE_TEMPLATE` | 创建新模板 | — | `CREATE_TEMPLATE_FROM_RESOURCE` | 从现有资源创建模板 | — | `GET_AVAILABLE_TEMPLATES_FOR_PROJECT` | 获取项目可用模板（含公开项目） | — | `UPGRADE_SERVICE_TO_LATEST_TEMPLATE_VERSION` | 将服务升级到最新模板版本 |
+| 查询/Mutation | 用途 |
+|--------------|------|
+| `GET_SERVICE_TEMPLATES` | 获取项目中的模板列表 |
+| `CREATE_SERVICE_TEMPLATE` | 创建新模板 |
+| `CREATE_TEMPLATE_FROM_RESOURCE` | 从现有资源创建模板 |
+| `GET_AVAILABLE_TEMPLATES_FOR_PROJECT` | 获取项目可用模板（含公开项目） |
+| `UPGRADE_SERVICE_TO_LATEST_TEMPLATE_VERSION` | 将服务升级到最新模板版本 |
 
 ### 7.2 React Hook 封装
-
 
 ```typescript
 const useServiceTemplate = (currentProject, onServiceTemplateCreated) => {
@@ -1133,7 +1119,6 @@ const useServiceTemplate = (currentProject, onServiceTemplateCreated) => {
 ```
 
 ### 7.3 代码引擎版本设置前端
-
 
 前端通过 `updateCodeGeneratorVersion` mutation 更新资源的代码引擎版本，对于 ServiceTemplate 类型资源，后端会同步写入 `TemplateCodeEngineVersion` Block。
 
@@ -1244,18 +1229,22 @@ Project (1) ──┬──> Resource (ProjectConfiguration) ──> Block (Proj
 
 ## 十、关键文件索引
 
-| 模块 | 服务层 | Resolver | DTO/常量 | — |------|--------|----------|----------| — | 项目配置 | — |  | — |
-| 项目 | — |  | — |
-| 资源/模板 | — |  | — |
-| 服务模板 | — |  | - | — | 资源版本 | — |  | — |
-| 资源模板版本 | — | - | — |
-| 模板代码引擎版本 | — | - | — |
-| Blueprint | — |  | — |
-| Block | — |  | — |
-| 自定义属性 | — |  | — |
-| 资源设置 | — |  | — |
-| 插件安装 | — |  | — |
-| 版本过期告警 | — | - | — |
-| BlockType 基类 | — | - | - | — | Block 类型枚举 | - | - | — |
-| 前端 Hook | — | - | — |
-| 前端代码引擎设置 | — | - | — |
+| 模块 | 服务层 | Resolver | DTO/常量 |
+|------|--------|----------|----------|
+| 项目配置 | projectConfigurationSettings.service.ts | projectConfigurationSettings.resolver.ts | ProjectConfigurationSettings.ts |
+| 项目 | project.service.ts | project.resolver.ts | Project.ts |
+| 资源/模板 | resource.service.ts | resource.resolver.ts | Resource.ts |
+| 服务模板 | serviceTemplate.service.ts | serviceTemplate.resolver.ts | CreateServiceTemplateArgs.ts |
+| 资源版本 | resourceVersion.service.ts | resourceVersion.resolver.ts | ResourceVersion.ts |
+| 资源模板版本 | resourceTemplateVersion.service.ts | — | ResourceTemplateVersion.ts, constants.ts |
+| 模板代码引擎版本 | templateCodeEngineVersion.service.ts | — | TemplateCodeEngineVersion.ts |
+| Blueprint | blueprint.service.ts | blueprint.resolver.ts | Blueprint.ts |
+| Block | block.service.ts | block.resolver.ts | Block.ts |
+| 自定义属性 | customProperty.service.ts | customProperty.resolver.ts | CustomProperty.ts |
+| 资源设置 | resourceSettings.service.ts | resourceSettings.resolver.ts | ResourceSettings.ts |
+| 插件安装 | pluginInstallation.service.ts | pluginInstallation.resolver.ts | PluginInstallation.ts |
+| 版本过期告警 | outdatedVersionAlert.service.ts | — | EnumOutdatedVersionAlertType.ts |
+| BlockType 基类 | — | — | IBlock.ts |
+| Block 类型枚举 | — | — | EnumBlockType.ts |
+| 前端 Hook | — | — | useServiceTemplate.ts, serviceTemplateQueries.ts |
+| 前端代码引擎设置 | — | — | CodeGeneratorVersion.tsx |
