@@ -707,51 +707,90 @@ const saveResourceSettings = async (
 1. **职责分离**：`createResourceFromTemplate` 的后端逻辑只关注模板本身（复制 serviceSettings、拷贝插件、记录版本关联等），不处理可变的自定义属性。
 2. **创建时序**：Resource 必须先存在（拿到 `resource.id`），才能更新其 `properties` 或创建关联的 `ResourceSettings` 记录——后者依赖前者的主键。
 
-### 7.5 保存失败时的行为（静默吞错 + 无回滚）
+### 7.5 保存失败时的行为（await 中断 + Apollo 独立错误状态 + 无回滚）
 
-模板安装主流程与属性保存是**完全解耦**的异步 Promise 链，保存阶段失败不会导致主流程回滚，也不会中断跳转。具体逻辑在 [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L43-L93)：
+模板安装主流程与属性保存通过 `.then(async ...)` 串联在同一条 Promise 链上，保存阶段的 reject **会中断后续代码**（包括跳转回调），但错误提示通过 Apollo Client 的独立状态管理仍然可见。具体逻辑在 [useCreateResource.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/hooks/useCreateResource.ts#L43-L93)：
 
 ```typescript
 // 模板主 Mutation
 createServiceFromTemplateInternal(...)
   .then(async (result) => {
     if (result.data?.createResourceFromTemplate) {
-      // ⚠️ await 在这里，但 catch 在最外层
+      // ✅ await 在这里 —— 如果 saveResourceSettings reject，await 会 throw
       await saveResourceSettings(
         result.data.createResourceFromTemplate,
         catalogProperties,
         settings
       );
-      // ⚠️ 即便 saveResourceSettings throw，onResourceCreated 仍会执行
+      // ❌ saveResourceSettings reject 时，这行不会执行！async 函数已中断
       onResourceCreated &&
         onResourceCreated(result.data.createResourceFromTemplate);
     }
   })
-  .catch(console.error);  // ⚠️ 所有错误最终只会 console.error，不影响用户
+  .catch(console.error);  // ⚠️ Promise 链上的所有 reject 只会被 console.error
 ```
 
-#### 7.5.1 saveResourceSettings 内部的失败传播
+#### 7.5.1 async/await 在 Promise 链中的精确行为
+
+`createServiceFromTemplateInternal(...).then(async (result) => {...})` 的执行机制：
+
+1. `.then(async ...)` 的回调是一个 **async 函数**，其返回值自动包装为 Promise
+2. 进入回调后，`await saveResourceSettings(...)` 会暂停 async 函数执行
+3. 如果 `saveResourceSettings` **resolve** → async 函数继续 → 执行 `onResourceCreated(...)` → 跳转
+4. 如果 `saveResourceSettings` **reject** → `await` 会将 reject 转换为 **throw** → async 函数立即终止 → `.then` 返回的 Promise 变为 rejected → 被外层 `.catch(console.error)` 捕获
+5. **关键结论**：保存请求 reject 时，`onResourceCreated`（及跳转）**不会执行**，async 函数在 `await` 处就已中断抛出
+
+#### 7.5.2 saveResourceSettings 内部的失败传播
 
 `saveResourceSettings` 用 `Promise.all(promises)` 并行执行两个更新：
 
 ```typescript
-return Promise.all(promises);   // 任一 promise reject → 整体 reject
+return Promise.all(promises);   // 任一 promise reject → 整体 reject（fail-fast）
 ```
 
-- 如果 `UPDATE_RESOURCE`（保存自定义属性）失败 → `Promise.all` reject
-- 如果 `UPDATE_RESOURCE_SETTINGS`（保存资源设置）失败 → `Promise.all` reject
-- **两个都失败** → `Promise.all` reject（以最先失败的为准）
+- 如果 `UPDATE_RESOURCE`（保存自定义属性）失败 → `Promise.all` reject → async 函数 throw → 跳转中断
+- 如果 `UPDATE_RESOURCE_SETTINGS`（保存资源设置）失败 → `Promise.all` reject → async 函数 throw → 跳转中断
+- **两个都失败** → `Promise.all` reject（以最先失败的为准，另一个请求的结果会被忽略）
 
-#### 7.5.2 失败后的实际后果
+#### 7.5.3 失败场景的真实影响
 
-| 失败场景 | 资源是否已创建 | 自定义属性 | 资源设置 | 是否跳转 | 用户是否感知 |
-|---------|--------------|-----------|---------|---------|------------|
-| 主 Mutation 失败（如 blueprint 禁用） | ❌ 未创建 | - | - | ❌ 不跳转 | ✅ Snackbar 显示错误 |
-| 主 Mutation 成功，自定义属性保存失败 | ✅ 已创建 | ❌ 未保存 | ✅ 已保存（如果没失败） | ✅ **仍跳转** | ❌ **不提示，静默失败** |
-| 主 Mutation 成功，资源设置保存失败 | ✅ 已创建 | ✅ 已保存（如果没失败） | ❌ 未保存 | ✅ **仍跳转** | ❌ **不提示，静默失败** |
-| 主 Mutation 成功，两个保存都失败 | ✅ 已创建 | ❌ 未保存 | ❌ 未保存 | ✅ **仍跳转** | ❌ **不提示，静默失败** |
+| 失败场景 | 资源已存在 | 自定义属性 | 资源设置 | 是否跳转 | 用户是否感知 |
+|---------|-----------|-----------|---------|---------|------------|
+| 主 Mutation 失败（如 blueprint 禁用） | ❌ 未创建 | - | - | ❌ 不跳转 | ✅ Snackbar 显示主 Mutation 错误 |
+| 主 Mutation 成功，自定义属性保存失败 | ✅ 已创建 | ❌ 未保存 | ✅ 已保存（如果另一个没失败） | ❌ **不跳转**（await throw 中断 onResourceCreated） | ✅ Snackbar 显示 updateResourceError |
+| 主 Mutation 成功，资源设置保存失败 | ✅ 已创建 | ✅ 已保存（如果另一个没失败） | ❌ 未保存 | ❌ **不跳转**（await throw 中断 onResourceCreated） | ✅ Snackbar 显示 updateError |
+| 主 Mutation 成功，两个保存都失败 | ✅ 已创建 | ❌ 未保存 | ❌ 未保存 | ❌ **不跳转** | ✅ Snackbar 显示最先失败的那个 |
 
-#### 7.5.3 后端无事务回滚机制
+#### 7.5.4 保存失败的错误为何能被 Snackbar 捕获
+
+虽然 Promise 链上的 reject 被 `.catch(console.error)` 静默吞掉了，但 Apollo Client 的 `useMutation` **独立管理**每个请求的 error 状态，与外层 Promise 是否被 catch 无关：
+
+```typescript
+// useCreateResource.ts:20-22
+const [updateResource, { error: updateResourceError }] = useMutation(UPDATE_RESOURCE);
+
+// useResourceSettings.tsx:30-37
+const [updateResourceSettings, { error: updateError }] = useMutation(UPDATE_RESOURCE_SETTINGS);
+
+// useCreateResource.ts:129-134
+return {
+  errorCreateResource:
+    errorCreateComponent ||
+    updateError ||                // Apollo 内部设置，不受 Promise.catch 影响
+    updateResourceError ||         // Apollo 内部设置，不受 Promise.catch 影响
+    errorCreateServiceFromTemplate,
+};
+```
+
+执行机制：
+1. HTTP 请求返回 4xx/5xx → Apollo Client 内部触发 `onError` 钩子 → 将 `error` 设置为 `ApolloError` 对象
+2. `useMutation` 返回的 `error` 状态更新触发组件 re-render
+3. `errorCreateResource` 通过 `||` 短路求值，会取第一个有值的 error（优先级：`errorCreateComponent` → `updateError` → `updateResourceError` → `errorCreateServiceFromTemplate`）
+4. 在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L497-L501) 中，`Boolean(errorCreateResource)` 为 true 时 Snackbar 显示 `formatError(errorCreateResource)`
+
+**注意**：保存阶段失败时，由于跳转未执行，用户仍停留在创建表单页，看到 Snackbar 错误提示，此时数据库中的 Resource 已创建但缺少属性。
+
+#### 7.5.5 后端无事务回滚机制
 
 后端 [serviceTemplate.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L242-L371) 的 `createResourceFromTemplate` 内部没有使用 Prisma `$transaction`，步骤之间是串行 await：
 
@@ -762,7 +801,7 @@ Step2 获取版本
   ↓
 Step3 校验 Blueprint
   ↓
-Step4-5 创建资源 (prisma.resource.create) ← 如果后续步骤失败，资源已落库，不会回滚
+Step4-5 内部创建资源 (prisma.resource.create) ← 资源已落库，后续失败不回滚
   ↓
 Step6 写 ResourceTemplateVersion Block
   ↓
@@ -771,9 +810,9 @@ Step7 copyPluginInstallations (逐个创建 PluginInstallation)
 Step8 commit（可选）
 ```
 
-如果 Step 6、7、8 中的任何一步失败，**之前已创建的 Resource 及已安装的插件都不会被删除或回滚**，数据库处于"半成品"状态。
+如果 Step 6、7、8 中的任何一步失败，后端会 throw `AmplicationError` → 主 Mutation 返回 error → 前端不进入保存阶段、不跳转、显示 Snackbar → 但数据库中已创建的 Resource 及部分 PluginInstallation **不会被删除或回滚**，属于「后端内部半成品」。
 
-### 7.6 跳转时机：主 Mutation 成功即跳转，不等保存完成
+### 7.6 跳转时机：保存全部成功后才跳转
 
 跳转逻辑在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L168-L174) 的 `handleResourceCreated` 回调中：
 
@@ -794,8 +833,8 @@ const handleResourceCreated = useCallback(
 createServiceFromTemplateInternal(...)
   .then(async (result) => {
     if (result.data?.createResourceFromTemplate) {
-      await saveResourceSettings(...);      // 先 await 保存
-      onResourceCreated &&                   // 保存完成后才触发回调
+      await saveResourceSettings(...);      // 先 await 保存（任何一个失败就 throw）
+      onResourceCreated &&                   // 只有全部保存成功才会执行到这里
         onResourceCreated(result.data.createResourceFromTemplate);
     }
   })
@@ -803,13 +842,16 @@ createServiceFromTemplateInternal(...)
 
 **执行顺序**：
 1. `createServiceFromTemplateInternal` resolve → 主 Mutation 成功，拿到 resource 对象
-2. `await saveResourceSettings(...)` → **等待**两个属性保存请求完成（或失败）
+2. `await saveResourceSettings(...)` → 并发发出 UPDATE_RESOURCE 和 UPDATE_RESOURCE_SETTINGS
+   - 两个都成功 → Promise.all resolve → 继续
+   - 任一失败 → Promise.all reject → async throw → 跳到外层 `.catch(console.error)` → `onResourceCreated` 不执行
 3. `onResourceCreated(...)` → 触发 `handleResourceCreated` → `reloadCatalog()` + `history.push(...)`
 
-**关键点**：
-- `saveResourceSettings` 用 `await`，所以跳转**确实会等**保存完成（或失败）
-- 但因为没有 `.catch` 处理保存的 reject，保存失败只是被静默吞掉，跳转仍会执行
-- **跳转的触发条件只有一个**：主 Mutation 返回了 `createResourceFromTemplate.id`
+**跳转的两个必要条件（必须同时满足）**：
+- 条件 A：主 Mutation 返回了 `createResourceFromTemplate.id`（后端所有步骤完成）
+- 条件 B：`saveResourceSettings` 返回的 `Promise.all` resolve（两个保存请求全部成功）
+
+任一条件不满足都不会跳转。
 
 #### 7.6.1 对比：useResources 中的另一套跳转逻辑
 
@@ -842,43 +884,45 @@ const createServiceFromTemplate = (data) => {
 
 ### 7.7 与模板安装主 Mutation 的关系总结
 
-整个流程可以概括为「**1 + 2 + 1**」四个独立请求：
+整个流程可以概括为「**1 + 2 + 1**」四个独立请求，但跳转必须等前三个请求全部成功：
 
 ```
 请求 1：createResourceFromTemplate（主 Mutation，服务端处理 8 步）
-  ↓ 成功返回 resource.id
+  ↓ 成功返回 resource.id（失败 → 中断、显示错误、不跳转）
   ├─ 请求 2：UPDATE_RESOURCE（保存 catalogProperties 到 Resource.properties）
   ├─ 请求 3：UPDATE_RESOURCE_SETTINGS（保存 settings 到 ResourceSettings）
-  ↓ 请求 2 & 3 无论成败
+  ↓ 请求 2 & 3 必须全部成功（任一失败 → 中断跳转、显示对应错误）
 请求 4（可选）：reloadCatalog / reloadResources（刷新前端列表缓存）
   ↓
 跳转 history.push(/newResourceId)
 ```
 
-| 请求 | 失败是否中断流程 | 失败是否回滚已创建资源 | 用户是否感知 |
+| 请求 | 失败是否中断跳转 | 失败是否回滚已创建资源 | 用户是否感知 |
 |------|----------------|---------------------|------------|
 | 请求 1（主 Mutation） | ✅ 中断（无后续请求，不跳转） | - | ✅ Snackbar 显示 GraphQL 错误 |
-| 请求 2（自定义属性） | ❌ 不中断 | ❌ 不回滚 | ❌ 静默失败 |
-| 请求 3（资源设置） | ❌ 不中断 | ❌ 不回滚 | ❌ 静默失败 |
-| 请求 4（刷新缓存） | ❌ 不中断（失败仍跳转） | - | ❌ 静默失败 |
+| 请求 2（自定义属性） | ✅ 中断跳转（await throw → onResourceCreated 不执行） | ❌ 不回滚（Resource 已在 DB） | ✅ Snackbar 显示 updateResourceError |
+| 请求 3（资源设置） | ✅ 中断跳转（await throw → onResourceCreated 不执行） | ❌ 不回滚（Resource 已在 DB） | ✅ Snackbar 显示 updateError |
+| 请求 4（刷新缓存） | ❌ 不中断（即使失败仍跳转，因为在 onResourceCreated 内部同步执行） | - | ❌ 静默失败（reloadCatalog 的 error 不影响页面跳转） |
 
-#### 7.7.1 主 Mutation 的错误展示路径
+#### 7.7.1 所有错误都通过 Snackbar 展示
 
-只有主 Mutation（`createResourceFromTemplate`）的错误会通过 `errorCreateResource` 暴露给 UI：
+`errorCreateResource` 用 `||` 短路拼接了四个来源的错误，**保存阶段的错误确实能被 UI 看到**，不存在之前猜测的 UX Bug：
 
 ```typescript
 // useCreateResource.ts:129-134
 return {
   errorCreateResource:
     errorCreateComponent ||
-    updateError ||                    // UPDATE_RESOURCE_SETTINGS 的错误（来自 useResourceSettings）
-    updateResourceError ||            // UPDATE_RESOURCE 的错误
+    updateError ||                    // UPDATE_RESOURCE_SETTINGS 的错误（Apollo 独立状态）
+    updateResourceError ||            // UPDATE_RESOURCE 的错误（Apollo 独立状态）
     errorCreateServiceFromTemplate,   // 主 Mutation 的错误
   // ...
 };
 ```
 
-在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L216-L217) 和 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L497-L501)：
+Apollo Client 的 `useMutation` error 状态与 Promise 链解耦：HTTP 请求失败时，Apollo 内部自动设置 `error`，不管外层 `.catch(console.error)` 是否吞掉了 Promise reject。
+
+错误展示在 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L216-L217) 和 [CreateResourceForm.tsx](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/Resource/create-resource-page/CreateResourceForm.tsx#L497-L501)：
 
 ```typescript
 const errorMessage = formatError(errorCreateResource);
@@ -894,7 +938,36 @@ const errorMessage = formatError(errorCreateResource);
 
 `formatError` 的实现见 [error.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-client/src/util/error.ts#L4-L23)，会提取 Apollo `graphQLErrors[0].message` 展示给用户。
 
-**注意**：虽然 `errorCreateResource` 也拼接了 `updateError` 和 `updateResourceError`（理论上保存阶段的错误也应该被显示），但由于 `saveResourceSettings` 内部没有 `await` 之后的错误传播处理，实际运行时这些错误可能不会正确冒泡到 Snackbar——因为 Promise 被 `.catch(console.error)` 吞掉了，这是一个潜在的 UX Bug。
+#### 7.7.2 半成品资源的精确边界
+
+半成品资源分两层，取决于失败发生在哪一阶段：
+
+**第一层：后端内部半成品（主 Mutation 失败）**
+
+发生在后端 [serviceTemplate.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/54-amplication/packages/amplication-server/src/core/resource/serviceTemplate.service.ts#L242-L371) 的 8 个步骤之间（无事务保护）：
+
+| 失败发生步骤 | Resource 已创建 | ResourceTemplateVersion Block | PluginInstallation 已拷贝 | commit 已提交 | 前端收到 |
+|------------|---------------|-----------------------------|-------------------------|-------------|---------|
+| Step 1-3 失败（校验阶段） | ❌ | ❌ | ❌ | ❌ | error |
+| Step 4-5 失败（创建资源） | ❌ / ✅（取决于 prisma.resource.create 之前/之后） | ❌ | ❌ | ❌ | error |
+| Step 6 失败（写 TemplateVersion） | ✅ | ❌ | ❌ | ❌ | error |
+| Step 7 失败（拷贝插件，逐个创建） | ✅ | ✅ | ⚠️ 部分成功 | ❌ | error |
+| Step 8 失败（commit / analytics） | ✅ | ✅ | ✅ | ❌ / ✅ | error |
+
+**特征**：前端看到主 Mutation 错误，不跳转，用户感知到失败，但数据库可能残留一个「缺 Block / 缺插件 / 没提交」的 Resource。
+
+**第二层：前后端分离半成品（主 Mutation 成功，保存阶段失败）**
+
+此时后端 8 个步骤全部完成，Resource 是完整的（有 Block、有插件），但前端两个保存请求至少一个失败：
+
+| 失败请求 | Resource.properties | ResourceSettings | 用户体验 |
+|---------|-------------------|------------------|---------|
+| 都成功 | ✅ 已写入 | ✅ 已写入 | 跳转新资源页，用户无感知 |
+| UPDATE_RESOURCE 失败 | ❌ 未写入 | ✅ 已写入 | 停留在创建页，Snackbar 显示属性保存错误，Resource 无自定义属性 |
+| UPDATE_RESOURCE_SETTINGS 失败 | ✅ 已写入 | ❌ 未写入 | 停留在创建页，Snackbar 显示设置保存错误，Resource 无 Blueprint 设置 |
+| 都失败 | ❌ 未写入 | ❌ 未写入 | 停留在创建页，Snackbar 显示最先失败的错误，Resource 只有基础字段 |
+
+**特征**：数据库中 Resource 基础信息完整（name、description、blueprint、gitRepository、plugins 等都在），但 `properties` 字段和关联的 `ResourceSettings` entity 可能缺失。用户可以在创建页看到 Snackbar 错误并选择重试或手动跳转。
 
 ---
 
