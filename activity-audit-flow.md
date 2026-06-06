@@ -5,20 +5,23 @@
 Amplication 的 Activity Log 与审计线索通过 **四层嵌套数据模型 + 两套独立 Kafka 事件流** 实现，将用户操作、资源变更与异步任务执行过程完整串联。
 
 ```
-数据模型层（持久化到数据库）
+实际生效链路（代码有写入）
 ───────────────────────────────────────────────────────────────
-UserAction (用户业务操作层) ──┐
-                               ├──► Action (动作容器层)
-Build (代码构建层)     ────────┤         │
-                                     ├──► ActionStep ──► ActionLog
-Deployment (部署层) ──── 仅 schema 定义，无实际执行代码
+数据模型层：
+  UserAction (用户业务操作层) ──┐
+                                 ├──► Action (动作容器层)
+  Build (代码构建层)     ────────┤         │
+                                           ├──► ActionStep ──► ActionLog
+事件流层（Kafka）：
+  USER_ACTION_TOPIC       → 用户账户级通知事件（注册/登录/切换工作区）
+  USER_ACTION_LOG_TOPIC   → UserAction 业务操作的异步日志落库
+  USER_BUILD_TOPIC        → 构建成功用户通知事件
+  DSG_LOG_TOPIC / ...     → Build 相关的异步日志落库
+
 ───────────────────────────────────────────────────────────────
-事件流层（Kafka，不经过 UserAction 表）
+仅 Prisma Schema 预留（代码无任何写入）
 ───────────────────────────────────────────────────────────────
-USER_ACTION_TOPIC       → 用户账户级通知事件（注册/登录/切换工作区）
-USER_ACTION_LOG_TOPIC   → UserAction 业务操作的异步日志落库
-USER_BUILD_TOPIC        → 构建成功用户通知事件
-DSG_LOG_TOPIC / ...     → Build 相关的异步日志落库
+  Deployment (部署层) ── schema 定义 actionId 外键，但从未被填充
 ```
 
 ### 核心模块位置
@@ -38,14 +41,15 @@ DSG_LOG_TOPIC / ...     → Build 相关的异步日志落库
 ### 2.1 ER 图
 
 ```
-UserAction ──┐
-             ├──► User (userId)
-             ├──► Resource (resourceId)
-             └──► Action ──► ActionStep ──► ActionLog
-Build ───────┘         ▲
-                           │
-                (Build 实际执行并写日志)
-                (Deployment 仅有 Prisma schema 定义，无实际执行代码)
+实际写入数据库的关联：
+  UserAction ──┐
+               ├──► User (userId)
+               ├──► Resource (resourceId)
+               └──► Action ──► ActionStep ──► ActionLog
+  Build ───────┘
+
+仅 Schema 层定义、无任何代码写入：
+  Deployment ── actionId (FK) ──► Action  (外键存在，但从未被填充)
 ```
 
 ### 2.2 各层模型详解
@@ -76,7 +80,12 @@ Build ───────┘         ▲
 | `id` | String | CUID 主键 |
 | `steps` | ActionStep[] | 包含的执行步骤 |
 
-**关键关联**：`UserAction`、`Build`、`Deployment` 三者均通过 `actionId` 外键关联到 Action，共享同一套 Step/Log 追踪机制。
+**实际使用 Action 的模型（代码有写入）**：
+- `UserAction`：通过 `actionId` 关联，完整使用 Action → ActionStep → ActionLog 四层链路
+- `Build`：通过 `actionId` 关联，独立创建 Step 并通过 Kafka 持续写入 Log
+
+**仅 Schema 层预留（无任何代码写入）**：
+- `Deployment`：Prisma schema 定义了 `actionId` 外键，但全局搜索无任何 `prisma.deployment.create/update` 调用，该字段从未被填充
 
 #### ActionStep - 执行步骤层
 定义于 [schema.prisma#ActionStep](file:///d:/fz/0601/solo-dogfeeding/code/45-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L461-L473)
