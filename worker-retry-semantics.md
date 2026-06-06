@@ -214,32 +214,139 @@ async onPackageManagerCreateSuccess(@Payload() message) {
 
 ---
 
-#### 3.2.2 git-sync-manager 消费者（EE，使用 Pacemaker）
+#### 3.2.2 git-sync-manager 消费者（EE，使用 Pacemaker）——逐行精确边界分析
 
-**消费者：`CREATE_PR_REQUEST_TOPIC`**
-[pull-request.controller.ts#L54-L162](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L54-L162)
+git-sync-manager 有两个消费者：`CREATE_PR_REQUEST_TOPIC`（PR 创建）和 `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC`（私有插件下载）。它们的 try/catch 边界比表面看起来要复杂得多——**并非所有异常都能被捕获**，存在多个会触发 Kafka 重投的逃逸路径。
+
+---
+
+##### 3.2.2.1 `CREATE_PR_REQUEST_TOPIC` 逐行异常边界分析
+
+代码位置：[pull-request.controller.ts#L54-L162](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L54-L162)
+
+整体结构分为三段：**try 块之外（L59-L86）→ try 块之内（L87-L157）→ try 块之后（L159-L161）**
+
+```
+handler generatePullRequest()
+├── [L59-L86] try 块之外 — 异常直接触发 Kafka 重投 ⚠️
+│    ├── L59:  Date.now() — 安全
+│    ├── L60:  plainToInstance(CreatePrRequest.Value, message) — 安全
+│    ├── L61:  validateOrReject(validArgs) — ❌ 校验失败直接抛
+│    ├── L63-65: context.getMessage() offset/topic/partition — 安全
+│    ├── L66-69: plainToInstance(CreatePrRequest.Key, key.toString())
+│    │              — ❌ key 为 null/undefined 时 toString() 抛
+│    ├── L70-73: logger.child() — 安全
+│    ├── L75-79: this.log() → emitMessage(CREATE_PR_LOG_TOPIC)
+│    │              — ❌ Kafka broker 不可用时抛
+│    └── L80-85: logger.info() — 安全（本地日志）
+│
+├── [L87-L157] try 块之内
+│    ├── [L88-L92] KafkaPacemaker.wrapLongRunningMethod(
+│    │                context, () => createPullRequest(validArgs)
+│    │              )
+│    │              — ✅ Pacemaker 覆盖（仅此处），异常进入 catch
+│    ├── [L94-L99] logger.info('Finish process, committing') — 安全
+│    ├── [L101-L115] emitMessage(CREATE_PR_SUCCESS_TOPIC)
+│    │                  — ❌ 抛异常进入 catch 块
+│    │
+│    └── [L116-L156] catch (error)
+│         ├── L117:  instanceof NoChangesOnPullRequest?
+│         ├──   YES:
+│         │    ├── L118-L122: this.log() → emitMessage(CREATE_PR_LOG_TOPIC)
+│         │    │                  — ❌ 抛异常逃离 catch → Kafka 重投
+│         │    └── L123-L133: emitMessage(CREATE_PR_SUCCESS_TOPIC)
+│         │                       — ❌ 抛异常逃离 catch → Kafka 重投
+│         ├──   NO:
+│         │    ├── L137-L140: logger.error() — 安全
+│         │    └── L142-L156: emitMessage(CREATE_PR_FAILURE_TOPIC)
+│         │                       — ❌ 抛异常逃离 catch → Kafka 重投
+│         └──   两个分支中任何 emit 失败，异常都会逃离 catch 块
+│
+└── [L159-L161] try 块之后
+     └── logger.info('Pull request item processed') — 安全
+```
+
+**逃逸路径汇总（触发 Kafka 重投）**：
+
+| 路径 | 位置 | 触发条件 | 异常类型 |
+|---|---|---|---|
+| ① | L61 `validateOrReject` | 消息格式不符合 class-validator 规则 | `ValidationError` 数组 |
+| ② | L68 `key.toString()` | Kafka 消息 key 为 null/undefined | `TypeError: Cannot read properties of null` |
+| ③ | L75 `this.log()` → `emitMessage(CREATE_PR_LOG_TOPIC)` | Kafka broker 不可用、序列化失败 | KafkaJS producer error / serializer error |
+| ④ | L118 catch 内 `this.log()` (NoChanges 分支) | Kafka broker 不可用 | 同上 |
+| ⑤ | L123 catch 内 `emitMessage(CREATE_PR_SUCCESS)` (NoChanges 分支) | Kafka broker 不可用 | 同上 |
+| ⑥ | L153 catch 内 `emitMessage(CREATE_PR_FAILURE)` | Kafka broker 不可用 | 同上 |
+
+> 💡 **关键洞察**：路径 ① 和 ② 是**永久性错误**（坏消息永远无法通过校验），如果没有死信队列，会导致 Kafka **无限重投同一条坏消息**。路径 ③~⑥ 是**瞬时性错误**（Kafka broker 恢复后可自愈）。
+
+---
+
+##### 3.2.2.2 `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` 逐行异常边界分析
+
+代码位置：[private-plugin.controller.ts#L32-L84](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L32-L84)
+
+```
+handler downloadPrivatePlugins()
+├── [L37-L46] try 块之外 — 异常直接触发 Kafka 重投 ⚠️
+│    ├── L37-40: plainToInstance(Key, key.toString())
+│    │              — ❌ key 为 null/undefined 时 toString() 抛
+│    ├── L42-45: plainToInstance(Value, message) — 安全
+│    └── L46:    validateOrReject(validArgs) — ❌ 校验失败直接抛
+│
+├── [L48-L83] try 块之内
+│    ├── [L49-L53] KafkaPacemaker.wrapLongRunningMethod(
+│    │                context, () => downloadPrivatePlugins(validArgs)
+│    │              )
+│    │              — ✅ Pacemaker 覆盖（仅此处），异常进入 catch
+│    ├── [L55-L67] emitMessage(DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC)
+│    │              — ❌ 抛异常进入 catch 块
+│    │
+│    └── [L68-L83] catch (error)
+│         ├── L69:    logger.error() — 安全
+│         └── L70-L82: emitMessage(DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC)
+│                        — ❌ 抛异常逃离 catch → Kafka 重投
+│
+└── (无 try 后代码)
+```
+
+**逃逸路径汇总（触发 Kafka 重投）**：
+
+| 路径 | 位置 | 触发条件 | 异常类型 |
+|---|---|---|---|
+| ① | L39 `key.toString()` | Kafka 消息 key 为 null/undefined | `TypeError: Cannot read properties of null` |
+| ② | L46 `validateOrReject` | 消息格式不符合 class-validator 规则 | `ValidationError` 数组 |
+| ③ | L79 catch 内 `emitMessage(DOWNLOAD_PRIVATE_PLUGINS_FAILURE)` | Kafka broker 不可用 | KafkaJS producer error |
+
+---
+
+##### 3.2.2.3 `emitMessage` 的异常来源
+
+所有逃逸路径中的 `emitMessage` 都经过 [KafkaProducer.service.ts#L22-L38](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts#L22-L38)，其中有两个抛异常点：
 
 ```typescript
-@EventPattern(KAFKA_TOPICS.CREATE_PR_REQUEST_TOPIC)
-async generatePullRequest(@Payload() message, @Ctx() context: KafkaContext) {
-  // ... 参数校验 ...
-  try {
-    const result = await KafkaPacemaker.wrapLongRunningMethod(
-      context,
-      () => this.pullRequestService.createPullRequest(validArgs)
-    );
-    await this.producerService.emitMessage(CREATE_PR_SUCCESS_TOPIC, ...);
-  } catch (error) {
-    // 包括 NoChangesOnPullRequest 特殊分支
-    await this.producerService.emitMessage(CREATE_PR_FAILURE_TOPIC, ...);
-  }
+async emitMessage(topic, message, schemaIds?) {
+  const kafkaMessage = await this.serializer.serialize(message, schemaIds);
+  //                                                  ^^^^ 抛点 1: 序列化失败
+  return await new Promise((resolve, reject) => {
+    this.kafkaClient.emit(topic, kafkaMessage).subscribe({
+      error: (err) => reject(err),  // 抛点 2: Kafka produce 失败
+      next: () => resolve(),
+    });
+  });
 }
 ```
 
-**消费者：`DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC`**
-[private-plugin.controller.ts#L32-L84](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L32-L84) — 同样的 try/catch 模式。
+序列化器实现 [KafkaMessageJsonSerializer.ts#L58-L80](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/libs/util/kafka/src/lib/serializer/json/KafkaMessageJsonSerializer.ts#L58-L80) 中，`serialize()` 使用 `JSON.stringify()` + `Buffer.from()`，对于正常对象不会抛异常（反序列化才会对前导零字节做二进制检测并抛异常）。因此实际生产中，`emitMessage` 抛出异常的主要来源是 **Kafka broker 不可用**。
 
-**结论**：✅ **无 Kafka 重投**。所有异常都被 try/catch 捕获并转化为 `CREATE_PR_SUCCESS/FAILURE` 或 `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE` 业务事件。
+---
+
+##### 3.2.2.4 结论
+
+git-sync-manager 的两个消费者 **并非完全无 Kafka 重投风险**。精确结论：
+
+- ✅ **核心业务异常（git 操作失败、插件下载失败）**：被 try/catch 捕获，转化为业务失败事件，**无 Kafka 重投**
+- ❌ **参数校验失败、消息 key 为空**：在 try 块之外，**直接触发 Kafka 重投**（永久性错误，无限循环）
+- ❌ **catch 块内发送失败/日志事件失败**：异常逃离 catch，**触发 Kafka 重投**（瞬时错误，Kafka 恢复后自愈）
 
 ---
 
@@ -271,29 +378,82 @@ async generatePullRequest(@Payload() message, @Ctx() context: KafkaContext) {
 
 **使用范围**：仅 `ee/packages/git-sync-manager` 的两个消费者使用。`amplication-build-manager` 和 `amplication-server` 的所有 Kafka 消费者**均未使用** Pacemaker（甚至没有注入 `@Ctx() KafkaContext`）。
 
-**使用场景**：git 操作（clone、diff、push、create PR）和私有插件下载通常耗时数分钟，远超默认的 `sessionTimeout`（30s）。如果在处理期间不发送心跳，Consumer 会被踢出 Group，导致消息被重新投递（造成重复执行）。
+---
 
-`KafkaPacemaker.wrapLongRunningMethod()` 解决此问题：
+#### 3.3.1 Pacemaker 精确覆盖范围
+
+Pacemaker 仅覆盖两个消费者 handler 中**一行代码**——核心业务服务方法调用：
+
+| 消费者 | Pacemaker 覆盖的代码 | 覆盖行数 |
+|---|---|---|
+| `CREATE_PR_REQUEST_TOPIC` | `() => this.pullRequestService.createPullRequest(validArgs)` | [pull-request.controller.ts#L89-L92](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L89-L92) |
+| `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | `() => this.privatePluginService.downloadPrivatePlugins(validArgs)` | [private-plugin.controller.ts#L49-L53](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L49-L53) |
+
+**未被 Pacemaker 覆盖的代码**（在 handler 中但不在 `wrapLongRunningMethod` 内）：
+
+| 代码段 | 所在位置 | 耗时风险 |
+|---|---|---|
+| 参数校验 `validateOrReject` | try 外 L61 / L46 | 毫秒级，可忽略 |
+| key 解析 `plainToInstance(...Key, key.toString())` | try 外 L66-L69 / L37-L40 | 毫秒级，可忽略 |
+| 前置日志 `this.log()` → `emitMessage(CREATE_PR_LOG_TOPIC)` | try 外 L75-L79（仅 PR 创建） | 毫秒级（Kafka 同步发送），broker 故障时可能阻塞 |
+| 成功事件发送 `emitMessage(CREATE_PR_SUCCESS)` / `emitMessage(DOWNLOAD_PRIVATE_PLUGINS_SUCCESS)` | try 内 L101-L115 / L55-L67 | 毫秒级（Kafka 同步发送） |
+| 失败事件发送 `emitMessage(CREATE_PR_FAILURE)` 等 | catch 内 L123-L156 / L70-L82 | 毫秒级（Kafka 同步发送） |
+| 本地日志 `logger.info()` / `logger.error()` | 多处 | 微秒级 |
+
+> 💡 **设计合理性分析**：虽然严格来说前置日志 `this.log()` 也可能因 Kafka 故障阻塞超过 30s，但 `this.log()` 在 try 块之外——如果它抛异常会直接触发 Kafka 重投，Pacemaker 也没必要保护它。真正耗时的是 git clone、diff、push 等 I/O 密集操作，这些全部在 `createPullRequest()` 和 `downloadPrivatePlugins()` 内部，Pacemaker 的覆盖范围是**正确且足够的**。
+
+---
+
+#### 3.3.2 Pacemaker 内部实现与异常语义
 
 ```typescript
-static async wrapLongRunningMethod(kafkaContext, fn, timeout = 3000) {
+static async wrapLongRunningMethod<T>(
+  kafkaContext: KafkaContext,
+  fn: () => Promise<T>,
+  timeout = 3000
+) {
   const heartbeat = kafkaContext.getHeartbeat();
+  const sleep = promisify(setTimeout);
   let isFnDone = false;
 
-  const fnPromise = fn(); // 启动业务函数
+  const wrappedFn = async () => {
+    const result = await fn();    // ① 启动业务函数
+    isFnDone = true;
+    return result;
+  };
+
+  const fnPromise = wrappedFn();
 
   while (!isFnDone) {
-    // 每 timeout 毫秒抢一次：要么业务完成，要么到点发心跳
-    await Promise.race([fnPromise, sleep(timeout)]);
+    await Promise.race([fnPromise, sleep(timeout)]);  // ② 每 3s 抢一次
     try {
-      await heartbeat();     // 向 Broker 发送心跳，延长 session
-    } catch (e) { /* swallow */ }
+      await heartbeat();       // ③ 发送心跳
+    } catch (error) {
+      // swallow — 心跳失败不影响业务函数
+    }
   }
-  return await fnPromise;
+
+  return await fnPromise;  // ④ 业务函数的异常直接由此 re-throw
 }
 ```
 
-**工作原理**：在业务函数执行期间，后台每 3 秒调用一次 `heartbeat()`，让 Group Coordinator 知道这个 Consumer 还活着。
+**关键行为**：
+
+1. **心跳失败被吞没**（③处 try/catch）：如果心跳发送失败（例如短暂网络闪断），Pacemaker 不会中断业务函数，继续循环。这是正确的——偶尔的心跳失败不足以让 Consumer 被踢出 Group（需要连续超过 `sessionTimeout`=30s 未收到心跳）。
+
+2. **业务异常原样传递**（④处 `return await fnPromise`）：如果 `fn()` 抛异常，Pacemaker 会原封不动地 re-throw。异常不会在 Pacemaker 内部被吞掉，会正常进入外层 try/catch 的 catch 分支。
+
+3. **与外层 try/catch 的配合**：Pacemaker 位于 try 块内部，所以：
+   - 业务成功 → 正常返回 → 继续执行成功事件发送
+   - 业务失败 → 异常 re-throw → 被外层 catch 捕获 → 发送业务失败事件
+
+---
+
+#### 3.3.3 使用场景
+
+git 操作（clone、diff、push、create PR）和私有插件下载通常耗时数分钟，远超默认的 `sessionTimeout`（30s）。如果在处理期间不发送心跳，Consumer 会被踢出 Group，导致消息被重新投递（造成重复执行）。
+
+Pacemaker 的工作原理是：在业务函数执行期间，后台每 3 秒调用一次 `heartbeat()`，让 Group Coordinator 知道这个 Consumer 还活着。
 
 ---
 
@@ -407,9 +567,11 @@ isBuildStale(build) {
    - `onPackageManagerCreateSuccess/Failure`：这两个 handler 无 try/catch，任何异常都会触发重投。
    - 幂等保障：`setJobStatus()` 是幂等的（同状态重复写入不改变结果）；`runBuild()` 重新读取共享目录的数据并重新执行；DSG Runner 被设计为可重复调用。
 
-2. **git-sync-manager 崩溃重启**：
-   - 如果在 `createPullRequest()` 执行过程中崩溃（Pacemaker 心跳也随之停止），超过 sessionTimeout 后 Group Coordinator 会触发 Rebalance，消息被重新分配给其他实例。
-   - 由于 git 操作（创建 PR）本身不是幂等的，重复执行可能导致创建重复 PR。但由于 Pacemaker 的存在，只要进程不崩溃就不会因超时而重投。
+2. **git-sync-manager 崩溃或异常逃逸**：
+   - **进程崩溃**：如果在 `createPullRequest()` / `downloadPrivatePlugins()` 执行过程中崩溃（Pacemaker 心跳也随之停止），超过 `sessionTimeout` 后 Group Coordinator 会触发 Rebalance，消息被重新分配给其他实例。
+   - **try 块外异常逃逸**：`validateOrReject` 失败（消息格式错误）或 `key.toString()` 失败（消息 key 为 null）直接触发 Kafka 重投。这是**永久性错误**，会无限循环。
+   - **catch 块内异常二次逃逸**：catch 中发送 `CREATE_PR_FAILURE` / `CREATE_PR_SUCCESS` 等 Kafka 事件时，如果 broker 不可用，异常逃离 catch 触发 Kafka 重投。Kafka 恢复后消息被重新消费，git 操作重新执行——可能创建重复 PR。
+   - 由于 git 操作（创建 PR）本身不是幂等的，上述场景中重复执行可能导致创建重复 PR。Pacemaker 仅保证**进程存活且执行核心业务函数期间**不会因会话超时而重投。
 
 3. **amplication-server 崩溃重启**：
    - 大多数消费者有 try/catch（不会触发重投），但如果进程在 handler 执行过程中崩溃，offset 未 commit，消息会被 Kafka 重投。
@@ -460,11 +622,14 @@ isBuildStale(build) {
     │    ├── actionService.complete(step, Failed)
     │    └── updateBuildStatuses(buildId, Failed, Canceled)
     ▼
-[6] git-sync-manager 消费 CREATE_PR_REQUEST (使用 Pacemaker + try/catch，无 Kafka 重投)
+[6] git-sync-manager 消费 CREATE_PR_REQUEST (Pacemaker 仅覆盖 createPullRequest)
     │  PullRequestController.generatePullRequest()
-    │  ├── KafkaPacemaker.wrapLongRunningMethod(context, () => createPullRequest())
-    │  │    └── 每 3s 心跳保活
-    │  └── 完成后 emit CREATE_PR_SUCCESS_TOPIC / CREATE_PR_FAILURE_TOPIC
+    │  ├── [try外] 参数校验、key 解析、前置日志 — 异常直接 Kafka 重投
+    │  ├── [try内] KafkaPacemaker.wrapLongRunningMethod(context, () => createPullRequest())
+    │  │    └── 每 3s 心跳保活，业务异常 re-throw 进入 catch
+    │  ├── [try内] 成功: emit CREATE_PR_SUCCESS_TOPIC — 失败进入 catch
+    │  └── [catch] emit CREATE_PR_FAILURE_TOPIC / CREATE_PR_SUCCESS_TOPIC(无变更)
+    │       注意: catch 内 emit 失败 → 异常逃离 catch → Kafka 重投
     ▼
 [7] amplication-server 消费 CREATE_PR_SUCCESS / CREATE_PR_FAILURE
     └── 更新 Build.gitStatus + 对应 ActionStep 状态
@@ -482,10 +647,15 @@ isBuildStale(build) {
 
 ### ⚠️ 潜在风险点
 1. **Redis 状态写入非原子**：`setJobStatus()` 的 read-modify-write 模式在极端并发下可能丢失状态更新
-2. **无死信队列（DLT）**：
-   - `PACKAGE_MANAGER_CREATE_SUCCESS/FAILURE`（build-manager）和 `DSG_LOG_TOPIC`（server）的消费者无 try/catch，若反复失败会无限次 Kafka 重投，没有"放弃"机制
-3. **无显式退避**：Kafka 级别的重试没有指数退避，瞬时故障可能引发消息风暴
-4. **Stale Build 被动检测**：无人查询的僵尸任务永远停留在 Running 状态
-5. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口（但仅用于用户前台编辑，影响面有限）
-6. **build-manager 未使用 Pacemaker**：如果某个极端场景下 `runBuild()` 执行超过 30 秒（例如 Redis 慢查询），Consumer 可能因会话超时被踢出 Group 导致消息重投
-7. **两套"锁"无关联但文档易混淆**：用户编辑锁与后台任务状态存储是完全独立的系统，但都被称为"锁"容易造成理解偏差
+2. **无死信队列（DLT）——永久性错误会无限循环**：
+   - `PACKAGE_MANAGER_CREATE_SUCCESS/FAILURE`（build-manager）和 `DSG_LOG_TOPIC`（server）的消费者无 try/catch，反复失败会无限次 Kafka 重投
+   - git-sync-manager 的 `validateOrReject` 失败（消息格式错误）和 `key.toString()` 失败（消息 key 为 null）位于 try 块外，**坏消息会被 Kafka 无限重投，永远无法自愈**
+3. **git-sync-manager catch 块内事件发送失败——异常二次逃逸**：
+   - `CREATE_PR_REQUEST_TOPIC` 有 3 条逃逸路径（L118 日志发送、L123 成功事件发送、L153 失败事件发送）
+   - `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` 有 1 条逃逸路径（L79 失败事件发送）
+   - 这些路径在 catch 块内，若 Kafka broker 瞬时不可用，异常会逃离 catch，触发 Kafka 重投。恢复后该消息会被重新执行，git 操作可能重复（如创建重复 PR）
+4. **无显式退避**：Kafka 级别的重试没有指数退避，瞬时故障可能引发消息风暴
+5. **Stale Build 被动检测**：无人查询的僵尸任务永远停留在 Running 状态
+6. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口（但仅用于用户前台编辑，影响面有限）
+7. **build-manager 未使用 Pacemaker**：如果某个极端场景下 `runBuild()` 执行超过 30 秒（例如 Redis 慢查询），Consumer 可能因会话超时被踢出 Group 导致消息重投
+8. **两套"锁"无关联但文档易混淆**：用户编辑锁与后台任务状态存储是完全独立的系统，但都被称为"锁"容易造成理解偏差
