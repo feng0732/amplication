@@ -514,7 +514,7 @@ handleMergeUpdatedBlock()
 
 ---
 
-## 十、升级提示创建入口的 await 链路与 Kafka 异步边界
+## 十、升级提示创建入口的查询来源与异步边界深度分析
 
 ### 10.1 告警触发的完整调用链
 
@@ -537,10 +537,12 @@ ResourceVersionService.create() [resourceVersion.service.ts#L40-L112]
              ▼
 triggerAlertsForTemplateVersion() [outdatedVersionAlert.service.ts#L179-L246]
     ├─ await prisma.resource.findUnique()  ← 校验是 ServiceTemplate
-    ├─ await blockService.findManyByBlockType()  ← 查询所有使用该模板的资源
+    ├─ await this.resourceService.resources({  ← ⚠️ 见 10.1.1 的详细查询链路
+    │      where: { serviceTemplateId, project: { workspace: { id } } }
+    │    })
     │
     └─ for (const service of services)  ← ⚠️ 串行遍历，不是并行
-         ├─ await resourceService.getServiceTemplateSettings()  ✅
+         ├─ await getServiceTemplateSettings(service.id)  ✅ ← 见 10.1.2
          └─ await outdatedVersionAlertService.create(...)       ✅
                  │
                  ▼
@@ -558,6 +560,163 @@ triggerAlertsForTemplateVersion() [outdatedVersionAlert.service.ts#L179-L246]
                            .emitMessage(...)   ← ❌ 没有 await
                            .catch(logger.error)
 ```
+
+---
+
+### 10.1.1 `serviceTemplateId` 查询来源的深度解析
+
+**关键发现**：Prisma `Resource` 表中**不存在** `serviceTemplateId` 字段。
+
+在 [schema.prisma#L219-L259](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L219-L259) 的 `model Resource` 定义中，所有字段如下：
+```
+id, createdAt, updatedAt, name, description, gitRepositoryOverride,
+githubLastSync, githubLastMessage, deletedAt, archived, gitRepositoryId,
+projectId, resourceType, codeGeneratorVersion, codeGeneratorStrategy,
+codeGeneratorName, licensed, ownershipId, properties, blueprintId
+```
+
+**没有 `serviceTemplateId` 字段！**
+
+`serviceTemplateId` 是一个定义在 [ResourceWhereInput.ts#L44](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/dto/ResourceWhereInput.ts#L44) 中的**虚拟查询字段**，仅用于 GraphQL 查询输入层，不对应数据库列。
+
+---
+
+#### 实际查询链路（两次查询 + 一次内存过滤）
+
+当调用 `resourceService.resources({ where: { serviceTemplateId } })` 时，在 [resource.service.ts#L1320-L1364](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364) 的 `prepareResourceFindManyArgsForQuery()` 中被**拦截并转换**：
+
+```
+Step 1: 解构提取虚拟字段
+    const { serviceTemplateId, ...where } = args.where;
+    ↓
+Step 2: 通过 Block 表查询匹配的资源 ID
+    resourceIds = await resourceTemplateVersionService
+        .getServiceIdsByTemplateId(workspaceId, serviceTemplateId)
+        ↓
+        内部调用 [resourceTemplateVersion.service.ts#L90-L117]
+        blockService.findManyByBlockTypeAndSettings(
+          { where: { resource.project.workspace.id } },
+          EnumBlockType.ResourceTemplateVersion,
+          { path: ["serviceTemplateId"], equals: templateId }
+        )
+        ↓
+        查询 Block 表，匹配条件：
+          - blockType = "ResourceTemplateVersion"
+          - settings.serviceTemplateId = {templateId}
+          - resource.project.workspace.id = {workspaceId}
+        ↓
+        返回 blocks.map(b => b.resourceId)  ← 所有使用该模板的资源 ID 列表
+    ↓
+Step 3: 用 ID IN 过滤 Resource 表
+    prisma.resource.findMany({
+      where: {
+        ...whereElse,
+        id: resourceIds ? { in: resourceIds } : where.id,  ← 用 IN 查询
+        deletedAt: null,
+        archived: { not: true }
+      }
+    })
+```
+
+**查询开销**：
+- 1 次 Block 表查询（JSON path 过滤 `settings.serviceTemplateId`）
+- 1 次 Resource 表查询（`id IN (...)`）
+
+---
+
+### 10.1.2 查询与告警创建的顺序与 N+1 查询问题
+
+在 [outdatedVersionAlert.service.ts#L209-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L209-L244) 的 `triggerAlertsForTemplateVersion()` 中：
+
+```typescript
+// 查询 ①：通过 Block 表 + Resource 表找出所有使用该模板的服务
+const services = await this.resourceService.resources({
+  where: {
+    serviceTemplateId: templateResourceId,
+    project: { workspace: { id: project.workspaceId } },
+  },
+});
+
+if (outdatedVersion !== null) {
+  // 串行遍历 N 个服务
+  for (const service of services) {
+    // 查询 ②：对每个服务，再次查询 Block 表读取 ResourceTemplateVersion Block
+    const currentTemplateVersion =
+      await this.resourceService.getServiceTemplateSettings(service.id, null);
+
+    // 查询 ③④...：每个服务创建告警（updateMany + create）
+    await this.create({
+      data: {
+        resource: { connect: { id: service.id } },
+        type: EnumOutdatedVersionAlertType.TemplateVersion,
+        outdatedVersion: currentTemplateVersion.version,  // ← 来自查询②
+        latestVersion,
+      },
+    }, template.name);
+  }
+}
+```
+
+#### N+1 查询问题分析
+
+| 查询 | 位置 | 目标 | 次数 |
+|------|------|------|------|
+| ① | `resourceService.resources()` | Block 表 + Resource 表找服务列表 | 1 次 |
+| ② | `getServiceTemplateSettings()` → Block 表读 version | 每个服务 1 次 | N 次 |
+| ③ | `prisma.outdatedVersionAlert.updateMany()` 旧告警 Canceled | 每个服务 1 次 | N 次 |
+| ④ | `prisma.outdatedVersionAlert.create()` 新告警 | 每个服务 1 次 | N 次 |
+| ⑤ | `raiseNotifications()` 内部 findFirst + findWorkspaceUsers | 每个服务 1 次 | N 次 |
+
+**总计：1 + 5×N 次数据库查询，全部串行执行。**
+
+**优化可能性**：查询①已经从 Block 表中读取了所有 ResourceTemplateVersion Block，可以在查询①时同时拿到 `version` 字段，不需要查询②再逐个读取。当前实现中查询①只返回了 resourceId 列表，把 Block 表中的 `settings.version` 丢弃了。
+
+---
+
+#### 两次 Block 查询之间的一致性窗口
+
+查询①和查询②之间**没有事务包裹**，存在不一致风险：
+
+| 时间点 | 操作 | 风险 |
+|--------|------|------|
+| T1 | 查询①完成，拿到服务列表 [S1, S2, S3] | — |
+| T2 | 服务 S2 在另一请求中被升级，Block 表 version 从 v1.0.0 → v1.1.0 | — |
+| T3 | 循环到 S2，查询②拿到 version = v1.1.0 | — |
+| T4 | 创建告警：outdatedVersion = v1.1.0，latestVersion = v1.1.0 | ❌ 告警中两个版本号相同，没有实际意义 |
+
+---
+
+### 10.1.3 告警类型与 blockId 的对应关系
+
+OutdatedVersionAlert 的 `blockId` 字段（见 [OutdatedVersionAlert.ts#L25-L29](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/dto/OutdatedVersionAlert.ts#L25-L29)）**并非所有告警类型都会填充**。
+
+[outdatedVersionAlert.resolver.ts#L101-L112](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.resolver.ts#L101-L112) 的 `@ResolveField block()` 中：
+```typescript
+if (!alert.blockId) {
+  return null;
+}
+```
+
+三种告警类型对 blockId 的使用：
+
+| 告警类型 | blockId 是否填充 | 关联对象 | 创建位置 |
+|---------|-----------------|---------|---------|
+| `TemplateVersion` | ❌ 始终为 null | 不关联具体 Block，只关联 resourceId | [outdatedVersionAlert.service.ts#L229-L244](file:///d:/fz/0601/solo-dogfeeding/code/47-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L229-L244) 中 `create()` 的 data 不含 `block` |
+| `PluginVersion` | ✅ 填充 PluginInstallation Block ID | 具体的插件安装 Block | `triggerAlertsForNewPluginVersion()` |
+| `CodeEngineVersion` | ✅ 填充 CodeEngineVersion Block ID | 具体的代码引擎版本 Block | （待确认调用点） |
+
+对应地，`OutdatedVersionAlertService.create()` 中旧告警 Canceled 的逻辑也依赖 blockId：
+```typescript
+// [outdatedVersionAlert.service.ts#L50-L56]
+where: {
+  resourceId: args.data.resource.connect.id,
+  blockId: args.data.block?.connect?.id,   // ← TemplateVersion 类型为 undefined
+  type: args.data.type,
+  status: New,
+}
+```
+
+对于 `TemplateVersion` 类型，`blockId` 条件为 `undefined`，Prisma 会忽略该条件，效果是"取消该资源下所有 TemplateVersion 类型的 New 告警"——这是正确的，因为模板版本告警是针对整个资源的。
 
 ---
 
@@ -820,6 +979,50 @@ await Promise.all(emitPromises);
 ### 修复 4（可选增强）：使用事务保证一致性
 
 将 ①②③④ 纳入同一个数据库事务中，确保要么全部成功，要么全部回滚。当前所有操作都是独立的 `prisma.update()` / `prisma.updateMany()` 调用，没有事务包裹。
+
+---
+
+### 修复 5（性能优化）：消除 triggerAlertsForTemplateVersion 的 N+1 查询
+
+当前 `triggerAlertsForTemplateVersion()` 的查询链路是：
+1. 通过 Block 表查询所有匹配的 resourceId（拿到 ResourceTemplateVersion Block，但只取了 resourceId，丢弃了 settings.version）
+2. 对每个 resourceId，再查一次 Block 表读取 version
+
+优化方案：让 `getServiceIdsByTemplateId()` 同时返回 `version`，避免第二次查询。
+
+```typescript
+// ❌ 旧代码：for 循环中逐个查 version
+for (const service of services) {
+  const currentTemplateVersion =
+    await this.resourceService.getServiceTemplateSettings(service.id, null);
+  await this.create(
+    { data: { ..., outdatedVersion: currentTemplateVersion.version } },
+    template.name
+  );
+}
+
+// ✅ 优化后：一次查询拿到所有 resourceId + version
+const templateVersionBlocks =
+  await this.resourceTemplateVersionService.getBlocksByTemplateId(
+    workspaceId, templateResourceId
+  ); // 返回 [{ resourceId, version }, ...]
+
+for (const block of templateVersionBlocks) {
+  await this.create(
+    { data: { resource: { connect: { id: block.resourceId } },
+               outdatedVersion: block.version, latestVersion } },
+    template.name
+  );
+}
+```
+
+预计查询次数从 **1 + 5×N** 降至 **1 + 4×N**。
+
+---
+
+### 修复 6（一致性增强）：将 triggerAlertsForTemplateVersion 的查询与告警创建纳入事务
+
+查询①（找服务列表）与循环中的查询②（读 version）、③④（创建告警）之间无事务包裹，存在不一致窗口（如服务在中间被升级，导致 outdatedVersion == latestVersion）。建议用 `prisma.$transaction()` 将整个循环包裹，避免中间状态被外部修改干扰。
 
 ---
 
