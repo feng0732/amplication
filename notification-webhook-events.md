@@ -1,5 +1,7 @@
 # Notification 与 Webhook 事件触发路径分析
 
+> **路径说明**：本文档中所有文件链接均为**仓库根目录下的相对路径**。将仓库克隆到任意机器后，以仓库根目录为基准即可定位到对应文件。例如 `packages/amplication-server/src/core/user/user.service.ts` 对应仓库根目录下的同名文件。
+
 ## 整体架构概览
 
 Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息队列实现服务间解耦：
@@ -24,16 +26,16 @@ Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息�
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| amplication-server | [packages/amplication-server](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server) | 业务服务，产生各类事件 |
-| notification-service | [packages/notification-service](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service) | 消费 Kafka 消息并转发至 Novu |
-| schema-registry | [libs/schema-registry](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry) | Kafka Topic 定义及消息 Schema |
-| util/nestjs/kafka | [libs/util/nestjs/kafka](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/util/nestjs/kafka) | Kafka Producer/Consumer 工具 |
+| amplication-server | [packages/amplication-server](packages/amplication-server) | 业务服务，产生各类事件 |
+| notification-service | [packages/notification-service](packages/notification-service) | 消费 Kafka 消息并转发至 Novu |
+| schema-registry | [libs/schema-registry](libs/schema-registry) | Kafka Topic 定义及消息 Schema |
+| util/nestjs/kafka | [libs/util/nestjs/kafka](libs/util/nestjs/kafka) | Kafka Producer/Consumer 工具 |
 
 ---
 
 ## Kafka Topics 定义
 
-所有 Topic 定义在 [schema-registry/src/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry/src/index.ts#L29-L69) 中的 `KAFKA_TOPICS` 枚举：
+所有 Topic 定义在 [schema-registry/src/index.ts](libs/schema-registry/src/index.ts#L29-L69) 中的 `KAFKA_TOPICS` 枚举：
 
 | Topic 常量 | Topic 实际值 | 触发场景 |
 |------------|-------------|---------|
@@ -48,7 +50,7 @@ Amplication 的通知系统采用 **事件驱动架构**，通过 Kafka 消息�
 
 ### 消息消费入口
 
-通知服务通过 NestJS Microservice 监听 Kafka 消息，入口在 [app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/app.controller.ts)：
+通知服务通过 NestJS Microservice 监听 Kafka 消息，入口在 [app.controller.ts](packages/notification-service/src/app.controller.ts)：
 
 ```typescript
 @EventPattern("user-action.internal.1")
@@ -69,7 +71,7 @@ notifyTechDebt(@Payload() message, @Ctx() context: KafkaContext) { ... }
 
 ### 处理管道（Pipeline）
 
-所有监听器统一调用 [app.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/app.service.ts#L27-L41) 中的 `notificationService()`，使用 **compose 中间件模式** 串行处理：
+所有监听器统一调用 [app.service.ts](packages/notification-service/src/app.service.ts#L27-L41) 中的 `notificationService()`，使用 **compose 中间件模式** 串行处理：
 
 ```typescript
 compose(
@@ -85,7 +87,7 @@ compose(
 
 ### Novu 集成
 
-通知最终通过 [novuService.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/util/novuService.ts) 发送，支持以下操作：
+通知最终通过 [novuService.ts](packages/notification-service/src/util/novuService.ts) 发送，支持以下操作：
 
 - `createSubscriber()` / `updateSubscriber()` / `deleteSubscriber()` — 管理订阅者
 - `triggerNotificationToSubscriber()` — 向指定用户触发通知（eventName 对应 Novu 中的工作流模板）
@@ -130,7 +132,7 @@ novuService.triggerNotificationToSubscriber(eventName: "build-completed")
 
 ### 关键代码位置
 
-1. **消息发送**：[build.service.ts#L473-L492](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/build/build.service.ts#L473-L492)
+1. **消息发送**：[build.service.ts#L473-L492](packages/amplication-server/src/core/build/build.service.ts#L473-L492)
 
    ```typescript
    this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_BUILD_TOPIC, <UserBuild.KafkaEvent>{
@@ -145,9 +147,9 @@ novuService.triggerNotificationToSubscriber(eventName: "build-completed")
    })
    ```
 
-2. **消息消费处理**：[buildCompleted.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/notification-packages/buildCompleted.ts)
+2. **消息消费处理**：[buildCompleted.ts](packages/notification-service/src/notification-packages/buildCompleted.ts)
 
-3. **消息 Schema**：[user-build/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry/src/lib/user-build/value.ts)
+3. **消息 Schema**：[user-build/value.ts](libs/schema-registry/src/lib/user-build/value.ts)
 
 ### 消息体字段说明
 
@@ -201,19 +203,19 @@ novuService.triggerNotificationToSubscriber(eventName: "technical-debt-alert")
 
 ### 关键代码位置
 
-1. **版本发布入口**：[resourceVersion.service.ts#L96-L109](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/resourceVersion/resourceVersion.service.ts#L96-L109)
+1. **版本发布入口**：[resourceVersion.service.ts#L96-L109](packages/amplication-server/src/core/resourceVersion/resourceVersion.service.ts#L96-L109)
 
-2. **插件版本告警触发**：[resourceVersion.service.ts#L114-L169](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/resourceVersion/resourceVersion.service.ts#L114-L169)
+2. **插件版本告警触发**：[resourceVersion.service.ts#L114-L169](packages/amplication-server/src/core/resourceVersion/resourceVersion.service.ts#L114-L169)
 
-3. **创建告警并发送通知**：[outdatedVersionAlert.service.ts#L45-L124](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L45-L124)
+3. **创建告警并发送通知**：[outdatedVersionAlert.service.ts#L45-L124](packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L45-L124)
 
-4. **通知处理**：[techDebtAlert.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/notification-packages/techDebtAlert.ts)
+4. **通知处理**：[techDebtAlert.ts](packages/notification-service/src/notification-packages/techDebtAlert.ts)
 
-5. **消息 Schema**：[tech-debt/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry/src/lib/tech-debt/value.ts)
+5. **消息 Schema**：[tech-debt/value.ts](libs/schema-registry/src/lib/tech-debt/value.ts)
 
 ### 告警类型
 
-在 [tech-debt/value.ts#L39-L43](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry/src/lib/tech-debt/value.ts#L39-L43) 中定义了三种技术债务告警类型：
+在 [tech-debt/value.ts#L39-L43](libs/schema-registry/src/lib/tech-debt/value.ts#L39-L43) 中定义了三种技术债务告警类型：
 
 | 类型 | 触发场景 |
 |------|---------|
@@ -270,7 +272,7 @@ subscribeUser() 中间件处理                    [subscribeUser.ts]
 
 ### 关键代码位置
 
-1. **消息发送**：[user.service.ts#L175-L202](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/user/user.service.ts#L175-L202)
+1. **消息发送**：[user.service.ts#L175-L202](packages/amplication-server/src/core/user/user.service.ts#L175-L202)
 
    ```typescript
    this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_ACTION_TOPIC, <UserAction.KafkaEvent>{
@@ -283,9 +285,9 @@ subscribeUser() 中间件处理                    [subscribeUser.ts]
    })
    ```
 
-2. **订阅处理**：[subscribeUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/notification-packages/subscribeUser.ts)
+2. **订阅处理**：[subscribeUser.ts](packages/notification-service/src/notification-packages/subscribeUser.ts)
 
-3. **消息 Schema / Action 类型**：[user-action/value.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/schema-registry/src/lib/user-action/value.ts)
+3. **消息 Schema / Action 类型**：[user-action/value.ts](libs/schema-registry/src/lib/user-action/value.ts)
 
 ### UserActionType 枚举
 
@@ -360,7 +362,7 @@ subscribeUser() 中间件                    [subscribeUser.ts]
 
 #### 关键代码位置
 
-1. **Stigg Webhook 入口**：[subscription.controller.ts#L20-L32](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/subscription/subscription.controller.ts#L20-L32)
+1. **Stigg Webhook 入口**：[subscription.controller.ts#L20-L32](packages/amplication-server/src/core/subscription/subscription.controller.ts#L20-L32)
 
    ```typescript
    @Post("updateStatus")
@@ -375,7 +377,7 @@ subscribeUser() 中间件                    [subscribeUser.ts]
    }
    ```
 
-2. **订阅状态事件处理**：[subscription.service.ts#L261-L332](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/subscription/subscription.service.ts#L261-L332)
+2. **订阅状态事件处理**：[subscription.service.ts#L261-L332](packages/amplication-server/src/core/subscription/subscription.service.ts#L261-L332)
 
    处理的 Webhook 事件类型：
    | 事件类型 | 处理动作 |
@@ -389,14 +391,14 @@ subscribeUser() 中间件                    [subscribeUser.ts]
    | `promotionalEntitlement.revoked` | 直接更新 Project/Service 许可 |
    | `promotionalEntitlement.expired` | 直接更新 Project/Service 许可 |
 
-3. **Notification Billing Feature 定义**：[billing-feature.types.ts#L21](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts#L21)
+3. **Notification Billing Feature 定义**：[billing-feature.types.ts#L21](libs/util/billing-types/src/lib/billing-feature.types.ts#L21)
    ```typescript
    Notification = "feature-notifications"
    ```
 
 4. **用户侧触发点（权限拉取 + Kafka 发送）**：
-   - GraphQL 入口：[workspace.resolver.ts#L79-L92](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
-   - 权限检查 + Kafka 发送：[user.service.ts#L175-L202](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/user/user.service.ts#L175-L202)
+   - GraphQL 入口：[workspace.resolver.ts#L79-L92](packages/amplication-server/src/core/workspace/workspace.resolver.ts#L79-L92)
+   - 权限检查 + Kafka 发送：[user.service.ts#L175-L202](packages/amplication-server/src/core/user/user.service.ts#L175-L202)
 
 #### 设计要点与注意事项
 
@@ -410,7 +412,7 @@ subscribeUser() 中间件                    [subscribeUser.ts]
 
 成员邀请（邀请邮件发送）**不走 Kafka 通知管道**，而是直接调用邮件服务：
 
-- 触发位置：[workspace.service.ts#L232-L308](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/workspace/workspace.service.ts#L232-L308) `inviteUser()`
+- 触发位置：[workspace.service.ts#L232-L308](packages/amplication-server/src/core/workspace/workspace.service.ts#L232-L308) `inviteUser()`
 - 直接调用：`this.mailService.sendInvitation(...)`
 
 邀请接受（`completeInvitation`）也不会产生通知，仅更新数据模型和上报 Analytics。
@@ -447,9 +449,9 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 ### 关键代码位置
 
-1. **消息发送**：[user.service.ts#L204-L269](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/user/user.service.ts#L204-L269)
+1. **消息发送**：[user.service.ts#L204-L269](packages/amplication-server/src/core/user/user.service.ts#L204-L269)
 
-2. **通知处理**：[featureAnnouncement.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/notification-service/src/notification-packages/featureAnnouncement.ts)
+2. **通知处理**：[featureAnnouncement.ts](packages/notification-service/src/notification-packages/featureAnnouncement.ts)
 
 ### 设计要点
 
@@ -483,7 +485,7 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 ### 2. 外部 ID 加密
 
-所有用户标识在跨服务传递时通过 `encryptString(userId)` 加密（见于 [build.service.ts#L486](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/build/build.service.ts#L486)、[user.service.ts#L176](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/user/user.service.ts#L176)、[outdatedVersionAlert.service.ts#L110](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L110)），避免明文用户 ID 在消息系统中传播。
+所有用户标识在跨服务传递时通过 `encryptString(userId)` 加密（见于 [build.service.ts#L486](packages/amplication-server/src/core/build/build.service.ts#L486)、[user.service.ts#L176](packages/amplication-server/src/core/user/user.service.ts#L176)、[outdatedVersionAlert.service.ts#L110](packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L110)），避免明文用户 ID 在消息系统中传播。
 
 ### 3. 面向工作区用户广播
 
@@ -491,7 +493,7 @@ novuService.triggerNotificationToSubscriber(eventName: notificationTemplateIdent
 
 ### 4. 事件溯源（Action + ActionStep + ActionLog）
 
-构建任务执行过程伴随完整的 Action → ActionStep → ActionLog 三层记录模型（见 [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/52-amplication/packages/amplication-server/src/core/action/action.service.ts)），但此模型仅用于任务状态追踪，**不直接触发通知**。通知仅在关键业务节点（代码生成成功、插件新版本发布等）显式触发。
+构建任务执行过程伴随完整的 Action → ActionStep → ActionLog 三层记录模型（见 [action.service.ts](packages/amplication-server/src/core/action/action.service.ts)），但此模型仅用于任务状态追踪，**不直接触发通知**。通知仅在关键业务节点（代码生成成功、插件新版本发布等）显式触发。
 
 ### 5. Stigg Webhook 延迟同步（Pull-on-Read）
 
