@@ -106,9 +106,9 @@ const openai = new OpenAI({
 ```
 
 **特征**：
-- 读取时机在 NestJS 启动前（`main.ts`），或完全不经过 DI 容器（独立 service）
+- 读取时机在 NestJS 启动前（`main.ts`），或服务虽然在 DI 容器内注册但主动绕过注入机制直接读 `process.env`（`OpenaiService`）
 - 无类型安全、无默认值管理、无 ConfigModule 的 `validate` 钩子
-- 测试时无法通过 NestJS 的 ConfigModule.forRoot 注入 mock 值
+- 服务本身可被 NestJS 测试模块 mock（如 `{ provide: OpenaiService, useValue: {} }`），但无法通过 ConfigModule.forRoot 单独注入环境变量值
 
 ### 2.4 第四类：Prisma env()（Prisma DSL 内置函数）
 
@@ -184,7 +184,7 @@ if (!BCRYPT_SALT) {
 OPENAI_API_KEY=[open-ai-key]
 ```
 
-**归属**：第三类（process.env 直读）
+**归属**：第三类（process.env 直读）——虽然服务本身注册在 NestJS DI 容器内，但读取方式绕过了所有注入机制。
 
 **读取位置**：`packages/gpt-gateway/providers/openai/openai.service.ts#L28`
 
@@ -195,18 +195,108 @@ const openai = new OpenAI({
 });
 ```
 
+**模块注册路径的真实链路**：
+
+```
+AppModule (src/app.module.ts#L33)
+  └─ imports: [TemplateModule, ...]
+       │
+       └─ TemplateModule (src/template/template.module.ts#L8-L12)
+            ├─ imports: [TemplateModuleBase, forwardRef(() => AuthModule)]
+            ├─ providers: [TemplateService, TemplateResolver, OpenaiService]   // ★ OpenaiService 直接列在这里
+            └─ exports: [TemplateService]   // 只导出了 TemplateService，OpenaiService 是私有实现细节
+                 │
+                 └─ TemplateService (src/template/template.service.ts#L17)
+                      └─ constructor(private openaiService: OpenaiService, ...)   // ★ 只有 TemplateService 能注入它
+```
+
+**三件关键事实**：
+
+#### 事实一：OpenaiService 由 TemplateModule 直接注册
+
+`OpenaiService` 不是通过 import 某个模块引入的，而是被直接列在 `TemplateModule` 的 `providers` 数组里（`packages/gpt-gateway/src/template/template.module.ts#L10`）：
+
+```typescript
+@Module({
+  imports: [TemplateModuleBase, forwardRef(() => AuthModule)],
+  providers: [TemplateService, TemplateResolver, OpenaiService],   // ★ 直接注册
+  exports: [TemplateService],
+})
+export class TemplateModule {}
+```
+
+这意味着：
+- `OpenaiService` 的实例生命周期由 `TemplateModule` 管理
+- 其他模块即使 import 了 `TemplateModule`，也无法注入 `OpenaiService`（因为它不在 `exports` 里）
+- 只有 `TemplateModule` 内部的 `TemplateService` 和 `TemplateResolver` 能使用它
+
+`TemplateModule` 本身被 `AppModule`（`src/app.module.ts#L33`）和 `ConversationTypeModule`（`src/conversationType/conversationType.module.ts#L12`）import，所以它是正式的 DI 容器成员，不是"游离在外的独立 service"。
+
+#### 事实二：OpenAIModule 存在但完全未被使用（僵尸模块）
+
+`packages/gpt-gateway/providers/openai/openai.module.ts#L1-L8` 虽然定义了：
+
+```typescript
+@Module({
+  providers: [OpenaiService],
+  exports: [OpenaiService],
+})
+export class OpenAIModule {}
+```
+
+但代码库中**没有任何地方 import 了 `OpenAIModule`**：
+- `AppModule` 的 imports 数组里没有 `OpenAIModule`
+- `TemplateModule` 的 imports 数组里也没有 `OpenAIModule`
+- 全项目 grep 不到 `import { OpenAIModule }` 的引用
+
+它是一个被写出来但从未接入的僵尸模块。可能的历史原因：开发者最初打算让 OpenaiService 通过独立模块发布，但后来图省事直接把它塞进了 TemplateModule 的 providers，忘了删除 `openai.module.ts`。
+
+#### 事实三：OpenaiService 没有构造函数，没有注入任何依赖（包括 SecretsManagerService 和 ConfigService）
+
+`packages/gpt-gateway/providers/openai/openai.service.ts#L20-L54`：
+
+```typescript
+@Injectable()
+export class OpenaiService {
+  // ★ 没有 constructor()！
+  async createChatCompletion(...) {
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,   // ★ 硬编码 process.env
+    });
+    ...
+  }
+}
+```
+
+虽然它是 `@Injectable()` 装饰的 NestJS provider，但它：
+1. **没有 constructor**——不接受任何依赖注入
+2. 每次 `createChatCompletion()` 调用时就地 `new OpenAI({ apiKey: process.env.OPENAI_API_KEY })`
+3. 完全绕过了 NestJS 提供的 ConfigService 和 SecretsManagerService
+
+这是典型的"类被注册进了 DI 容器，但内部实现仍然是全局状态直读"的反模式。
+
 **不走密钥链路（第一类 SecretsManagerService）的原因**：
 
-1. **非 DSG 生成代码**：`gpt-gateway/providers/openai/` 目录下的代码是该项目的自定义扩展（DSG 生成的 providers 只有 `secrets/` 一个子目录）。自定义代码未被纳入 Amplication 的插件体系，没有通过 `CreateServerSecretsManager` 的 before 钩子向 `EnumSecretsNameKey` 注册 `OpenAiApiKey`。
+1. **非 DSG 生成代码**：`gpt-gateway/providers/openai/` 和 `gpt-gateway/src/template/` 中涉及 OpenAI 的代码都是该项目的自定义扩展。DSG 生成的 providers 目录只有 `secrets/` 一个子目录，TemplateModule 的 DSG 模板（`template.module.base.ts`）也没有 OpenaiService。自定义代码未被纳入 Amplication 的插件体系，没有通过 `CreateServerSecretsManager` 的 before 钩子向 `EnumSecretsNameKey` 注册 `OpenAiApiKey`。
 
-2. **模块未接入 DI 容器**：`OpenAIModule`（`providers/openai/openai.module.ts`）没有 import `SecretsManagerModule`，其 provider 也没有注入 `SecretsManagerService`。`OpenAIModule` 本身也没有被 `AppModule` 的 `imports` 数组注册——`AppModule` 只显式 import 了 `SecretsManagerModule`，没有 `OpenAIModule`。
+2. **TemplateModule 没有 import SecretsManagerModule**：TemplateModule 的 imports 数组只有 `[TemplateModuleBase, forwardRef(() => AuthModule)]`（`src/template/template.module.ts#L9`），没有 `SecretsManagerModule`。即使 OpenaiService 想注入 `SecretsManagerService`，NestJS 也会报 "Nest can't resolve dependencies"。
 
-3. **实例化时机设计**：`OpenaiService` 在每次 `createChatCompletion()` 调用时才 `new OpenAI({...})`，而不是在构造函数里保存单例。这种"每次请求新建 SDK 实例"的模式让开发者习惯性直接读 `process.env`，而不是把 async 的 `getSecret()` 调用塞进同步的构造逻辑。
+3. **OpenaiService 完全没有构造函数注入**：它没有 `constructor`，不接受任何依赖注入。即使 TemplateModule 正确 import 了 SecretsManagerModule，也无法把 SecretsManagerService 传入 OpenaiService——因为没人接收。
 
-4. **实际上是设计疏漏**：从安全性角度看，`OPENAI_API_KEY` 是真正的敏感密钥，应该走第一类 SecretsManagerService。当前实现意味着：
-   - 如果未来替换为外部 Secrets Provider（如 AWS Secrets Manager），`OPENAI_API_KEY` 不会被自动纳入
-   - 缺失时不会抛出清晰的 Amplication 风格错误，而是由 OpenAI SDK 抛一个 `APIError`
-   - 没有出现在 `EnumSecretsNameKey` 枚举中，不利于"项目有哪些 secrets"的可发现性
+4. **每次调用就地 new SDK 的实现方式**：`OpenaiService` 在每次 `createChatCompletion()` 调用时才 `new OpenAI({...})`，而不是在构造函数里持有一个 SDK 单例。这种模式让开发者很自然地就地读 `process.env`，而不是把 async 的 `getSecret()` 调用塞进同步的构造逻辑。
+
+5. **僵尸模块 OpenAIModule 的存在反而妨碍了正确接入**：如果开发者想通过 import OpenAIModule 来使用 OpenaiService，就会发现 OpenAIModule 也没有 import SecretsManagerModule——两个模块都"各自为政"，没有一个正确的接入点。
+
+**实际上是设计疏漏**：从安全性角度看，`OPENAI_API_KEY` 是真正的敏感密钥，应该走第一类 SecretsManagerService。当前实现意味着：
+- 如果未来替换为外部 Secrets Provider（如 AWS Secrets Manager），`OPENAI_API_KEY` 不会被自动纳入
+- 缺失时不会抛出清晰的 Amplication 风格错误，而是由 OpenAI SDK 抛一个 `APIError`
+- 没有出现在 `EnumSecretsNameKey` 枚举中，不利于"项目有哪些 secrets"的可发现性
+
+**正确的接入方式（假设要修复）**：
+1. 在插件中向 `CreateServerSecretsManager` 的 before 钩子追加 `{ name: "OpenAiApiKey", key: "OPENAI_API_KEY" }`
+2. 在 TemplateModule 的 imports 中加入 `SecretsManagerModule`
+3. 给 OpenaiService 加 constructor，注入 `SecretsManagerService`
+4. 把 SDK 单例提到构造函数里（或使用 async Factory Provider 延迟创建），通过 `getSecret<string>(EnumSecretsNameKey.OpenAiApiKey)` 获取密钥
 
 ### 3.2 DB_URL
 
@@ -304,7 +394,7 @@ export const ENV_VARIABLES: VariableDictionary = [
 |------|---------|---------|------|-------------------------------|------------|---------|
 | **1. SecretsManagerService** | `SecretsManagerService.getSecret(EnumSecretsNameKey.X)` | ✅ | ✅ | ✅ | ✅ | `JWT_SECRET_KEY` |
 | **2. ConfigService.get()** | `ConfigService.get("XXX")` | ❌ | ❌ | ❌ | ✅ | `BCRYPT_SALT`, `JWT_EXPIRATION`, `KAFKA_*`, `GRAPHQL_*` |
-| **3. process.env 直读** | `process.env.XXX` | ❌ | ❌ | ❌ | ❌ | `PORT`, `OPENAI_API_KEY` |
+| **3. process.env 直读** | `process.env.XXX` | ❌ | ❌ | ❌ | ⚠️ 部分 | `PORT`（DI 外）, `OPENAI_API_KEY`（服务在 DI 内但绕过注入） |
 | **4. Prisma env()** | `env("XXX")` in `.prisma` | ❌ | ❌ | ❌ | ❌（Prisma 自有 DSL） | `DB_URL` |
 | **5. 脚本读取** | `dotenv.config()` + `process.env.XXX` | ❌ | ❌ | ❌ | ❌（独立脚本） | `BCRYPT_SALT`（seed 脚本中） |
 
@@ -387,7 +477,7 @@ const secretsManagerModule = await createSecretsManager({
 - `JWT_SECRET_KEY`：由 auth 插件通过 before 钩子注入 → 进入 `EnumSecretsNameKey` → 走第一类通道
 - `DB_URL`：由 DSG 核心 `constants.ts` 硬编码 → 不进入枚举 → 走第四类 Prisma 通道
 - `BCRYPT_SALT`：由 DSG 核心 `ENV_VARIABLES` 默认值内置 → 不进入枚举 → 走第二类/第五类通道
-- `OPENAI_API_KEY`：由 `gpt-gateway` 项目自定义代码使用 → 未注册进枚举 → 走第三类通道
+- `OPENAI_API_KEY`：由 `gpt-gateway` 项目自定义扩展使用；服务本身被 `TemplateModule.providers` 注册进 DI 容器，但未通过插件向枚举注册，且 OpenaiService 无 constructor 绕过了注入机制 → 走第三类通道
 
 ### 5.4 作用域的三层边界
 
@@ -824,16 +914,25 @@ const serviceSettingsDic: { [key: string]: any } = appInfo.settings;
 ### 8.1 分层抽象架构
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  消费层（五类消费者，见第 2 章）                              │
-│                                                              │
-│   1. SecretsManagerService ──┐                               │
-│   2. ConfigService.get() ────┼── NestJS DI 容器内            │
-│                              │                               │
-│   3. process.env 直读 ───────┼── NestJS DI 容器外            │
-│   4. Prisma env() ───────────┤   无法受益于下面的抽象层      │
-│   5. 脚本读取 ───────────────┘                               │
-└────────────────────────────┬─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  消费层（五类消费者，见第 2 章）                                  │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  NestJS DI 容器内                                          │    │
+│  │    1. SecretsManagerService.getSecret(...)                 │    │
+│  │    2. ConfigService.get("XXX")                             │    │
+│  │    3. process.env.OPENAI_API_KEY                           │    │
+│  │       （OpenaiService 虽在 DI 内但绕过注入直读）           │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  NestJS DI 容器外（无法受益于下方的抽象层）                │    │
+│  │    3. process.env.PORT        （main.ts，DI 启动前）       │    │
+│  │    4. env("DB_URL")            （Prisma schema DSL）      │    │
+│  │    5. dotenv.config() + process.env.BCRYPT_SALT           │    │
+│  │       （独立 seed 脚本）                                    │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└────────────────────────────┬─────────────────────────────────────┘
                              │
                              ▼
 ┌──────────────────────────────────────────────────────────┐
@@ -1097,6 +1196,10 @@ Amplication 插件化架构的核心原则：**DSG 核心不做任何业务假�
 
 ### 10.9 为什么 OPENAI_API_KEY 走 process.env 直读？
 
-1. **非 DSG 生成代码**：是 `gpt-gateway` 项目的自定义扩展，没有通过插件注册进枚举
-2. **模块未接入 DI**：`OpenAIModule` 没有 import `SecretsManagerModule`
-3. **设计疏漏**：从安全性角度它应该走 SecretsManagerService——这是一个待改进点
+1. **非 DSG 生成代码**：`OpenaiService` 是 `gpt-gateway` 项目的自定义扩展（不在 DSG 生成的 `providers/secrets/` 范围内，也不在 TemplateModule 的 DSG 模板里），没有通过插件注册进 `EnumSecretsNameKey` 枚举。
+
+2. **注册路径特殊**：不是通过 `OpenAIModule` 接入（`OpenAIModule` 存在但完全未被 import，是僵尸模块），而是被直接塞进了 `TemplateModule.providers` 数组。而 `TemplateModule` 本身没有 import `SecretsManagerModule`，导致即使 OpenaiService 想注入也拿不到。
+
+3. **服务实现层面绕过注入**：`OpenaiService` 甚至没有 constructor——没有任何依赖注入入口。虽然它被 `@Injectable()` 装饰且注册在 DI 容器内，但内部完全靠 `process.env` 硬编码读取。
+
+4. **设计疏漏**：从安全性角度它应该走 SecretsManagerService。需要修复的话必须同时做四件事：插件注册枚举 → TemplateModule 导入 SecretsManagerModule → OpenaiService 增加 constructor 注入 → 把 SDK 创建逻辑从方法体移到构造函数或 async Factory。
