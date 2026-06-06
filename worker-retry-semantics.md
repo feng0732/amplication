@@ -10,9 +10,16 @@ Amplication 的后台构建任务采用 **Kafka 事件驱动 + 多服务协作**
 
 ```
 amplication-server ──Kafka──▶ amplication-build-manager ──HTTP──▶ DSG Runner (Argo)
-       ▲                              │
-       │                              │ Kafka
-       └────── CODE_GENERATION_* ◀────┘
+       ▲                              │                          │
+       │                              │ Kafka                    │ HTTP回调
+       │                              ▼                          ▼
+       │                     amplication-build-manager      (POST /code-generation-*)
+       │                     接收DSG执行结果
+       │
+       │                       ┌──────────────────────┐
+       └──── CODE_GENERATION_* │  git-sync-manager (EE) │ CREATE_PR_* ──┘
+                               │  (Pacemaker心跳保活)   │
+                               └──────────────────────┘
 ```
 
 核心服务模块：
@@ -20,19 +27,35 @@ amplication-server ──Kafka──▶ amplication-build-manager ──HTTP─�
 | 服务 | 职责 | 关键文件 |
 |---|---|---|
 | `amplication-server` | 接收构建请求、持久化 Build/Action 状态、消费构建结果事件 | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts) |
-| `amplication-build-manager` | 消费构建请求、拆分子任务、聚合子任务状态、调用 DSG Runner | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts) |
+| `amplication-build-manager` | 消费构建请求、拆分子任务、聚合子任务状态、调用 DSG Runner、接收 DSG 回调 | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts) |
+| `git-sync-manager` (EE) | 消费 PR 创建请求、执行 git 操作（长任务，使用 Pacemaker） | [pull-request.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts) |
 
 ---
 
 ## 2. 锁机制（Lock）
 
-代码库中存在**两种独立的锁体系**，它们解决的问题域不同，互不依赖。
+### 2.1 两套完全独立的系统
 
-### 2.1 数据库级资源锁（Block/Entity 锁）
+代码库中存在**两套完全独立、无任何关联**的"锁"体系：
 
-**用途**：防止多个用户同时编辑同一个 Block 或 Entity，属于**用户态协作锁**。
+| 体系 | 用途 | 使用方 | 与后台任务的关系 |
+|---|---|---|---|
+| **用户编辑锁** (Block/Entity) | 防止多个前端用户同时编辑同一代码资源 | **仅** GraphQL resolvers（前台用户接口） | 后台任务从不获取 |
+| **Redis 任务状态存储** | 追踪 Build 子任务的执行进度 | amplication-build-manager | 后台任务状态追踪（非严格意义的锁） |
 
-**实现位置**：
+> ⚠️ **重要澄清**：用户编辑锁与后台任务之间**不存在任何交互**。后台构建流程不会尝试获取 Block/Entity 锁，也不会被用户锁阻塞。
+
+---
+
+### 2.2 用户编辑锁（Block/Entity 锁）
+
+**用途**：防止多个前端用户同时编辑同一个 Block 或 Entity，属于**纯用户态协作锁**。
+
+**调用入口（仅 GraphQL 层）**：
+- [entity.resolver.ts#L149](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/entity/entity.resolver.ts#L149) — `acquireLock` mutation
+- [block.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/block/block.resolver.ts) — 返回查询中附带 `lockedByUser` 信息
+
+**服务层实现**：
 - [block.service.ts#L665-L752](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/block/block.service.ts#L665-L752)
 - [entity.service.ts#L1472-L1537](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L1472-L1537)
 
@@ -48,21 +71,13 @@ amplication-server ──Kafka──▶ amplication-build-manager ──HTTP─�
 
 > ⚠️ **注意**：这是 **check-then-act** 模式，并非严格的分布式锁。在高并发下存在 TOCTOU（Time-of-check to time-of-use）竞态窗口。实际中因为是用户级编辑冲突，并发概率极低。
 
-**释放锁 `releaseLock()`**：
-```typescript
-prisma.block.update({
-  where: { id },
-  data: { lockedByUser: { disconnect: true }, lockedAt: null }
-});
-```
-
-**高阶函数 `useLocking()`**：封装"获取锁 → 执行业务 → 更新锁（有变更则保持、无变更则释放）"的标准流程，使用 `try/finally` 保证异常情况下也会调用 `updateLock()`。
+**后台构建中的 `lockedByUserId` 字段**：在 [build.service.ts#L212-L219](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts#L212-L219) 中，`lockedByUserId` 出现在 `DSG_RESOURCE_DATA_PROPERTIES_TO_REMOVE` 列表里——它只是**作为需要清理的敏感字段**，在构建数据发送给 DSG 前被剔除，不参与任何锁逻辑。
 
 ---
 
-### 2.2 Redis 任务状态存储（非严格意义上的锁）
+### 2.3 Redis 任务状态存储（非严格意义上的锁）
 
-**用途**：在 build-manager 中追踪一个 Build 被拆分成的多个子 Job（Server / AdminUI）的执行状态。
+**用途**：在 build-manager 中追踪一个 Build 被拆分成的多个子 Job（Server / AdminUI）的执行状态。这是**状态存储**而非互斥锁——它不会阻塞任何操作，只是记录进度。
 
 **实现位置**：
 - [build-job-handler.service.ts#L100-L148](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts#L100-L148)
@@ -132,17 +147,131 @@ Amplication **没有显式的重试记录表或死信队列（DLT）**。重试�
 | `maxBytesPerPartition` | 10,485,760 (10MB) | 每个分区每次拉取最大字节数 |
 
 **重试发生条件**（NestJS + KafkaJS 行为）：
-1. **消息处理函数抛出异常** → NestJS Kafka 适配器不会提交该消息的 offset，下次 poll 时会重新投递该消息
+1. **消息处理函数抛出异常且未被捕获** → NestJS Kafka 适配器不会提交该消息的 offset，下次 poll 时会重新投递该消息
 2. **Consumer 崩溃**（进程退出、OOM 等）→ 超过 `sessionTimeout` 后，Group Coordinator 将该 Consumer 的分区分配给其他实例，这些分区上未 commit 的消息全部重新投递
 3. **处理时间超过 `rebalanceTimeout`** → 在 Rebalance 期间无法完成处理的消息会被重新分配
 
 > 💡 **关键点**：系统采用 **At-Least-Once** 投递语义。消费端必须保证幂等。
 
-### 3.2 Kafka Pacemaker — 长任务心跳保活
+---
+
+### 3.2 Kafka 重投 vs 业务失败事件：精确边界
+
+这是整个重试语义中最关键的分界点。每个 Kafka 消费者的异常处理方式决定了消息是被 Kafka 重投，还是被转化为业务失败事件。
+
+**判定规则**：
+- ✅ **异常被 try/catch 吞没** → handler 正常返回 → NestJS commit offset → **无 Kafka 重投**，走业务失败流程
+- ❌ **异常抛出到 handler 之外** → NestJS 不 commit offset → **Kafka 重投**
+
+下面是各消费者的实际行为：
+
+#### 3.2.1 amplication-build-manager 消费者
+
+**消费者 1：`CODE_GENERATION_REQUEST_TOPIC`**
+[build-runner.controller.ts#L68-L78](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L68-L78)
+
+```typescript
+@EventPattern(KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC)
+async onCodeGenerationRequest(@Payload() message) {
+  // 控制器层无 try/catch
+  await this.buildRunnerService.runBuild(...);
+}
+```
+
+但 `runBuild()` 服务层内部**完全捕获**了所有异常 [build-runner.service.ts#L109-L158](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L158)：
+```typescript
+try {
+  // ... 拆分子任务、调用 DSG Runner ...
+} catch (error) {
+  this.logger.error(error.message, error);
+  await this.emitCodeGenerationFailure(buildId, error.message); // 发送业务失败事件
+}
+```
+
+**结论**：✅ **无 Kafka 重投**，异常被服务层捕获，转化为 `CODE_GENERATION_FAILURE` Kafka 事件。
+
+**消费者 2：`PACKAGE_MANAGER_CREATE_SUCCESS`**
+[build-runner.controller.ts#L44-L54](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L44-L54)
+
+```typescript
+@EventPattern(KAFKA_TOPICS.PACKAGE_MANAGER_CREATE_SUCCESS)
+async onPackageManagerCreateSuccess(@Payload() message) {
+  // 无 try/catch
+  await this.buildRunnerService.onPackageManagerCreateSuccess(args);
+}
+```
+
+`onPackageManagerCreateSuccess()` → `codeGenerationAndPackagesCompleted()` → `producerService.emitMessage()` 均无 try/catch。
+
+**结论**：❌ **可能触发 Kafka 重投**。若 Kafka producer 发送失败（如 broker 不可用），异常会冒泡到 handler，导致 offset 不 commit，消息被 Kafka 重投。
+
+**消费者 3：`PACKAGE_MANAGER_CREATE_FAILURE`**
+[build-runner.controller.ts#L56-L66](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L56-L66) — 同样无 try/catch。
+
+**结论**：❌ **可能触发 Kafka 重投**。
+
+另外值得注意：**build-manager 的所有消费者均未注入 `@Ctx() KafkaContext`**，因此它们无法使用 Pacemaker，也无法手动控制 offset 提交行为。
+
+---
+
+#### 3.2.2 git-sync-manager 消费者（EE，使用 Pacemaker）
+
+**消费者：`CREATE_PR_REQUEST_TOPIC`**
+[pull-request.controller.ts#L54-L162](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L54-L162)
+
+```typescript
+@EventPattern(KAFKA_TOPICS.CREATE_PR_REQUEST_TOPIC)
+async generatePullRequest(@Payload() message, @Ctx() context: KafkaContext) {
+  // ... 参数校验 ...
+  try {
+    const result = await KafkaPacemaker.wrapLongRunningMethod(
+      context,
+      () => this.pullRequestService.createPullRequest(validArgs)
+    );
+    await this.producerService.emitMessage(CREATE_PR_SUCCESS_TOPIC, ...);
+  } catch (error) {
+    // 包括 NoChangesOnPullRequest 特殊分支
+    await this.producerService.emitMessage(CREATE_PR_FAILURE_TOPIC, ...);
+  }
+}
+```
+
+**消费者：`DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC`**
+[private-plugin.controller.ts#L32-L84](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L32-L84) — 同样的 try/catch 模式。
+
+**结论**：✅ **无 Kafka 重投**。所有异常都被 try/catch 捕获并转化为 `CREATE_PR_SUCCESS/FAILURE` 或 `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE` 业务事件。
+
+---
+
+#### 3.2.3 amplication-server 消费者
+
+[build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.controller.ts) 中所有 `@EventPattern` 消费者：
+
+| 消费者 | 有 try/catch? | Kafka 重投? |
+|---|---|---|
+| `CODE_GENERATION_NOTIFY_VERSION_TOPIC` | ✅ | 无 |
+| `BUILD_PLUGIN_NOTIFY_VERSION_TOPIC` | ✅ | 无 |
+| `CODE_GENERATION_SUCCESS_TOPIC` | ✅ | 无 |
+| `CODE_GENERATION_FAILURE_TOPIC` | ✅ | 无 |
+| `CREATE_PR_SUCCESS_TOPIC` | ✅ | 无 |
+| `CREATE_PR_FAILURE_TOPIC` | ✅ | 无 |
+| `DSG_LOG_TOPIC` | ❌ | 可能 |
+| `CREATE_PR_LOG_TOPIC` | ✅ | 无 |
+| `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC` | ✅ | 无 |
+| `DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC` | ✅ | 无 |
+| `DOWNLOAD_PRIVATE_PLUGINS_LOG_TOPIC` | ✅ | 无 |
+
+**结论**：除 `DSG_LOG_TOPIC` 外，其余均有 try/catch → **无 Kafka 重投**。
+
+---
+
+### 3.3 Kafka Pacemaker — 长任务心跳保活（仅 git-sync-manager 使用）
 
 **实现位置**：[pacemaker.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/libs/util/nestjs/kafka/src/pacemaker/pacemaker.service.ts)
 
-某些消息处理可能耗时很长（如代码生成 > 30s），如果在处理期间不发送心跳，Consumer 会被踢出 Group，导致消息被重新投递（造成重复执行）。
+**使用范围**：仅 `ee/packages/git-sync-manager` 的两个消费者使用。`amplication-build-manager` 和 `amplication-server` 的所有 Kafka 消费者**均未使用** Pacemaker（甚至没有注入 `@Ctx() KafkaContext`）。
+
+**使用场景**：git 操作（clone、diff、push、create PR）和私有插件下载通常耗时数分钟，远超默认的 `sessionTimeout`（30s）。如果在处理期间不发送心跳，Consumer 会被踢出 Group，导致消息被重新投递（造成重复执行）。
 
 `KafkaPacemaker.wrapLongRunningMethod()` 解决此问题：
 
@@ -166,24 +295,16 @@ static async wrapLongRunningMethod(kafkaContext, fn, timeout = 3000) {
 
 **工作原理**：在业务函数执行期间，后台每 3 秒调用一次 `heartbeat()`，让 Group Coordinator 知道这个 Consumer 还活着。
 
-### 3.3 应用层错误处理与"重试"
+---
 
-代码中**没有显式的重试计数或退避策略**。应用层错误处理分为两条路径：
+### 3.4 应用层错误处理与业务失败事件
 
-**路径 A：build-manager 消费 `CODE_GENERATION_REQUEST_TOPIC` 出错**
-- [build-runner.service.ts#L109-L158](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L109-L158)
-- `runBuild()` 中任何异常被 catch 后，调用 `emitCodeGenerationFailure()` 发送失败事件到 Kafka
-- 之后该消息被视为"已处理"，offset 会被正常 commit
-- **不会触发 Kafka 级别的重试**，而是直接走业务失败流程
+代码中**没有显式的重试计数或退避策略**。应用层通过 Kafka 业务事件表达成功/失败：
 
-**路径 B：build-manager 调用 DSG Runner HTTP 接口失败**
-- [build-runner.service.ts#L161-L192](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L161-L192)
-- `runJob()` 中 `axios.post()` 抛出异常会直接向上抛出，被外层 `runBuild()` 的 catch 捕获
-- 同样发送 `CODE_GENERATION_FAILURE` 事件
-
-**路径 C：DSG 子任务成功/失败回调**
-- 成功：`handleDsgJobCompleted()` → 更新 Redis 状态 → 如果所有子任务成功则触发包管理器或发送 `CODE_GENERATION_SUCCESS`
-- 失败：`emitCodeGenerationFailureWhenJobStatusFailed()` → 更新 Redis 状态为 Failure → 发送 `CODE_GENERATION_FAILURE`
+**DSG 子任务成功/失败回调（HTTP，非 Kafka）**：
+build-manager 通过 HTTP POST 接口接收 DSG Runner 的回调 [build-runner.controller.ts#L23-L42](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L23-L42)：
+- 成功：`handleDsgJobCompleted()` → 更新 Redis 状态 → 如果所有子任务成功则触发包管理器或发送 `CODE_GENERATION_SUCCESS` Kafka 事件
+- 失败：`emitCodeGenerationFailureWhenJobStatusFailed()` → 更新 Redis 状态为 Failure → 发送 `CODE_GENERATION_FAILURE` Kafka 事件
 
 失败处理的去重保护：
 ```typescript
@@ -222,6 +343,8 @@ async emitCodeGenerationFailureWhenJobStatusFailed(jobBuildId) {
 3. DSG Runner 读取对应目录的数据，生成代码写入 `DSG_JOBS_CODE_FOLDER`
 4. build-manager 将成功子任务的结果 `copyFromJobToArtifact()` 复制到最终产物目录
 
+---
+
 ### 4.2 构建状态机恢复（Action Step 追踪）
 
 **实现位置**：
@@ -249,6 +372,8 @@ Build (status=Running)
    - 任一 Failed → Build = Failed
    - 其他情况（兼容性兜底）→ Build = Failed
 
+---
+
 ### 4.3 Stale Build 检测（僵尸任务清理）
 
 **定义** [build.service.ts#L177](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts#L177)：
@@ -271,18 +396,24 @@ isBuildStale(build) {
 
 > ⚠️ **注意**：这是一个**被动检测**机制，没有后台定时任务主动扫描。只有当有人查询该 Build 时才会触发状态修正。
 
+---
+
 ### 4.4 Kafka 消息重放带来的隐式恢复
 
 由于采用 Kafka Consumer Group 的 At-Least-Once 语义，以下场景会自动"恢复"任务：
 
-1. **build-manager 崩溃重启**：未 commit offset 的消息会被重新投递给重启后的实例或组内其他实例。由于：
-   - `setJobStatus()` 是幂等的（同状态重复写入不改变结果）
-   - `runBuild()` 重新读取共享目录的数据并重新执行
-   - DSG Runner 被设计为可重复调用
-   
-   因此重放通常不会造成数据不一致。
+1. **build-manager 崩溃重启**：
+   - `onCodeGenerationRequest`：虽然 `runBuild()` 内部 catch 异常不会触发重投，但如果进程在 handler 执行过程中崩溃，offset 尚未 commit，消息会被 Kafka 重投。
+   - `onPackageManagerCreateSuccess/Failure`：这两个 handler 无 try/catch，任何异常都会触发重投。
+   - 幂等保障：`setJobStatus()` 是幂等的（同状态重复写入不改变结果）；`runBuild()` 重新读取共享目录的数据并重新执行；DSG Runner 被设计为可重复调用。
 
-2. **server 端崩溃重启**：未处理完成的 `CODE_GENERATION_SUCCESS` / `CODE_GENERATION_FAILURE` 事件会被重新投递。对应的处理函数 `onCodeGenerationSuccess()` / `onCodeGenerationFailure()` 内部通过数据库 Step 状态做天然幂等（重复调用 `actionService.complete()` 时，即使 Step 已是终态也不会出错，`updateBuildStatuses()` 也是幂等的 UPDATE）。
+2. **git-sync-manager 崩溃重启**：
+   - 如果在 `createPullRequest()` 执行过程中崩溃（Pacemaker 心跳也随之停止），超过 sessionTimeout 后 Group Coordinator 会触发 Rebalance，消息被重新分配给其他实例。
+   - 由于 git 操作（创建 PR）本身不是幂等的，重复执行可能导致创建重复 PR。但由于 Pacemaker 的存在，只要进程不崩溃就不会因超时而重投。
+
+3. **amplication-server 崩溃重启**：
+   - 大多数消费者有 try/catch（不会触发重投），但如果进程在 handler 执行过程中崩溃，offset 未 commit，消息会被 Kafka 重投。
+   - 幂等保障：处理函数 `onCodeGenerationSuccess()` / `onCodeGenerationFailure()` 内部通过数据库 Step 状态做天然幂等（重复调用 `actionService.complete()` 时，即使 Step 已是终态也不会出错，`updateBuildStatuses()` 也是幂等的 UPDATE）。
 
 ---
 
@@ -292,20 +423,23 @@ isBuildStale(build) {
 [1] amplication-server BuildService.create()
     │  ├── Prisma: 创建 Build(status=Running) + Action + Step(ADD_TO_QUEUE)
     │  └── 写入 DSG_RESOURCE_DATA_BASE_FOLDER/{buildId}/resource-data.json
+    │       (lockedByUserId 等敏感字段在此前被剔除)
     │  └── Kafka: emit CODE_GENERATION_REQUEST_TOPIC
     ▼
-[2] amplication-build-manager 消费请求
+[2] amplication-build-manager 消费请求 (onCodeGenerationRequest)
     │  BuildRunnerService.runBuild()
     │  ├── 从共享目录读取 resource-data.json
     │  ├── BuildJobsHandlerService.splitBuildsIntoJobs()
     │  │    └── Redis: set buildId → { "buildId-server": InProgress, "buildId-admin-ui": InProgress }
     │  └── 并发调用 runJob() 每个子任务
     │       └── HTTP POST DSG_RUNNER_URL (触发 Argo Workflow)
+    │  注意：此过程中所有异常都被 runBuild() catch，转为 CODE_GENERATION_FAILURE 事件
+    │  注意：此处未使用 Pacemaker（未注入 @Ctx() KafkaContext）
     ▼
 [3] DSG Runner 执行代码生成（异步）
-    │  完成后通过 HTTP 回调 build-manager 的 /code-generation-success 或 /code-generation-failure
+    │  完成后通过 HTTP 回调 build-manager 的 POST /code-generation-success 或 /code-generation-failure
     ▼
-[4] build-runner.controller 接收回调
+[4] build-runner.controller 接收 HTTP 回调
     │  ├── 成功: handleDsgJobCompleted()
     │  │    ├── Redis: 当前 job → Success
     │  │    ├── copyFromJobToArtifact() 复制代码到产物目录
@@ -317,18 +451,20 @@ isBuildStale(build) {
     │       ├── Redis: 当前 job → Failure
     │       └── Kafka emit CODE_GENERATION_FAILURE_TOPIC (仅首次)
     ▼
-[5] amplication-server 消费结果事件
+[5] amplication-server 消费结果事件 (所有消费者均有 try/catch，无 Kafka 重投)
     │  onCodeGenerationSuccess():
-    │    ├── saveToGitProvider() → 发出 CREATE_PR_REQUEST
+    │    ├── saveToGitProvider() → Kafka emit CREATE_PR_REQUEST
     │    └── actionService.complete(step, Success)
     │  onCodeGenerationFailure():
     │    ├── 写入错误日志到 ActionLog
     │    ├── actionService.complete(step, Failed)
     │    └── updateBuildStatuses(buildId, Failed, Canceled)
     ▼
-[6] git-sync-manager 消费 CREATE_PR_REQUEST
-    │  PullRequestService.createPullRequest()
-    │  └── GitClientService: clone → apply diff → push → create PR
+[6] git-sync-manager 消费 CREATE_PR_REQUEST (使用 Pacemaker + try/catch，无 Kafka 重投)
+    │  PullRequestController.generatePullRequest()
+    │  ├── KafkaPacemaker.wrapLongRunningMethod(context, () => createPullRequest())
+    │  │    └── 每 3s 心跳保活
+    │  └── 完成后 emit CREATE_PR_SUCCESS_TOPIC / CREATE_PR_FAILURE_TOPIC
     ▼
 [7] amplication-server 消费 CREATE_PR_SUCCESS / CREATE_PR_FAILURE
     └── 更新 Build.gitStatus + 对应 ActionStep 状态
@@ -342,11 +478,14 @@ isBuildStale(build) {
 1. **解耦彻底**：各服务通过 Kafka 事件通信，无直接 RPC 依赖
 2. **状态分级存储**：短期运行态放 Redis、长期持久态放 Prisma/DB、大文件放共享存储
 3. **天然幂等**：所有状态更新都是单向终态迁移（Running → Success/Failure），重复执行副作用可接受
-4. **长任务保护**：Pacemaker 心跳机制避免 Kafka 会话超时
+4. **长任务保护**：Pacemaker 心跳机制在 git-sync-manager 中有效避免长任务因 Kafka 会话超时被重复投递
 
 ### ⚠️ 潜在风险点
 1. **Redis 状态写入非原子**：`setJobStatus()` 的 read-modify-write 模式在极端并发下可能丢失状态更新
-2. **无死信队列**：反复失败的消息会无限次重试，没有"放弃"机制
+2. **无死信队列（DLT）**：
+   - `PACKAGE_MANAGER_CREATE_SUCCESS/FAILURE`（build-manager）和 `DSG_LOG_TOPIC`（server）的消费者无 try/catch，若反复失败会无限次 Kafka 重投，没有"放弃"机制
 3. **无显式退避**：Kafka 级别的重试没有指数退避，瞬时故障可能引发消息风暴
 4. **Stale Build 被动检测**：无人查询的僵尸任务永远停留在 Running 状态
-5. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口
+5. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口（但仅用于用户前台编辑，影响面有限）
+6. **build-manager 未使用 Pacemaker**：如果某个极端场景下 `runBuild()` 执行超过 30 秒（例如 Redis 慢查询），Consumer 可能因会话超时被踢出 Group 导致消息重投
+7. **两套"锁"无关联但文档易混淆**：用户编辑锁与后台任务状态存储是完全独立的系统，但都被称为"锁"容易造成理解偏差
