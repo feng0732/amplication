@@ -350,6 +350,148 @@ git-sync-manager 的两个消费者 **并非完全无 Kafka 重投风险**。精
 
 ---
 
+##### 3.2.2.5 事件 key 解析路径深度分析
+
+git-sync-manager 中 Kafka 消息 key 的解析存在**两层问题**：key 不经过 `validateOrReject` 校验、且 `plainToInstance` 接收到的是未 JSON 解析的原始字符串。
+
+**完整链路（以 CREATE_PR_REQUEST 为例）**：
+
+```
+Producer (amplication-server build.service.ts#L1318-L1331)
+  │ 构造: { key: { resourceRepositoryId: kafkaEventKey, resourceId: branchPer ? res.id : null }, value: {...} }
+  │        ↑ kafkaEventKey 始终为非空 string (demoRepoName 或 resourceRepository.id)
+  │        ↑ resourceId 可能为 null (非 branchPerResource 模式下显式设为 null)
+  ▼
+KafkaProducerService.emitMessage()
+  │ serialiseField(keyObj): typeof keyObj === 'object' → JSON.stringify(keyObj) → Buffer
+  │ 例: {"resourceRepositoryId":"repo-123","resourceId":null} → Buffer
+  ▼
+Kafka Broker (消息持久化)
+  ▼
+Consumer (git-sync-manager pull-request.controller.ts#L66-L69)
+  │ context.getMessage().key  ← 从 KafkaJS 获取的原始 Buffer
+  │ .toString()                ← Buffer → JSON 字符串: '{"resourceRepositoryId":"repo-123","resourceId":null}'
+  │ plainToInstance(CreatePrRequest.Key, jsonString)  ← ⚠️ 传入的是 STRING，不是 OBJECT
+  ▼
+结果: eventKey.resourceRepositoryId = undefined, eventKey.resourceId = undefined
+```
+
+---
+
+**问题 1：key 是否经过 `validateOrReject` 校验？—— 否**
+
+两个消费者中，**只有 value 被校验，key 从不校验**：
+
+| 消费者 | value 校验? | key 校验? |
+|---|---|---|
+| CREATE_PR_REQUEST | ✅ L61: `await validateOrReject(validArgs)` | ❌ 无 |
+| DOWNLOAD_PRIVATE_PLUGINS_REQUEST | ✅ L46: `await validateOrReject(validArgs)` | ❌ 无 |
+
+Key 的 schema 类虽然定义了 `@IsString()` 装饰器：
+- [create-pr-request/key.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/libs/schema-registry/src/lib/create-pr-request/key.ts): `resourceRepositoryId!: string`, `resourceId!: string | null`
+- [download-private-plugins-request/key.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/libs/schema-registry/src/lib/download-private-plugins-request/key.ts): `resourceId!: string | null`
+
+但由于 key 从未被 `validateOrReject()` 调用，这些装饰器完全不生效——**即使 key 内容完全不符合 schema（如字段缺失、类型错误），也不会触发任何异常**。
+
+---
+
+**问题 2：`plainToInstance` 对非空但不符合 schema 的 key 会如何处理？—— 返回全 undefined 的实例**
+
+`class-transformer` 的 `plainToInstance(cls, plain)` 行为：
+- 若 `plain` 是**普通对象** `{foo: "bar"}` → 创建 `cls` 实例并拷贝属性
+- 若 `plain` 是**字符串**（如 JSON 字符串 `'{"foo":"bar"}'`）→ 创建 `cls` 空实例，**不做任何属性拷贝**
+- 若 `plain` 是**畸形对象**（如 key 字段拼写错误 `{resourceRepoId: "x"}`）→ 创建实例，存在的字段拷贝，不存在的字段为 undefined
+
+在当前代码中，`context.getMessage().key.toString()` 返回的是 **JSON 字符串**，不是解析后的对象。因此 **无论 key 内容是否符合 schema，`eventKey` 的所有字段都是 `undefined`**。
+
+所有 key 内容异常场景的结果一致：
+
+| key Buffer 内容 | `.toString()` 结果 | `plainToInstance` 结果 | 是否抛异常 |
+|---|---|---|---|
+| 合法 JSON 对象 `{"resourceRepositoryId":"repo-1","resourceId":null}` | JSON string | `{resourceRepositoryId: undefined, resourceId: undefined}` | ❌ 不抛 |
+| 非法 JSON（如 `"not-json"` 或部分损坏） | 原始字符串 | 全字段 undefined | ❌ 不抛 |
+| key 为对象但字段缺失 `{resourceRepositoryId:"repo-1"}` | JSON string | 全字段 undefined | ❌ 不抛 |
+| key 为 `null` | `TypeError: Cannot read properties of null` | — | ✅ 抛（try 外 → Kafka 重投）|
+
+---
+
+**问题 3：缺失的 `resourceRepositoryId` / `resourceId` 对后续事件的影响**
+
+解析出来的 `eventKey`（字段全为 undefined）仅用于**构造下游 Kafka 事件的 key**，不参与任何业务逻辑判断：
+
+**CREATE_PR_REQUEST 后续 key 使用**：
+
+| 位置 | 代码 | 实际效果 |
+|---|---|---|
+| [L102-L104](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L102-L104) 成功事件 | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | `{ resourceRepositoryId: undefined }` |
+| [L126](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L126) NoChanges 分支 | `key: eventKey` | `{ resourceRepositoryId: undefined, resourceId: undefined }` |
+| [L142-L145](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L142-L145) 失败事件 | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | `{ resourceRepositoryId: undefined }` |
+
+这些 key 经 `JSON.stringify` 序列化后，`undefined` 字段会被省略，最终所有下游事件的 key 都变成 `{}`。
+
+**DOWNLOAD_PRIVATE_PLUGINS_REQUEST 后续 key 使用**：
+
+| 位置 | 代码 | 实际效果 |
+|---|---|---|
+| [L56-L58](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L56-L58) 成功事件 | `key: { resourceId: eventKey.resourceId }` | `{ resourceId: undefined }` → `{}` |
+| [L71-L73](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L71-L73) 失败事件 | `key: { resourceId: eventKey.resourceId }` | `{ resourceId: undefined }` → `{}` |
+
+---
+
+**影响评估**：
+
+1. **Kafka 分区丢失**：key 全部变成 `{}`，CREATE_PR_SUCCESS/FAILURE、DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE 事件失去按 `resourceRepositoryId` / `resourceId` 分区的能力，所有消息 hash 到同一分区。
+
+2. **业务逻辑不受影响**：下游消费者（amplication-server）**只读取 `@Payload()` value，从不读取 key**（见 [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.controller.ts) 所有 handler 均无 `@Ctx()` 或 `context.getMessage()` 调用）。
+
+3. **`resourceId: null` 的语义变化**：Producer 端对于非 branch-per-resource 构建显式将 `resourceId` 设为 `null`（表示"整个项目级别，避免并行 PR 冲突"，见 [build.service.ts#L1321-L1328](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts#L1321-L1328) 的注释）。由于 key 解析 bug，这个 `null` 变成了 `undefined`，最终在序列化时被省略为 `{}`——语义上等价（都不包含 resourceId），但丢失了显式 null 的意图。
+
+---
+
+##### 3.2.2.6 业务偏移 vs Kafka 重投：本质区别
+
+git-sync-manager 中存在两种完全不同的"失败处理"模式，二者在 offset 管理、重试机制、控制方上有本质区别：
+
+| 维度 | Kafka 重投（Kafka-level retry） | 业务偏移（Business offset） |
+|---|---|---|
+| **触发条件** | 异常**逃离 handler 函数**（try 外抛异常、catch 内二次逃逸） | handler **正常返回**（offset 已 commit），但业务操作本身失败 |
+| **offset 行为** | ❌ **不 commit** → 消息滞留原 offset | ✅ **commit** → Kafka 认为消息已处理 |
+| **消息是否重投** | ✅ Kafka 自动重新投递同一消息（可能无限循环） | ❌ Kafka 不再关心此消息 |
+| **失败通知方式** | 无（消息重复消费） | 业务事件：`CREATE_PR_FAILURE`、`DOWNLOAD_PRIVATE_PLUGINS_FAILURE` 等 Kafka 事件 |
+| **控制方** | Kafka Consumer Group 协议（sessionTimeout、rebalance、poll 循环） | 应用代码（try/catch、事件发送） |
+| **重试语义** | 完全相同的消息从头执行 | 无自动重试，需应用层设计补偿逻辑 |
+| **幂等性要求** | 高（重复执行 git clone/push 可能创建重复 PR） | 低（仅发送 Kafka 事件） |
+
+**代码中的具体实例对照**：
+
+**Kafka 重投示例（offset 不 commit）**：
+```typescript
+// pull-request.controller.ts L61 - try 块外
+await validateOrReject(validArgs);  // ← 抛 ValidationError → 逃离 handler
+// → NestJS 不 commit offset → Kafka 重投同一条消息
+```
+
+**业务偏移示例（offset commit，走业务失败）**：
+```typescript
+// pull-request.controller.ts L87-L156 - try/catch 内
+try {
+  await KafkaPacemaker.wrapLongRunningMethod(
+    context, () => this.pullRequestService.createPullRequest(validArgs)
+    // ← git 操作失败抛异常
+  );
+} catch (error) {
+  // ← 异常被捕获
+  await this.producerService.emitMessage(CREATE_PR_FAILURE_TOPIC, failureEvent);
+  // ← 发送业务失败事件（假设这次 emit 成功）
+}
+// → handler 正常返回 → NestJS commit offset → Kafka 不再重投
+// → 下游 amplication-server 消费 CREATE_PR_FAILURE 事件处理业务失败
+```
+
+> 💡 **关键洞察**：业务偏移是一种"承认失败、记录失败、继续前进"的策略——offset 向前推进，失败状态通过事件系统传播给下游；Kafka 重投则是"卡在原地、反复尝试"——offset 不动，希望下一次处理能成功。前者适合**确定性失败**（git 仓库不存在、权限不足等），后者适合**瞬时性失败**（网络闪断、Kafka broker 临时不可用等）。当前代码中瞬时失败也会在 catch 内 `emitMessage` 失败时意外升级为 Kafka 重投。
+
+---
+
 #### 3.2.3 amplication-server 消费者
 
 [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.controller.ts) 中所有 `@EventPattern` 消费者：
@@ -650,12 +792,16 @@ isBuildStale(build) {
 2. **无死信队列（DLT）——永久性错误会无限循环**：
    - `PACKAGE_MANAGER_CREATE_SUCCESS/FAILURE`（build-manager）和 `DSG_LOG_TOPIC`（server）的消费者无 try/catch，反复失败会无限次 Kafka 重投
    - git-sync-manager 的 `validateOrReject` 失败（消息格式错误）和 `key.toString()` 失败（消息 key 为 null）位于 try 块外，**坏消息会被 Kafka 无限重投，永远无法自愈**
-3. **git-sync-manager catch 块内事件发送失败——异常二次逃逸**：
+3. **git-sync-manager key 解析 Bug——key 字段全为 undefined**：
+   - `plainToInstance()` 直接接收 `key.toString()` 返回的 JSON 字符串，没有先 `JSON.parse()`，导致 `resourceRepositoryId` / `resourceId` 全部为 `undefined`
+   - Key 从不经过 `validateOrReject` 校验，schema 上的 `@IsString()` 装饰器完全不生效
+   - 后果：下游所有 CREATE_PR_SUCCESS/FAILURE、DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE 事件的 key 退化为 `{}`，失去按资源分区的能力；但由于下游消费者只读取 value，业务逻辑不受影响
+4. **git-sync-manager catch 块内事件发送失败——异常二次逃逸**：
    - `CREATE_PR_REQUEST_TOPIC` 有 3 条逃逸路径（L118 日志发送、L123 成功事件发送、L153 失败事件发送）
    - `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` 有 1 条逃逸路径（L79 失败事件发送）
    - 这些路径在 catch 块内，若 Kafka broker 瞬时不可用，异常会逃离 catch，触发 Kafka 重投。恢复后该消息会被重新执行，git 操作可能重复（如创建重复 PR）
-4. **无显式退避**：Kafka 级别的重试没有指数退避，瞬时故障可能引发消息风暴
-5. **Stale Build 被动检测**：无人查询的僵尸任务永远停留在 Running 状态
-6. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口（但仅用于用户前台编辑，影响面有限）
-7. **build-manager 未使用 Pacemaker**：如果某个极端场景下 `runBuild()` 执行超过 30 秒（例如 Redis 慢查询），Consumer 可能因会话超时被踢出 Group 导致消息重投
-8. **两套"锁"无关联但文档易混淆**：用户编辑锁与后台任务状态存储是完全独立的系统，但都被称为"锁"容易造成理解偏差
+5. **无显式退避**：Kafka 级别的重试没有指数退避，瞬时故障可能引发消息风暴
+6. **Stale Build 被动检测**：无人查询的僵尸任务永远停留在 Running 状态
+7. **数据库锁非严格**：Block/Entity 锁的 check-then-act 模式存在 TOCTOU 竞态窗口（但仅用于用户前台编辑，影响面有限）
+8. **build-manager 未使用 Pacemaker**：如果某个极端场景下 `runBuild()` 执行超过 30 秒（例如 Redis 慢查询），Consumer 可能因会话超时被踢出 Group 导致消息重投
+9. **两套"锁"无关联但文档易混淆**：用户编辑锁与后台任务状态存储是完全独立的系统，但都被称为"锁"容易造成理解偏差
