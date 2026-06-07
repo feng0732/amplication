@@ -395,56 +395,111 @@ Key 的 schema 类虽然定义了 `@IsString()` 装饰器：
 
 ---
 
-**问题 2：`plainToInstance` 对非空但不符合 schema 的 key 会如何处理？—— 返回全 undefined 的实例**
+**问题 2：class-transformer@0.5.1 `plainToInstance` 接收 JSON 字符串时返回什么？—— 原字符串本身，不是类实例**
 
-`class-transformer` 的 `plainToInstance(cls, plain)` 行为：
-- 若 `plain` 是**普通对象** `{foo: "bar"}` → 创建 `cls` 实例并拷贝属性
-- 若 `plain` 是**字符串**（如 JSON 字符串 `'{"foo":"bar"}'`）→ 创建 `cls` 空实例，**不做任何属性拷贝**
-- 若 `plain` 是**畸形对象**（如 key 字段拼写错误 `{resourceRepoId: "x"}`）→ 创建实例，存在的字段拷贝，不存在的字段为 undefined
+经过运行 class-transformer@0.5.1 实测验证，`plainToInstance(cls, plain)` 对非 object 类型输入的处理是**直接原样返回**，不创建类实例：
 
-在当前代码中，`context.getMessage().key.toString()` 返回的是 **JSON 字符串**，不是解析后的对象。因此 **无论 key 内容是否符合 schema，`eventKey` 的所有字段都是 `undefined`**。
-
-所有 key 内容异常场景的结果一致：
-
-| key Buffer 内容 | `.toString()` 结果 | `plainToInstance` 结果 | 是否抛异常 |
+| `plain` 输入类型 | `plainToInstance` 返回值 | `typeof` 返回值 | `instanceof CreatePrRequestKey` |
 |---|---|---|---|
-| 合法 JSON 对象 `{"resourceRepositoryId":"repo-1","resourceId":null}` | JSON string | `{resourceRepositoryId: undefined, resourceId: undefined}` | ❌ 不抛 |
-| 非法 JSON（如 `"not-json"` 或部分损坏） | 原始字符串 | 全字段 undefined | ❌ 不抛 |
-| key 为对象但字段缺失 `{resourceRepositoryId:"repo-1"}` | JSON string | 全字段 undefined | ❌ 不抛 |
-| key 为 `null` | `TypeError: Cannot read properties of null` | — | ✅ 抛（try 外 → Kafka 重投）|
+| `string` (JSON 字符串) | **原字符串本身** | `"string"` | `false` |
+| `string` (任意字符串) | **原字符串本身** | `"string"` | `false` |
+| `null` | `null` | `"object"` | `false` |
+| `number` | **原数字本身** | `"number"` | `false` |
+| `object` (普通对象) | `cls` 类实例，属性已拷贝 | `"object"` | `true` |
+
+**实测核心输出**（class-transformer@0.5.1）：
+```javascript
+plainToInstance(CreatePrRequestKey, '{"resourceRepositoryId":"repo-123","resourceId":null}')
+// → 返回字符串本身: '{"resourceRepositoryId":"repo-123","resourceId":null}'
+// → typeof = "string", NOT "object"
+// → result.resourceRepositoryId = undefined (因为字符串没有该属性)
+// → Object.keys(result) = ["0","1","2",...] (字符索引!)
+```
+
+**为什么属性读取变成 `undefined`？**
+
+不是"空实例的未定义属性"，而是 JavaScript 对字符串对象的属性访问行为：
+```javascript
+const str = '{"resourceRepositoryId":"repo-123"}';
+str.resourceRepositoryId; // → undefined (字符串没有这个属性)
+str[0];                   // → "{" (有数字索引属性)
+Object.keys(str);         // → ["0","1","2",...] (字符位置索引)
+```
+
+`plainToInstance` 内部在 transform 前做了类型检查：如果输入 `plain` 不是 object（且不是数组），直接 return 原 value，不进入任何转换逻辑。这就是为什么字符串输入被原样返回。
+
+**所有非 null key 场景的精确结果**：
+
+| key Buffer 内容 | `.toString()` 结果 | `plainToInstance` 实际返回 | `.resourceRepositoryId` | 是否抛异常 |
+|---|---|---|---|---|
+| 合法 JSON `{"resourceRepositoryId":"repo-1","resourceId":null}` | JSON string | **该 JSON string** | `undefined` | ❌ |
+| 非法 JSON `"not-a-valid-json"` | 原始字符串 `"not-a-valid-json"` | **该字符串** | `undefined` | ❌ |
+| key 为对象但字段缺失 | JSON string | **该 JSON string** | `undefined` | ❌ |
+| key 为 `null` | `TypeError: .toString()` on null | — | — | ✅ 抛 → Kafka 重投 |
+
+**正确写法对比**：
+```typescript
+// 当前代码 (错误):
+const eventKey = plainToInstance(CreatePrRequest.Key, context.getMessage().key.toString());
+//   → eventKey 是 string, eventKey.resourceRepositoryId = undefined
+
+// 正确代码 (需先 JSON.parse):
+const keyStr = context.getMessage().key.toString();
+const keyPlain = JSON.parse(keyStr);
+const eventKey = plainToInstance(CreatePrRequest.Key, keyPlain);
+//   → eventKey 是 CreatePrRequest.Key 实例, .resourceRepositoryId = "repo-123"
+```
 
 ---
 
-**问题 3：缺失的 `resourceRepositoryId` / `resourceId` 对后续事件的影响**
+**问题 3：缺失的 `resourceRepositoryId` / `resourceId` 对下游事件 key 的影响——分支间产生不一致的 Kafka key**
 
-解析出来的 `eventKey`（字段全为 undefined）仅用于**构造下游 Kafka 事件的 key**，不参与任何业务逻辑判断：
+由于 `eventKey` 实际上是**字符串**（而非类实例），下游不同分支对 `eventKey` 的使用方式会经 `KafkaMessageJsonSerializer.serialiseField()` 产生完全不同的 key Buffer：
 
-**CREATE_PR_REQUEST 后续 key 使用**：
+```typescript
+// KafkaMessageJsonSerializer.serialiseField() 的分支逻辑:
+private serialiseField(field: string | Json | null): Buffer | null {
+  if (field === null) return null;
+  if (typeof field === "string") return Buffer.from(field, "utf-8");  // ← 路径 A: 字符串直接编码
+  const stringVal = JSON.stringify(field);                            // ← 路径 B: 对象先 JSON.stringify
+  return Buffer.from(stringVal, "utf-8");
+}
+```
 
-| 位置 | 代码 | 实际效果 |
+**CREATE_PR_REQUEST 各分支的实际序列化结果**：
+
+| 分支 | 位置 | 代码 | `eventKey` 实际类型 | 经 `serialiseField` 后的 key Buffer |
+|---|---|---|---|---|
+| 正常成功 | [L102-L104](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L102-L104) | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | `typeof eventKey === "string"`, 读取 `.resourceRepositoryId` 得 `undefined` → 构造对象 `{ resourceRepositoryId: undefined }` → `JSON.stringify` 省略 undefined → `"{}"` → `Buffer.from("{}")` | **Buffer: `"{}"` (2 bytes)** |
+| NoChanges (无变更) | [L122-L134](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L122-L134) | `key: eventKey` | `eventKey` 本身就是 string: `'{"resourceRepositoryId":"repo-123","resourceId":null}'` → 走路径 A 直接 `Buffer.from(该字符串)` | **Buffer: 完整 JSON 字符串 (~60 bytes, 内容含实际 ID)** |
+| 失败 | [L142-L145](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L142-L145) | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | 同正常成功分支 | **Buffer: `"{}"` (2 bytes)** |
+
+**关键发现：NoChanges 分支的 key 与成功/失败分支完全不同！**
+
+- NoChanges 分支：key 是**完整 JSON 字符串**，包含实际的 `resourceRepositoryId` → Kafka 按真实 ID hash 分区
+- 成功/失败分支：key 是 `{}` → 所有消息 hash 到同一分区
+
+这意味着同一个 `resourceRepositoryId` 的消息，在不同分支可能被路由到**不同分区**，破坏了同一资源 PR 操作的有序性保证。
+
+**DOWNLOAD_PRIVATE_PLUGINS_REQUEST 后续 key 使用**（仅成功/失败两个分支，都走路径 B）：
+
+| 位置 | 代码 | 经 `serialiseField` 后的 key Buffer |
 |---|---|---|
-| [L102-L104](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L102-L104) 成功事件 | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | `{ resourceRepositoryId: undefined }` |
-| [L126](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L126) NoChanges 分支 | `key: eventKey` | `{ resourceRepositoryId: undefined, resourceId: undefined }` |
-| [L142-L145](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/pull-request/pull-request.controller.ts#L142-L145) 失败事件 | `key: { resourceRepositoryId: eventKey.resourceRepositoryId }` | `{ resourceRepositoryId: undefined }` |
-
-这些 key 经 `JSON.stringify` 序列化后，`undefined` 字段会被省略，最终所有下游事件的 key 都变成 `{}`。
-
-**DOWNLOAD_PRIVATE_PLUGINS_REQUEST 后续 key 使用**：
-
-| 位置 | 代码 | 实际效果 |
-|---|---|---|
-| [L56-L58](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L56-L58) 成功事件 | `key: { resourceId: eventKey.resourceId }` | `{ resourceId: undefined }` → `{}` |
-| [L71-L73](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L71-L73) 失败事件 | `key: { resourceId: eventKey.resourceId }` | `{ resourceId: undefined }` → `{}` |
+| [L56-L58](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L56-L58) 成功 | `key: { resourceId: eventKey.resourceId }` | `{ resourceId: undefined }` → `JSON.stringify` → `"{}"` → Buffer: `"{}"` |
+| [L71-L73](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/ee/packages/git-sync-manager/src/private-plugin/private-plugin.controller.ts#L71-L73) 失败 | `key: { resourceId: eventKey.resourceId }` | 同上 → Buffer: `"{}"` |
 
 ---
 
 **影响评估**：
 
-1. **Kafka 分区丢失**：key 全部变成 `{}`，CREATE_PR_SUCCESS/FAILURE、DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE 事件失去按 `resourceRepositoryId` / `resourceId` 分区的能力，所有消息 hash 到同一分区。
+1. **分区能力严重丢失**：
+   - DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE：所有消息 key = `"{}"` → 全量 hash 到同一分区，完全丧失按 `resourceId` 分区能力
+   - CREATE_PR_SUCCESS/FAILURE：所有消息 key = `"{}"` → 同上
+   - CREATE_PR_SUCCESS (NoChanges 分支)：key = 完整 JSON 字符串 → 按真实 ID hash，但与成功/失败分支的 key 不同源，导致同一资源的不同状态事件可能落在不同分区，**破坏有序性**
 
 2. **业务逻辑不受影响**：下游消费者（amplication-server）**只读取 `@Payload()` value，从不读取 key**（见 [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.controller.ts) 所有 handler 均无 `@Ctx()` 或 `context.getMessage()` 调用）。
 
-3. **`resourceId: null` 的语义变化**：Producer 端对于非 branch-per-resource 构建显式将 `resourceId` 设为 `null`（表示"整个项目级别，避免并行 PR 冲突"，见 [build.service.ts#L1321-L1328](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts#L1321-L1328) 的注释）。由于 key 解析 bug，这个 `null` 变成了 `undefined`，最终在序列化时被省略为 `{}`——语义上等价（都不包含 resourceId），但丢失了显式 null 的意图。
+3. **`resourceId: null` 的语义完全丢失**：Producer 端对于非 branch-per-resource 构建显式将 `resourceId` 设为 `null`（表示"整个项目级别，避免并行 PR 冲突"，见 [build.service.ts#L1321-L1328](file:///d:/fz/0601/solo-dogfeeding/code/55-amplication/packages/amplication-server/src/core/build/build.service.ts#L1321-L1328) 的注释）。由于 key 解析 Bug，`eventKey` 是字符串，`.resourceId` = `undefined`，成功/失败分支中这个值直接被 `JSON.stringify` 省略——语义上虽然"不包含 resourceId"，但 NoChanges 分支的 key 中实际上保留了原 `resourceId: null`。**同一资源在不同分支 key 语义不一致**。
 
 ---
 
@@ -792,10 +847,12 @@ isBuildStale(build) {
 2. **无死信队列（DLT）——永久性错误会无限循环**：
    - `PACKAGE_MANAGER_CREATE_SUCCESS/FAILURE`（build-manager）和 `DSG_LOG_TOPIC`（server）的消费者无 try/catch，反复失败会无限次 Kafka 重投
    - git-sync-manager 的 `validateOrReject` 失败（消息格式错误）和 `key.toString()` 失败（消息 key 为 null）位于 try 块外，**坏消息会被 Kafka 无限重投，永远无法自愈**
-3. **git-sync-manager key 解析 Bug——key 字段全为 undefined**：
-   - `plainToInstance()` 直接接收 `key.toString()` 返回的 JSON 字符串，没有先 `JSON.parse()`，导致 `resourceRepositoryId` / `resourceId` 全部为 `undefined`
+3. **git-sync-manager key 解析 Bug (class-transformer@0.5.1 精确行为)**：
+   - `plainToInstance()` 直接接收 `key.toString()` 返回的 JSON **字符串**，class-transformer@0.5.1 对非 object 输入**原样返回字符串**（不创建类实例），`eventKey` 实际上是 string 类型
+   - 读取 `eventKey.resourceRepositoryId` 实际上是在读取 JavaScript 字符串对象的属性 → 返回 `undefined`
    - Key 从不经过 `validateOrReject` 校验，schema 上的 `@IsString()` 装饰器完全不生效
-   - 后果：下游所有 CREATE_PR_SUCCESS/FAILURE、DOWNLOAD_PRIVATE_PLUGINS_SUCCESS/FAILURE 事件的 key 退化为 `{}`，失去按资源分区的能力；但由于下游消费者只读取 value，业务逻辑不受影响
+   - **分区不一致问题**：NoChanges 分支直接使用整个字符串作为 key（`key: eventKey`），经 `serialiseField` 走字符串路径，产生包含真实 ID 的完整 JSON key；而成功/失败分支构造 `{ resourceRepositoryId: undefined }` 对象，经 `JSON.stringify` 后退化为 `"{}"`。**同一 resourceRepositoryId 的不同状态事件可能被路由到不同分区，破坏 Kafka 分区有序性保证**
+   - 但由于下游消费者（amplication-server）只读取 value、从不读取 key，业务逻辑不受直接影响
 4. **git-sync-manager catch 块内事件发送失败——异常二次逃逸**：
    - `CREATE_PR_REQUEST_TOPIC` 有 3 条逃逸路径（L118 日志发送、L123 成功事件发送、L153 失败事件发送）
    - `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` 有 1 条逃逸路径（L79 失败事件发送）
