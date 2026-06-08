@@ -6,8 +6,8 @@
 
 | 服务 | 模块 | 职责 |
 |------|------|------|
-| `amplication-server` | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts) | Build 创建、Action/Step 管理、最终状态入库、Git 推送编排 |
-| `amplication-server` | [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/action.service.ts) | Step 生命周期、ActionLog 写入 |
+| `amplication-server` | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts) | Build 创建、Action/Step 管理、最终状态入库、Git 推送编排、Build Stale 兜底 |
+| `amplication-server` | [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/action.service.ts) | Step 生命周期（create/complete/log） |
 | `amplication-server` | [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.controller.ts) | Kafka 事件消费者（成功/失败/日志/PR） |
 | `amplication-build-manager` | [build-runner.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-build-manager/src/build-runner/build-runner.service.ts) | DSG 执行、Package Manager 编排、状态聚合、失败去重 |
 | `amplication-build-manager` | [build-job-handler.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-build-manager/src/build-job-handler/build-job-handler.service.ts) | 子作业拆分、Redis 状态读写、Job ID 编解码 |
@@ -19,22 +19,26 @@
 系统采用 **三层状态** 分层管理：
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Layer 3: PostgreSQL (Build 表)                                      │
-│  status: Running | Completed | Failed | Invalid | Unknown | Canceled │
-│  gitStatus: NotConnected | Waiting | Completed | Failed | Canceled   │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │  Layer 2: PostgreSQL (ActionStep 表)                         │    │
-│  │  status: Waiting | Running | Failed | Success               │    │
-│  │  Step 类型: ADD_TO_QUEUE | GENERATE_APPLICATION |            │    │
-│  │            DOWNLOAD_PRIVATE_PLUGINS | PUSH_TO_GIT_PROVIDER   │    │
-│  │  ┌──────────────────────────────────────────────────────┐    │    │
-│  │  │  Layer 1: Redis (子 Job 状态)                           │    │    │
-│  │  │  status: in-progress | success | failure               │    │    │
-│  │  │  Key: buildId, Value: {jobBuildId → status}            │    │    │
-│  │  └──────────────────────────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Layer 3: PostgreSQL (Build 表) — 构建最终状态                             │
+│  status: Running | Completed | Failed | Invalid | Unknown | Canceled       │
+│  gitStatus: NotConnected | Waiting | Completed | Failed | Canceled        │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 2: PostgreSQL (ActionStep 表) — 用户可见步骤进度              │    │
+│  │  status: Waiting | Running | Failed | Success                       │    │
+│  │  Step 名称:                                                          │    │
+│  │    · ADD_TO_QUEUE                                                    │    │
+│  │    · DOWNLOAD_PRIVATE_PLUGINS (可选)                                 │    │
+│  │    · GENERATE_APPLICATION                                            │    │
+│  │    · PUSH_TO_GIT_PROVIDER (可选)                                     │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
+│  │  │  Layer 1: Redis — 细粒度子 Job 状态（仅 Build Manager 内部用）  │    │    │
+│  │  │  status: in-progress | success | failure                     │    │    │
+│  │  │  Key: buildId, Value: { "buildId-server": status,            │    │    │
+│  │  │                            "buildId-admin-ui": status }      │    │    │
+│  │  └─────────────────────────────────────────────────────────────┘    │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 各层状态枚举定义：
@@ -43,6 +47,30 @@
 - Build Git 状态：[EnumBuildGitStatus.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/dto/EnumBuildGitStatus.ts)
 - Action Step 状态：[EnumActionStepStatus.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/dto/EnumActionStepStatus.ts)
 - Job 状态：[types.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-build-manager/src/types.ts)
+
+### 1.3 Build.status 与 Build.gitStatus 的职责边界核准
+
+基于对所有 `updateBuildStatuses()` 调用点的代码审计，两者职责边界如下：
+
+| 字段 | 职责定位 | 语义说明 |
+|------|---------|---------|
+| **Build.status** | **构建整体结果的最终状态** | 由代码生成结果 + Git 推送结果（如有）共同决定，是对外 API 返回的主状态 |
+| **Build.gitStatus** | **Git 推送专属子状态** | 只反映 Git 环节本身，与代码生成解耦 |
+
+具体取值的语义：
+
+**Build.status**：
+- `Running`：构建尚未结束（代码生成中 / Git 推送中 / 等待回调）
+- `Completed`：全流程成功（代码生成 + Git 推送都成功；或代码生成成功但未配置 Git）
+- `Failed`：任一关键环节失败（代码生成失败 / Git 推送失败 / 插件下载失败 / 超时 stale）
+- `Invalid`、`Unknown`、`Canceled`：历史兼容或异常路径，正常流程不产出
+
+**Build.gitStatus**：
+- `Waiting`：Git 环节尚未开始（代码生成阶段 / Git 请求已发送等待回调）
+- `NotConnected`：资源未配置 Git 仓库（无需 Git 推送）
+- `Completed`：Git 推送成功
+- `Failed`：Git 推送失败
+- `Canceled`：Git 推送被取消（因上游环节失败，Git 环节从未触发）
 
 ---
 
@@ -62,13 +90,13 @@ async create(args: CreateBuildArgs): Promise<Build> {
       ...args.data,
       version,
       createdAt: new Date(),
-      status: EnumBuildStatus.Running,        // Layer 3: Build 状态 = Running
-      gitStatus: EnumBuildGitStatus.Waiting,   // Layer 3: Git 状态 = Waiting
+      status: EnumBuildStatus.Running,        // Layer 3: Build.status = Running
+      gitStatus: EnumBuildGitStatus.Waiting,   // Layer 3: Build.gitStatus = Waiting
       entityVersions: { connect: latestEntityVersions.map(v => ({ id: v.id })) },
       action: {
         create: {
           steps: {
-            create: createInitialStepData(version, args.data.message), // Layer 2: 创建初始 Step
+            create: createInitialStepData(version, args.data.message), // Layer 2: 初始 Step
           },
         },
       },
@@ -76,7 +104,7 @@ async create(args: CreateBuildArgs): Promise<Build> {
     include: { commit: true, resource: true },
   });
   // ...
-  // 有私钥插件 → 先下载插件；无插件 → 直接进入 generate() 阶段
+  // 有私钥插件 → 先下载插件；无插件 → 直接进入 generate()
   if (resourcePrivatePlugins.length > 0) {
     await this.downloadPrivatePlugins(logger, build, user, resourcePrivatePlugins);
   } else {
@@ -98,7 +126,7 @@ export function createInitialStepData(
   return {
     message: "Adding task to queue",
     name: "ADD_TO_QUEUE",
-    status: EnumActionStepStatus.Success,   // 立即成功（入队动作本身瞬时完成）
+    status: EnumActionStepStatus.Success,   // 立即标记 Success（瞬时操作）
     completedAt: new Date(),
     logs: {
       create: [
@@ -126,7 +154,7 @@ private async generate(logger: ILogger, build: Build, user: User): Promise<strin
       const dsgResourceData = await this.getDSGResourceData(resource, buildId, buildVersion, user);
       await this.saveDsgResourceDataToSharedStorage(buildId, dsgResourceData);
       
-      // 发送轻量消息：只传 resourceId + buildId
+      // 轻量消息：只传 resourceId + buildId，大对象通过共享文件系统传递
       const codeGenerationEvent: CodeGenerationRequest.KafkaEvent = {
         key: null,
         value: { resourceId, buildId },
@@ -176,19 +204,17 @@ DSG Runner (容器内)
      ▼
 Build Manager [build-logger.controller.ts]
      │  addCodeGenerationLog()
-     │  - 提取 buildId（去 domain 后缀）
-     │  - Job 有 domain 时加 [server]/[admin-ui] 前缀
+     │  - extractBuildId(): 去除 domain 后缀
+     │  - 若为子 Job 日志，message 加 "[server]"/"[admin-ui]" 前缀
      ▼
-Kafka: DSG_LOG_TOPIC
+Kafka: DSG_LOG_TOPIC  (key = { buildId })
      │
      ▼
 Server [build.controller.ts] onDsgLog()
-     │  actionService.logByStepId()
+     │  actionService.logByStepId() → ActionLog 表
+     │  Error 级别额外触发 Segment 埋点
      ▼
-PostgreSQL: ActionLog 表
-     │  (同时 Error 级别会触发 Segment 埋点)
-     ▼
-Segment Analytics
+PostgreSQL ActionLog + Segment Analytics
 ```
 
 ### 3.2 DSG Runner → Build Manager：日志接收
@@ -210,7 +236,7 @@ DTO 定义在 [OnCodeGenerationLogRequest.ts](file:///d:/fz/0601/solo-dogfeeding
 
 ```typescript
 export interface CodeGenerationLogRequestDto extends LogEntry {
-  buildId: string;  // 可能是 buildId 或 buildId-server / buildId-admin-ui
+  buildId: string;  // 可能是 buildId 或 jobBuildId（buildId-server / buildId-admin-ui）
 }
 ```
 
@@ -223,13 +249,12 @@ export interface CodeGenerationLogRequestDto extends LogEntry {
 async addCodeGenerationLog(logEntry: CodeGenerationLogRequestDto): Promise<void> {
   const buildId = this.buildJobsHandlerService.extractBuildId(logEntry.buildId);
 
-  // 如果是子 Job 日志，给 message 加 domain 前缀区分来源
+  // 子 Job 日志自动加 domain 前缀："Compiling" → "[server] Compiling"
   if (buildId !== logEntry.buildId) {
     const domain = this.buildJobsHandlerService.extractDomain(logEntry.buildId);
     logEntry.message = `[${domain}] ${logEntry.message}`;
   }
 
-  // 转发到 Kafka，key = { buildId }
   const logEvent: CodeGenerationLog.KafkaEvent = {
     key: { buildId },
     value: { ...logEntry, buildId },
@@ -237,11 +262,6 @@ async addCodeGenerationLog(logEntry: CodeGenerationLogRequestDto): Promise<void>
   await this.producerService.emitMessage(KAFKA_TOPICS.DSG_LOG_TOPIC, logEvent);
 }
 ```
-
-日志加工规则：
-- `extractBuildId("build-123-server")` → `"build-123"`
-- `extractDomain("build-123-server")` → `"server"`
-- 消息处理：`"Compiling TypeScript"` → `"[server] Compiling TypeScript"`
 
 ### 3.4 Server：日志入库 + 错误埋点
 
@@ -271,23 +291,9 @@ public async onDsgLog(logEntry: CodeGenerationLog.Value): Promise<void> {
     logEntry.message
   );
 
-  // 3. Error 级别额外触发 Segment 错误埋点
+  // 3. Error 级别额外触发 Segment 埋点（CodeGenerationError）
   if (ACTION_LOG_LEVEL[logEntry.level] === EnumActionLogLevel.Error) {
-    const build = await this.prisma.build.findUnique({
-      where: { id: logEntry.buildId },
-      include: { createdBy: { include: { account: true } }, resource: { include: { project: true } } },
-    });
-    await this.analytics.trackManual({
-      user: { accountId: build.createdBy.account.id, workspaceId: build.resource.project.workspaceId },
-      data: {
-        properties: {
-          resourceId: build.resource.id,
-          projectId: build.resource.project.id,
-          message: logEntry.message,
-        },
-        event: EnumEventType.CodeGenerationError,
-      },
-    });
+    // ... analytics.trackManual()
   }
 }
 ```
@@ -298,12 +304,7 @@ ActionLog 写入底层在 [action.service.ts](file:///d:/fz/0601/solo-dogfeeding
 // action.service.ts#L166-L183
 async logByStepId(stepId: string, level: EnumActionLogLevel, message: string, meta: JsonValue = {}): Promise<void> {
   await this.prisma.actionLog.create({
-    data: {
-      level,
-      message,
-      meta,
-      step: { connect: { id: stepId } },
-    },
+    data: { level, message, meta, step: { connect: { id: stepId } } },
     select: SELECT_ID,
   });
 }
@@ -315,7 +316,7 @@ async logByStepId(stepId: string, level: EnumActionLogLevel, message: string, me
 
 ### 4.1 触发条件
 
-当代码生成全部子 Job 成功，且 `dsgResourceData.packages.length > 0` 且 `ENABLE_PACKAGE_MANAGER=true` 时，进入 Package Manager 阶段：
+当所有子 Job 代码生成成功，且 `dsgResourceData.packages.length > 0` 且 `ENABLE_PACKAGE_MANAGER=true` 时，进入 Package Manager 阶段：
 
 ```typescript
 // build-runner.service.ts#L366-L376
@@ -323,11 +324,9 @@ if (buildStatus === EnumJobStatus.Success) {
   const dsgResourceData = await this.buildJobsHandlerService.extractDsgResourceData(jobBuildId);
   
   if (dsgResourceData.packages?.length > 0 && this.enablePackageManager) {
-    // 有包需要生成 → 进入 Package Manager 流程
-    await this.generatePackages(buildId, resourceId, dsgResourceData);
+    await this.generatePackages(buildId, resourceId, dsgResourceData);  // 有包 → 调 PM
   } else {
-    // 无包 → 直接完成
-    await this.codeGenerationAndPackagesCompleted(jobBuildId);
+    await this.codeGenerationAndPackagesCompleted(jobBuildId);          // 无包 → 直接完成
   }
 }
 ```
@@ -337,14 +336,12 @@ if (buildStatus === EnumJobStatus.Success) {
 ```typescript
 // build-runner.service.ts#L69-L88
 async generatePackages(buildId: string, resourceId: string, dsgResourceData: DSGResourceData) {
-  // 写日志：发送 N 个包待生成
   this.buildLoggerService.addCodeGenerationLog({
     buildId,
     message: `Sending ${dsgResourceData.packages?.length} package(s) for generation`,
     level: LogLevel.Info,
   });
 
-  // 发送 Kafka 消息
   const requestPackagesEvent: PackageManagerCreateRequest.KafkaEvent = {
     key: null,
     value: { resourceId, buildId, dsgResourceData },
@@ -358,19 +355,16 @@ async generatePackages(buildId: string, resourceId: string, dsgResourceData: DSG
 
 ### 4.3 Package Manager 成功回调
 
-Kafka 消费在 [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts#L44-L54)：
-
 ```typescript
 // build-runner.controller.ts#L44-L54
 @EventPattern(KAFKA_TOPICS.PACKAGE_MANAGER_CREATE_SUCCESS)
 async onPackageManagerCreateSuccess(@Payload() message: PackageManagerCreateSuccess.Value): Promise<void> {
-  this.logger.info("Code package manager create success response received", { build: message.buildId });
   const args = plainToInstance(PackageManagerCreateSuccess.Value, message);
   await this.buildRunnerService.onPackageManagerCreateSuccess(args);
 }
 ```
 
-处理逻辑：包生成成功 = 整个代码生成 + 包生成都完成，直接发送 `CODE_GENERATION_SUCCESS_TOPIC`：
+处理逻辑：PM 成功 = 代码生成 + 包生成都完成，发送 `CODE_GENERATION_SUCCESS_TOPIC`：
 
 ```typescript
 // build-runner.service.ts#L54-L58
@@ -378,8 +372,6 @@ async onPackageManagerCreateSuccess(response: PackageManagerCreateSuccess.Value)
   await this.codeGenerationAndPackagesCompleted(response.buildId);
 }
 ```
-
-`codeGenerationAndPackagesCompleted()` 发送最终成功事件：
 
 ```typescript
 // build-runner.service.ts#L93-L107
@@ -400,12 +392,11 @@ async codeGenerationAndPackagesCompleted(buildIdOrJobBuildId: string) {
 @EventPattern(KAFKA_TOPICS.PACKAGE_MANAGER_CREATE_FAILURE)
 async onPackageManagerCreateFailure(@Payload() message: PackageManagerCreateFailure.Value): Promise<void> {
   const args = plainToInstance(PackageManagerCreateFailure.Value, message);
-  this.logger.info("Code package manager create failure response received", { error: args.errorMessage });
   await this.buildRunnerService.onPackageManagerCreateFailure(args);
 }
 ```
 
-处理逻辑：包生成失败 = 整个构建失败，直接发送 `CODE_GENERATION_FAILURE_TOPIC`：
+处理逻辑：PM 失败 = 整个构建失败：
 
 ```typescript
 // build-runner.service.ts#L60-L67
@@ -414,15 +405,15 @@ async onPackageManagerCreateFailure(response: PackageManagerCreateFailure.Value)
 }
 ```
 
-> **注意**：Package Manager 阶段的失败**没有**多 Job 去重保护，因为此时代码生成已经全部完成，Package Manager 是单一阶段。
+> **注意**：Package Manager 阶段**没有**多 Job 去重保护，因为此时代码生成已全部完成，PM 是单一阶段。
 
 ---
 
-## 五、Git 推送 Step 完整状态流转
+## 五、Git 推送 Step 状态流转（代码核准版）
 
-### 5.1 Step 创建：PUSH_TO_GIT_PROVIDER
+### 5.1 调用链入口
 
-当 Server 收到 `CODE_GENERATION_SUCCESS_TOPIC` 后，首先调用 `saveToGitProvider()`：
+Server 收到 `CODE_GENERATION_SUCCESS_TOPIC` 后，在 [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.controller.ts#L87-L101) 顺序执行：
 
 ```typescript
 // build.controller.ts#L87-L101
@@ -430,15 +421,36 @@ async onPackageManagerCreateFailure(response: PackageManagerCreateFailure.Value)
 async onCodeGenerationSuccess(@Payload() message: CodeGenerationSuccess.Value): Promise<void> {
   const args = plainToInstance(CodeGenerationSuccess.Value, message);
   try {
-    await this.buildService.saveToGitProvider(args.buildId);   // Step 1: Git 推送
-    await this.buildService.onCodeGenerationSuccess(args.buildId); // Step 2: 完成代码生成 Step
+    await this.buildService.saveToGitProvider(args.buildId);     // 先 Git 推送
+    await this.buildService.onCodeGenerationSuccess(args.buildId); // 再完成 GENERATE Step
   } catch (error) {
+    // ⚠️ 注意：外层 try-catch 捕获的是 saveToGitProvider 本身抛出的异常
+    // 但 saveToGitProvider 内部的 CREATE_PR_REQUEST emit 异常被内部吞掉，不会走到这里
     this.logger.error("Failed to Complete Code Generation Step ", error, {...});
   }
 }
 ```
 
-`saveToGitProvider()` 在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1130-L1342) 中创建 `PUSH_TO_GIT_PROVIDER` Step：
+### 5.2 Step 创建：PUSH_TO_GIT_PROVIDER
+
+`saveToGitProvider()` 在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1130-L1342) 中创建 Step：
+
+**分支 A：资源未配置 Git 仓库**
+
+```typescript
+// build.service.ts#L1227-L1234
+if (!resourceRepository) {
+  // 无 Git → 直接完成 Build，不创建 PUSH_TO_GIT Step
+  await this.updateBuildStatuses(
+    build.id,
+    EnumBuildStatus.Completed,
+    EnumBuildGitStatus.NotConnected
+  );
+  return;
+}
+```
+
+**分支 B：有 Git 配置 → 创建 PUSH_TO_GIT Step**
 
 ```typescript
 // build.service.ts#L1285-L1341
@@ -448,27 +460,11 @@ return this.actionService.run(
   PUSH_TO_GIT_STEP_MESSAGE(gitProvider),    // "Push changes to GitHub"
   async (step) => {
     try {
-      await this.actionService.logInfo(step, PUSH_TO_GIT_STEP_START_LOG); // "Pull request creation job added to queue..."
-      
-      const createPullRequestMessage: CreatePrRequest.Value = {
-        ...gitSettings,
-        resourceId: resource.id,
-        resourceName: kebabCase(resource.name),
-        newBuildId: build.id,
-        oldBuildId: oldBuild?.id,
-        gitResourceMeta: {
-          adminUIPath: serviceSettings?.adminUISettings?.adminUIPath,
-          serverPath: serviceSettings?.serverSettings?.serverPath,
-        },
-        isBranchPerResource: branchPerResourceEntitlement?.hasAccess ?? false,
-        overrideCustomizableFilesInGit: projectConfigurationSettings.overrideCustomizableFilesInGit ?? false,
-      };
+      await this.actionService.logInfo(step, PUSH_TO_GIT_STEP_START_LOG);
+      // ... 组装 createPullRequestMessage
 
       const createPullRequestEvent: CreatePrRequest.KafkaEvent = {
-        key: {
-          resourceRepositoryId: kafkaEventKey,
-          resourceId: createPullRequestMessage.isBranchPerResource ? resource.id : null,
-        },
+        key: { resourceRepositoryId: kafkaEventKey, resourceId: ... },
         value: createPullRequestMessage,
       };
       await this.kafkaProducerService.emitMessage(
@@ -476,34 +472,69 @@ return this.actionService.run(
         createPullRequestEvent
       );
     } catch (error) {
+      // ⚠️ 关键代码行为核准：内部 catch，只打日志，不向外抛出异常
       logger.error("Failed to emit Create Pull Request Message.", error);
     }
   },
-  true  // leaveStepOpenAfterSuccessfulExecution = true，异步等待 PR 结果回调
+  true  // leaveStepOpenAfterSuccessfulExecution = true
 );
 ```
 
-**关键分支**：如果资源没有配置 Git 仓库，则直接标记 Build 完成（无需 Git 推送）：
+### 5.3 代码核准：CREATE_PR_REQUEST 发送失败后 Step 是否挂起？
+
+**结论：Step 会永久挂起（保持 Running）**
+
+推演 `actionService.run()` 的执行路径 [action.service.ts#L275-L295](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/action.service.ts#L275-L295)：
 
 ```typescript
-// build.service.ts#L1227-L1234
-if (!resourceRepository) {
-  await this.updateBuildStatuses(
-    build.id,
-    EnumBuildStatus.Completed,
-    EnumBuildGitStatus.NotConnected
-  );
-  return;  // 不创建 PUSH_TO_GIT Step，直接返回
+// action.service.ts#L275-L295
+async run<T>(
+  actionId: string, stepName: string, message: string,
+  stepFunction: (step: ActionStep) => Promise<T>,
+  leaveStepOpenAfterSuccessfulExecution = false
+): Promise<T> {
+  const step = await this.createStep(actionId, stepName, message);  // ① Step.status = Running
+  try {
+    const result = await stepFunction(step);   // ② 执行用户回调
+    if (!leaveStepOpenAfterSuccessfulExecution) {
+      await this.complete(step, EnumActionStepStatus.Success);  // ③ leaveStepOpen=true → 不执行
+    }
+    return result;
+  } catch (error) {
+    // ④ 用户回调内部已吞掉异常，不会走到这里
+    await this.log(step, EnumActionLogLevel.Error, error.message);
+    await this.complete(step, EnumActionStepStatus.Failed);
+    throw error;
+  }
 }
 ```
 
-此时状态：
-- `ActionStep[GENERATE_APPLICATION]` 尚未完成（等待 onCodeGenerationSuccess()）
-- `ActionStep[PUSH_TO_GIT_PROVIDER].status = Running`（如果配置了 Git）
-- `Build.status = Running`
-- `Build.gitStatus = Waiting`
+**CREATE_PR_REQUEST 发送失败后的完整执行链**：
 
-### 5.2 Git 推送成功回调：状态入库
+| 步骤 | 实际行为 | 结果 |
+|------|---------|------|
+| ① | `createStep()` 创建 Step | `Step.status = Running` |
+| ② | `stepFunction()` 执行，内部 `emitMessage()` 抛异常，被内部 try-catch 捕获，只打日志，**不向外 throw** | stepFunction **正常返回**（无异常） |
+| ③ | `leaveStepOpen = true`，跳过 `complete(Success)` | Step 未被标记 Success |
+| ④ | 外层 try-catch**未触发**（stepFunction 没抛异常） | Step 未被标记 Failed |
+| — | **最终结果** | `Step.status = Running`，永久挂起，Build.status 也保持 Running，直到 5 小时 stale 兜底 |
+
+**补救机制**：只有当 `calcBuildStatus()` 被调用，且 `isBuildStale()` 判断创建时间超过 5 小时时，才会兜底标记为 Failed：
+
+```typescript
+// build.service.ts#L1547-L1561
+isBuildStale(build: Build): boolean {
+  if (build.status === EnumBuildStatus.Running) {
+    const stalePeriod = STALE_BUILD_HOURS * 60 * 60 * 1000;  // 5 小时
+    if (Date.now() - build.createdAt.getTime() > stalePeriod) {
+      return true;
+    }
+  }
+  return false;
+}
+```
+
+### 5.4 Git 推送成功回调：状态入库
 
 Kafka 消费在 [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.controller.ts#L117-L127)：
 
@@ -530,7 +561,7 @@ public async onCreatePRSuccess(response: CreatePrSuccess.Value): Promise<void> {
   const step = steps.find((step) => step.name === PUSH_TO_GIT_STEP_NAME);
 
   try {
-    // 1. 资源同步状态通知
+    // 1. 资源同步状态通知（Success）
     await this.resourceService.reportSyncMessage(build.resourceId, "Sync Completed Successfully");
 
     // 2. 更新代码行统计（新增/删除行数、变更文件数）
@@ -554,16 +585,15 @@ public async onCreatePRSuccess(response: CreatePrSuccess.Value): Promise<void> {
     // 6. Layer 3: 更新 Build 最终状态
     await this.updateBuildStatuses(
       build.id,
-      EnumBuildStatus.Completed,       // Build 完成
-      EnumBuildGitStatus.Completed      // Git 推送完成
+      EnumBuildStatus.Completed,       // Build.status = Completed
+      EnumBuildGitStatus.Completed      // Build.gitStatus = Completed
     );
 
-    // 7. 计费上报：Git 推送次数
-    const workspace = await this.resourceService.getResourceWorkspace(build.resourceId);
+    // 7. 计费上报：CodePushToGit 次数
     await this.billingService.reportUsage(workspace.id, BillingFeature.CodePushToGit);
 
   } catch (error) {
-    // 异常分支：即使 PR 业务成功，本地处理也可能失败
+    // ⚠️ Git 业务操作成功，但本地处理（LOC统计/计费）异常 → 整体标记失败
     await this.actionService.logInfo(step, PUSH_TO_GIT_STEP_FAILED_LOG(response.gitProvider));
     await this.actionService.logInfo(step, error);
     await this.actionService.complete(step, EnumActionStepStatus.Failed);
@@ -576,11 +606,10 @@ public async onCreatePRSuccess(response: CreatePrSuccess.Value): Promise<void> {
 成功回调后最终状态：
 - `Build.status = Completed`
 - `Build.gitStatus = Completed`
-- `Build.linesOfCodeAdded/Deleted/filesChanged` 已更新
 - `ActionStep[PUSH_TO_GIT_PROVIDER].status = Success`
-- `ActionStep[GENERATE_APPLICATION]` 已由 `onCodeGenerationSuccess()` 标记 Success
+- `ActionStep[GENERATE_APPLICATION].status = Success`（由 onCodeGenerationSuccess() 标记）
 
-### 5.3 Git 推送失败回调：状态入库
+### 5.5 Git 推送失败回调：状态入库
 
 ```typescript
 // build.controller.ts#L129-L139
@@ -600,15 +629,11 @@ async onPullRequestFailure(@Payload() message: CreatePrFailure.Value): Promise<v
 ```typescript
 // build.service.ts#L917-L968
 public async onCreatePRFailure(response: CreatePrFailure.Value): Promise<void> {
-  const build = await this.prisma.build.findUnique({
-    where: { id: response.buildId },
-    include: { createdBy: { include: { account: true } }, resource: { include: { project: true } } },
-  });
-
+  const build = await this.prisma.build.findUnique({ where: { id: response.buildId }, include: {...} });
   const steps = await this.actionService.getSteps(build.actionId);
   const step = steps.find((step) => step.name === PUSH_TO_GIT_STEP_NAME);
 
-  // 1. 资源同步状态通知（错误）
+  // 1. 资源同步状态通知（Error）
   await this.resourceService.reportSyncMessage(build.resourceId, `Error: ${response.errorMessage}`);
 
   // 2. 写入失败日志
@@ -618,21 +643,15 @@ public async onCreatePRFailure(response: CreatePrFailure.Value): Promise<void> {
   // 3. Layer 2: 标记 PUSH_TO_GIT Step = Failed
   await this.actionService.complete(step, EnumActionStepStatus.Failed);
 
-  // 4. Layer 3: 标记 Build + Git 双失败
+  // 4. Layer 3: 双失败
   await this.updateBuildStatuses(
     build.id,
     EnumBuildStatus.Failed,
     EnumBuildGitStatus.Failed
   );
 
-  // 5. Segment 错误埋点
-  await this.analytics.trackManual({
-    user: { accountId: build.createdBy.account.id, workspaceId: build.resource.project.workspaceId },
-    data: {
-      properties: { resourceId: build.resource.id, projectId: build.resource.project.id, message: response.errorMessage },
-      event: EnumEventType.GitSyncError,
-    },
-  });
+  // 5. Segment 埋点：GitSyncError
+  await this.analytics.trackManual({...});
 }
 ```
 
@@ -641,9 +660,9 @@ public async onCreatePRFailure(response: CreatePrFailure.Value): Promise<void> {
 - `Build.gitStatus = Failed`
 - `ActionStep[PUSH_TO_GIT_PROVIDER].status = Failed`
 
-### 5.4 代码生成 Step 完成（与 Git 并行）
+### 5.6 代码生成 Step 完成（与 Git 并行）
 
-在 `saveToGitProvider()` 创建 Git Step 的同时，`onCodeGenerationSuccess()` 完成代码生成 Step：
+`onCodeGenerationSuccess()` 在 `saveToGitProvider()` 返回后执行，仅完成 GENERATE_APPLICATION Step：
 
 ```typescript
 // build.service.ts#L450-L495
@@ -651,31 +670,22 @@ async onCodeGenerationSuccess(buildId: string): Promise<void> {
   const step = await this.getBuildStep(buildId, GENERATE_STEP_NAME);
   
   // 发送 USER_BUILD_TOPIC 通知用户侧
-  this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_BUILD_TOPIC, <UserBuild.KafkaEvent>{
-    key: {},
-    value: {
-      commitId: commitWithAccount.commit.id,
-      resourceId: commitWithAccount.resourceId,
-      buildId: buildId,
-      workspaceId: commitWithAccount.commit.project.workspaceId,
-      // ...
-    },
-  }).catch(error => this.logger.error(`Failed to queue user build ${buildId}`, error));
+  this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_BUILD_TOPIC, <UserBuild.KafkaEvent>{...});
 
   // Layer 2: 标记 GENERATE_APPLICATION Step = Success
   await this.actionService.complete(step, EnumActionStepStatus.Success);
+  
+  // ⚠️ 关键核准：此处**不修改 Build.status**！Build 最终状态由 Git 回调（或 NotConnected 分支）决定
 }
 ```
 
-> **注意**：此处仅完成 `GENERATE_APPLICATION` Step，**不修改 Build.status**。Build 的最终状态（Completed/Failed）由 Git 推送回调（或无 Git 场景下的 NotConnected 分支）决定。
-
 ---
 
-## 六、最终构建状态入库总览
+## 六、最终构建状态入库与状态矩阵（代码核准版）
 
 ### 6.1 updateBuildStatuses() 统一入口
 
-所有 Build 状态修改都通过 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L497-L509) 的统一方法：
+所有 Build 状态修改都通过 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L497-L509)：
 
 ```typescript
 // build.service.ts#L497-L509
@@ -691,26 +701,65 @@ async updateBuildStatuses(
 }
 ```
 
-### 6.2 状态矩阵：所有场景的最终状态
+### 6.2 状态矩阵：全部 11 个调用点核准
 
-| 场景 | Build.status | Build.gitStatus | 触发点 |
-|------|-------------|-----------------|--------|
-| Build 创建 | Running | Waiting | create() |
-| 代码生成失败 | Failed | Canceled | onCodeGenerationFailure() |
-| 代码生成成功 + 无 Git 仓库 | Completed | NotConnected | saveToGitProvider() 内分支 |
-| Git 推送成功 | Completed | Completed | onCreatePRSuccess() |
-| Git 推送失败 | Failed | Failed | onCreatePRFailure() / onCreatePRSuccess() catch |
-| 私钥插件下载失败 | Failed | Canceled | onDownloadPrivatePluginFailure() |
-| Git 推送过程中 saveToGitProvider() 本地异常 | 见 catch 分支 | 见 catch 分支 | onCreatePRSuccess() catch |
+基于代码中所有 `updateBuildStatuses()` 调用点的完整审计：
 
-### 6.3 Step 状态汇总
+| # | 场景 | Build.status | Build.gitStatus | PUSH_TO_GIT Step | 代码来源 |
+|---|------|-------------|-----------------|------------------|---------|
+| 1 | Build 创建初始化 | `Running` | `Waiting` | 未创建 | [L291](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L291) |
+| 2 | 代码生成失败 | `Failed` | `Canceled` | 未创建 | [L529](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L529) |
+| 3 | Git 推送成功回调 | `Completed` | `Completed` | `Success` | [L885](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L885) |
+| 4 | Git 推送成功但本地处理异常 | `Failed` | `Failed` | `Failed` | [L905](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L905) |
+| 5 | Git 推送失败回调 | `Failed` | `Failed` | `Failed` | [L948](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L948) |
+| 6 | 插件下载失败 | `Failed` | `Canceled` | 未创建 | [L1076](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1076) |
+| 7 | 代码生成成功但未配置 Git | `Completed` | `NotConnected` | 未创建 | [L1228](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1228) |
+| 8 | CREATE_PR_REQUEST Kafka 发送失败（内部吞异常） | **保持 `Running`** | **保持 `Waiting`** | **保持 `Running`（挂起）** | 无显式调用，见 §5.3 |
+| 9 | Build stale（Running 超过 5h）兜底 | `Failed` | `Failed` | 未修改 | [L1573](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1573) |
+| 10 | calcBuildStatus() 兜底：所有 Step Success | `Completed` | `Completed` | 未直接修改 | [L1595](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1595) |
+| 11 | calcBuildStatus() 兜底：任一 Step Failed | `Failed` | `Failed` | 未直接修改 | [L1603](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1603) |
 
-| Step Name | 创建时机 | 完成时机 | 状态 |
-|-----------|---------|---------|------|
+### 6.3 按阶段归类的状态流转
+
+```
+Build 创建
+  ├── status=Running, gitStatus=Waiting (#1)
+  │
+  ├─[有私钥插件]→ 下载插件
+  │     ├── 成功 → generate()
+  │     └── 失败 → status=Failed, gitStatus=Canceled (#6)
+  │
+  └─[无私钥插件]→ generate()
+        │
+        ├── DSG 执行失败 → status=Failed, gitStatus=Canceled (#2)
+        │
+        └── DSG 执行成功 → saveToGitProvider()
+              │
+              ├─[未配置 Git]→ status=Completed, gitStatus=NotConnected (#7)
+              │
+              └─[已配置 Git]→ 创建 PUSH_TO_GIT Step=Running
+                    │
+                    ├── CREATE_PR_REQUEST Kafka 发送失败（吞异常）
+                    │     → Step 保持 Running（挂起）
+                    │     → status 保持 Running, gitStatus 保持 Waiting (#8)
+                    │     → 5h 后 stale 兜底: status=Failed, gitStatus=Failed (#9)
+                    │
+                    ├── Git 推送成功回调
+                    │     ├── 本地处理成功 → status=Completed, gitStatus=Completed (#3)
+                    │     └── 本地处理异常 → status=Failed, gitStatus=Failed (#4)
+                    │
+                    └── Git 推送失败回调
+                          → status=Failed, gitStatus=Failed (#5)
+```
+
+### 6.4 Step 状态汇总
+
+| Step Name | 创建时机 | 完成时机 | 可能状态 |
+|-----------|---------|---------|---------|
 | ADD_TO_QUEUE | Build.create() | 创建即完成 | Success |
-| DOWNLOAD_PRIVATE_PLUGINS | 有私钥插件时 | 下载成功/失败 Kafka 回调 | Success / Failed |
-| GENERATE_APPLICATION | generate() | CODE_GENERATION_SUCCESS/FAILURE Kafka 回调 | Success / Failed |
-| PUSH_TO_GIT_PROVIDER | 代码生成成功且有 Git 配置时 | CREATE_PR_SUCCESS/FAILURE Kafka 回调 | Success / Failed |
+| DOWNLOAD_PRIVATE_PLUGINS | 有私钥插件时 | 插件下载成功/失败 Kafka 回调 | Success / Failed |
+| GENERATE_APPLICATION | generate() | CODE_GENERATION_SUCCESS / FAILURE Kafka 回调 | Success / Failed / Running（挂起场景 #8） |
+| PUSH_TO_GIT_PROVIDER | saveToGitProvider()（有 Git 配置时） | CREATE_PR_SUCCESS / FAILURE Kafka 回调 | Success / Failed / Running（挂起场景 #8） |
 
 ---
 
@@ -718,11 +767,11 @@ async updateBuildStatuses(
 
 ### 7.1 去重问题背景
 
-一个 Build 可能被拆分为 2 个子 Job（Server + AdminUI），两个 Job 并发执行。如果两个 Job 都失败，会触发两次失败回调。如果没有去重保护：
-- `CODE_GENERATION_FAILURE_TOPIC` 会被发送两次
-- Server 端 `onCodeGenerationFailure()` 会执行两次
-- ActionLog 会重复写入错误日志
-- 下游监听器（通知、计费等）会被触发两次
+一个 Build 可能被拆分为 2 个子 Job（Server + AdminUI），两个 Job 并发执行。如果两个 Job 都失败，会触发两次失败回调。没有去重保护则：
+- `CODE_GENERATION_FAILURE_TOPIC` 被发送两次
+- Server 端 `onCodeGenerationFailure()` 执行两次
+- ActionLog 重复写入错误日志
+- 下游监听器（通知、计费等）触发两次
 
 ### 7.2 去重核心机制：otherJobsHaveNotFailed 标志
 
@@ -733,20 +782,19 @@ async updateBuildStatuses(
 ```typescript
 // build-runner.service.ts#L257-L277
 async emitCodeGenerationFailureWhenJobStatusFailed(jobBuildId: string) {
-  let otherJobsHaveNotFailed = true;          // 默认假设其他 Job 还没失败
+  let otherJobsHaveNotFailed = true;
   const buildId = this.buildJobsHandlerService.extractBuildId(jobBuildId);
   try {
-    // 关键：在标记当前 Job 为 Failure 之前，先读取 Redis 中的聚合状态
+    // ① 在标记当前 Job 之前，先读 Redis 聚合状态
     const currentBuildStatus = await this.buildJobsHandlerService.getBuildStatus(buildId);
-    // 只要已经有任一 Job = Failure，聚合状态就是 Failure，说明已有人先失败了
     otherJobsHaveNotFailed = currentBuildStatus !== EnumJobStatus.Failure;
 
-    // 再标记当前 Job 为 Failure
+    // ② 再标记当前 Job = Failure
     await this.buildJobsHandlerService.setJobStatus(jobBuildId, EnumJobStatus.Failure);
   } catch (error) {
     this.logger.error(error.message, error);
   } finally {
-    // 只有"我是第一个失败者"才发送失败事件
+    // ③ 只有第一个失败者才发送事件
     if (otherJobsHaveNotFailed) {
       await this.emitCodeGenerationFailure(buildId);
     }
@@ -763,17 +811,17 @@ async handleDsgJobCompleted(resourceId: string, jobBuildId: string) {
   let otherJobsHaveNotFailed = true;
 
   try {
-    // 同样：先读，后写，判断是否已有人失败
+    // ① 先读聚合状态
     const currentBuildStatus = await this.buildJobsHandlerService.getBuildStatus(buildId);
     otherJobsHaveNotFailed = currentBuildStatus !== EnumJobStatus.Failure;
 
-    await this.copyFromJobToArtifact(resourceId, jobBuildId);  // 这里可能抛异常
+    await this.copyFromJobToArtifact(resourceId, jobBuildId);  // 可能抛异常
 
     await this.buildJobsHandlerService.setJobStatus(jobBuildId, EnumJobStatus.Success);
     // ...
   } catch (error) {
     this.logger.error(error.message, error);
-    if (otherJobsHaveNotFailed) {  // 只有第一个失败的才发事件
+    if (otherJobsHaveNotFailed) {  // ② 只有第一个失败的才发事件
       await this.emitCodeGenerationFailure(buildId, error.message);
     }
   }
@@ -785,48 +833,48 @@ async handleDsgJobCompleted(resourceId: string, jobBuildId: string) {
 以 Server Job 先失败、AdminUI Job 后失败为例：
 
 ```
-时间轴 ──────────────────────────────────────────────────────────────>
-
 T0: Redis = { "build-123-server": "in-progress", "build-123-admin-ui": "in-progress" }
-    getBuildStatus() = InProgress
+    getBuildStatus() → InProgress
 
 T1: [Server Job] 失败回调
     ① getBuildStatus() → InProgress → otherJobsHaveNotFailed = true
     ② setJobStatus("build-123-server", Failure)
-    Redis = { "build-123-server": "failure", "build-123-admin-ui": "in-progress" }
+       Redis = { "build-123-server": "failure", "build-123-admin-ui": "in-progress" }
     ③ otherJobsHaveNotFailed = true → emit CODE_GENERATION_FAILURE_TOPIC ✓
 
 T2: [AdminUI Job] 失败回调
     ① getBuildStatus() → Failure → otherJobsHaveNotFailed = false
     ② setJobStatus("build-123-admin-ui", Failure)
-    Redis = { "build-123-server": "failure", "build-123-admin-ui": "failure" }
+       Redis = { "build-123-server": "failure", "build-123-admin-ui": "failure" }
     ③ otherJobsHaveNotFailed = false → 跳过 emit ✗ （去重成功）
 ```
 
-### 7.4 去重边界情况分析
+### 7.4 去重边界情况
 
 | 场景 | 去重效果 | 原因 |
 |------|---------|------|
 | Server 失败 → AdminUI 失败 | ✅ 仅 1 次事件 | Server 先标记，AdminUI 读取时已是 Failure |
-| AdminUI 失败 → Server 失败 | ✅ 仅 1 次事件 | 同上，顺序无关 |
-| 两个 Job 同时失败（极端并发） | ⚠️ 理论可能双发 | 两者都先读到 InProgress，然后都认为自己是第一个 |
-| runBuild() 同步异常（作业提交前） | ✅ 仅 1 次事件 | 此时尚未拆分 Job，无并发问题 |
-| Package Manager 失败 | N/A（无去重） | 单阶段，不存在多 Job 并发 |
-| Git 推送失败 | N/A（无去重） | 单阶段，Server 端直接处理 |
+| AdminUI 失败 → Server 失败 | ✅ 仅 1 次事件 | 顺序无关，谁先读谁先发 |
+| 两个 Job 同时失败（极端并发） | ⚠️ 理论可能双发 | Redis get+set 非原子，两者都可能先读到 InProgress |
+| runBuild() 同步异常（作业提交前） | N/A | 单线程，尚未拆分 Job |
+| Package Manager 失败 | N/A | 单阶段，无需去重 |
+| Git 推送失败 | N/A | 单阶段，无需去重 |
+| CREATE_PR_REQUEST 发送失败 | N/A | 单阶段，且异常被吞（Step 挂起） |
 
-> **并发风险**：Redis 的 `get` + `set` 不是原子操作。在极高并发下，两个 Job 可能都在对方 `setJobStatus()` 之前完成 `getBuildStatus()`，导致都认为自己是第一个失败者。生产环境中由于 DSG 作业执行时间较长（分钟级），这种竞态概率极低。如需严格保证，可改用 Redis Lua 脚本或 `SETNX` 实现分布式锁。
+> **并发风险**：Redis 的 `get` + `set` 非原子操作。极高并发下两个 Job 可能都在对方 `setJobStatus()` 前完成 `getBuildStatus()`，导致都认为自己是第一个失败者。由于 DSG 作业执行时间为分钟级，这种竞态概率极低。如需严格保证，可改用 Redis Lua 脚本或 `SETNX` 分布式锁。
 
 ### 7.5 去重保护范围汇总
 
 ```
-阶段                      是否有去重保护
-──────────────────────────────────────────
-runBuild() 同步异常            ❌（无需，单线程）
-DSG 执行失败回调                ✅（otherJobsHaveNotFailed）
-产物复制阶段异常                ✅（otherJobsHaveNotFailed）
-Package Manager 失败            ❌（单阶段，无需）
-Git 推送失败                    ❌（单阶段，无需）
-onCodeGenerationFailure() 服务端  ❌（依赖上游去重）
+阶段                          是否有去重保护
+───────────────────────────────────────────────
+runBuild() 同步异常              ❌（无需，单线程）
+DSG 执行失败回调                  ✅（otherJobsHaveNotFailed）
+产物复制阶段异常                  ✅（otherJobsHaveNotFailed）
+Package Manager 失败              ❌（单阶段，无需）
+Git 推送回调失败                  ❌（单阶段，无需）
+CREATE_PR_REQUEST 发送失败        ❌（异常被吞，Step 挂起）
+onCodeGenerationFailure() 服务端   ❌（依赖上游去重）
 ```
 
 ---
@@ -867,42 +915,58 @@ onCodeGenerationFailure() 服务端  ❌（依赖上游去重）
      │              │              │ aggregate: all Success?    │               │
      │              │              │ has packages? → emit PACKAGE_MANAGER_CREATE_REQUEST──>│
      │              │              │              │             │               │
-     │              │              │<──consume PACKAGE_MANAGER_CREATE_SUCCESS───│（或无包跳过）
+     │              │              │<──consume PM_CREATE_SUCCESS─────────────────│（或无包跳过）
      │              │              │ emit CODE_GENERATION_SUCCESS ─────────────>│
      │              │<─consume─────│              │             │               │
      │              │ saveToGitProvider()         │             │               │
-     │              │ Step: PUSH_TO_GIT=Running (if has Git)   │               │
-     │              │ emit CREATE_PR_REQUEST ─────────────────────────────────>│
+     │              │  ├─ 无 Git → status=Completed, gitStatus=NotConnected    │
+     │              │  └─ 有 Git → 创建 PUSH_TO_GIT Step=Running                │
+     │              │     emit CREATE_PR_REQUEST ──────────────────────────────>│
+     │              │        ├─ 发送失败（内部吞异常）→ Step 保持 Running（挂起）│
+     │              │        └─ 发送成功 → 等待回调             │               │
+     │              │ onCodeGenerationSuccess()   │             │               │
      │              │ Step: GENERATE_APPLICATION=Success       │               │
      │              │ emit USER_BUILD_TOPIC ────>│             │               │
      │              │              │              │             │ 创建 PR/Push   │
+     │              │              │              │             │               │
      │              │<─consume CREATE_PR_SUCCESS ───────────────────────────────│
-     │              │ DB: update LOC stats        │             │               │
-     │              │ Step: PUSH_TO_GIT=Success   │             │               │
-     │              │ DB: Build.status=Completed  │             │               │
-     │              │ DB: Build.gitStatus=Completed            │               │
-     │              │ report billing: CodePushToGit            │               │
+     │              │  ├─ 本地成功 → status=Completed, gitStatus=Completed      │
+     │              │  └─ 本地异常 → status=Failed, gitStatus=Failed            │
+     │              │ 或                          │             │               │
+     │              │<─consume CREATE_PR_FAILURE ───────────────────────────────│
+     │              │     → status=Failed, gitStatus=Failed                    │
      │  Notify Done │              │              │             │               │
      │<─────────────│              │              │             │               │
 ```
 
 ---
 
-## 九、关键设计要点
+## 九、关键设计要点（代码核准版）
 
 ### 9.1 三层状态隔离设计
-- **Layer 1 Redis**：细粒度子 Job 状态，支持快速聚合判断，无需查库
-- **Layer 2 ActionStep**：面向用户的步骤进度，每个 Step 有独立生命周期和日志
-- **Layer 3 Build**：最终持久化状态，对外 API 展示和后续流程依赖
+- **Layer 1 Redis**：细粒度子 Job 状态，毫秒级聚合判断，无需查库
+- **Layer 2 ActionStep**：面向用户的步骤进度，每个 Step 独立生命周期和日志
+- **Layer 3 Build**：双轴最终状态，对外 API 展示
 
 ### 9.2 异步 Step 的 leaveStepOpen 模式
-`actionService.run()` 的第 5 个参数 `leaveStepOpenAfterSuccessfulExecution=true` 使 Step 在同步回调完成后仍保持 Running，等待未来的 Kafka 事件最终完成。这是长时间异步任务的标准处理模式。
+`actionService.run()` 的 `leaveStepOpenAfterSuccessfulExecution=true` 参数使 Step 在同步回调返回后仍保持 Running，等待未来的 Kafka 事件最终完成。这是长时间异步任务的标准处理模式。
 
-### 9.3 日志的 domain 前缀区分
-Build Manager 的 `addCodeGenerationLog()` 对拆分作业的日志自动添加 `[server]`/`[admin-ui]` 前缀，用户在 UI 上可清晰区分日志来源。
+### 9.3 Step 挂起风险（代码实际行为）
+**CREATE_PR_REQUEST 发送失败会导致 PUSH_TO_GIT Step 永久挂起**。原因：异常被 `saveToGitProvider()` 内部 try-catch 吞噬，stepFunction 正常返回，配合 `leaveStepOpen=true`，`actionService.run()` 既不会标记 Success 也不会标记 Failed。唯一补救是 5 小时后的 stale 兜底。这是一个潜在的设计缺陷。
 
-### 9.4 失败去重的"先读后写"模式
-通过在修改状态前先读取聚合状态，用局部变量 `otherJobsHaveNotFailed` 作为是否发送事件的依据，避免了多 Job 并发失败时的重复通知。虽非严格原子（依赖 Redis 非事务操作），但在 DSG 分钟级执行时间下实际足够可靠。
+### 9.4 Build.status 与 gitStatus 的双轴设计
+- `Build.status` 是**整体构建结果**，由代码生成 + Git 推送联合决定
+- `Build.gitStatus` 是**Git 环节专属子状态**，与代码生成解耦
+- 代码生成失败 → `gitStatus=Canceled`（Git 未执行）
+- 代码生成成功但未配 Git → `gitStatus=NotConnected`（无需执行）
+- Git 推送成功 → `status=Completed, gitStatus=Completed`
+- Git 推送失败 → `status=Failed, gitStatus=Failed`（即使代码生成成功，整体也标记失败）
 
-### 9.5 Build 最终状态的"双轴"设计
-`Build.status`（代码生成结果）和 `Build.gitStatus`（Git 推送结果）独立维护，支持部分成功场景：例如代码生成成功但 Git 推送失败，用户可以下载代码产物但无法同步到 Git。
+### 9.5 日志的 domain 前缀区分
+Build Manager 的 `addCodeGenerationLog()` 对拆分作业日志自动添加 `[server]`/`[admin-ui]` 前缀，用户在 UI 上可清晰区分日志来源。
+
+### 9.6 失败去重的"先读后写"模式
+通过在修改状态前先读取聚合状态，用局部变量 `otherJobsHaveNotFailed` 判断是否发送事件，避免多 Job 并发失败时的重复通知。虽非严格原子（Redis get+set 非事务），但 DSG 分钟级执行时间下实际足够可靠。
+
+### 9.7 Stale 兜底机制
+`calcBuildStatus()` 提供兜底：超过 5 小时仍 Running 的 Build 会被强制标记 Failed，避免异常情况下（如 #8 挂起场景）永远处于 Running 状态。
