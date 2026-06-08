@@ -480,9 +480,15 @@ return this.actionService.run(
 );
 ```
 
-### 5.3 代码核准：CREATE_PR_REQUEST 发送失败后 Step 是否挂起？
+### 5.3 代码核准：CREATE_PR_REQUEST 发送失败后的完整状态链路
 
-**结论：Step 会永久挂起（保持 Running）**
+**核心结论**：CREATE_PR_REQUEST 发送失败后，**两个 Step 的状态不同**：
+- `GENERATE_APPLICATION` → **正常完成（Success）**
+- `PUSH_TO_GIT_PROVIDER` → **永久挂起（Running）**
+
+原因是：`saveToGitProvider()` 内部吞掉异常后**正常返回**，`build.controller.ts` 继续执行后续的 `onCodeGenerationSuccess()`。
+
+#### 5.3.1 PUSH_TO_GIT_PROVIDER Step 挂起推演
 
 推演 `actionService.run()` 的执行路径 [action.service.ts#L275-L295](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/action.service.ts#L275-L295)：
 
@@ -499,9 +505,9 @@ async run<T>(
     if (!leaveStepOpenAfterSuccessfulExecution) {
       await this.complete(step, EnumActionStepStatus.Success);  // ③ leaveStepOpen=true → 不执行
     }
-    return result;
+    return result;   // ④ stepFunction 正常返回 → run() 正常返回，不抛异常
   } catch (error) {
-    // ④ 用户回调内部已吞掉异常，不会走到这里
+    // ⑤ 用户回调内部已吞掉异常，不会走到这里
     await this.log(step, EnumActionLogLevel.Error, error.message);
     await this.complete(step, EnumActionStepStatus.Failed);
     throw error;
@@ -509,17 +515,57 @@ async run<T>(
 }
 ```
 
-**CREATE_PR_REQUEST 发送失败后的完整执行链**：
+**PUSH_TO_GIT_PROVIDER Step 挂起链路**：
 
 | 步骤 | 实际行为 | 结果 |
 |------|---------|------|
-| ① | `createStep()` 创建 Step | `Step.status = Running` |
-| ② | `stepFunction()` 执行，内部 `emitMessage()` 抛异常，被内部 try-catch 捕获，只打日志，**不向外 throw** | stepFunction **正常返回**（无异常） |
+| ① | `createStep()` 创建 PUSH_TO_GIT Step | `Step.status = Running` |
+| ② | `stepFunction()` 执行，内部 `emitMessage()` 抛异常，被内部 try-catch 捕获，只打日志，**不向外 throw** | stepFunction **正常返回 undefined**（无异常） |
 | ③ | `leaveStepOpen = true`，跳过 `complete(Success)` | Step 未被标记 Success |
-| ④ | 外层 try-catch**未触发**（stepFunction 没抛异常） | Step 未被标记 Failed |
-| — | **最终结果** | `Step.status = Running`，永久挂起，Build.status 也保持 Running，直到 5 小时 stale 兜底 |
+| ④ | `run()` 正常返回（无异常）→ `saveToGitProvider()` **正常返回** | Step 未被标记 Failed |
+| — | **PUSH_TO_GIT Step 最终** | `Running`（永久挂起） |
 
-**补救机制**：只有当 `calcBuildStatus()` 被调用，且 `isBuildStale()` 判断创建时间超过 5 小时时，才会兜底标记为 Failed：
+#### 5.3.2 GENERATE_APPLICATION Step 仍会正常完成
+
+关键代码在 [build.controller.ts#L87-L101](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.controller.ts#L87-L101)：
+
+```typescript
+// build.controller.ts#L87-L101
+@EventPattern(KAFKA_TOPICS.CODE_GENERATION_SUCCESS_TOPIC)
+async onCodeGenerationSuccess(@Payload() message: CodeGenerationSuccess.Value): Promise<void> {
+  const args = plainToInstance(CodeGenerationSuccess.Value, message);
+  try {
+    await this.buildService.saveToGitProvider(args.buildId);      // ① 先 Git 推送（内部吞异常后正常返回）
+    await this.buildService.onCodeGenerationSuccess(args.buildId);  // ② 再完成 GENERATE Step（① 正常返回，所以② 一定会执行）
+  } catch (error) {
+    // saveToGitProvider 内部异常已被吞，不会向外抛 → 外层 catch 不会触发
+    this.logger.error("Failed to Complete Code Generation Step ", error, {...});
+  }
+}
+```
+
+**GENERATE_APPLICATION Step 完成链路**：
+
+| 步骤 | 实际行为 | 结果 |
+|------|---------|------|
+| ① | `saveToGitProvider()` 执行，内部 CREATE_PR_REQUEST 发送失败被吞 → 正常返回 | 无异常抛出 |
+| ② | `onCodeGenerationSuccess()` 被调用 → `actionService.complete(step, Success)` | `GENERATE_APPLICATION` Step = **Success** |
+| ③ | 同时发送 `USER_BUILD_TOPIC` 通知用户侧 | 用户侧收到构建完成通知 |
+| — | **GENERATE_APPLICATION Step 最终** | `Success`（正常完成） |
+
+#### 5.3.3 CREATE_PR_REQUEST 发送失败后的最终状态全景
+
+| 对象 | 最终状态 | 归类 |
+|------|---------|------|
+| ActionStep[GENERATE_APPLICATION] | **Success** | ✅ 正常完成 |
+| ActionStep[PUSH_TO_GIT_PROVIDER] | **Running** | ⚠️ 挂起（永久） |
+| Build.status | **Running** | 未决（因 PUSH_TO_GIT 仍 Running） |
+| Build.gitStatus | **Waiting** | 未决（Git 请求未成功发出） |
+| 用户侧通知 | 已发送 USER_BUILD_TOPIC | 可能误导用户以为构建成功 |
+
+#### 5.3.4 补救机制：Stale 兜底
+
+只有当 `calcBuildStatus()` 被调用，且 `isBuildStale()` 判断创建时间超过 5 小时时，才会兜底标记为 Failed：
 
 ```typescript
 // build.service.ts#L1547-L1561
@@ -533,6 +579,11 @@ isBuildStale(build: Build): boolean {
   return false;
 }
 ```
+
+Stale 兜底后状态：
+- `Build.status = Failed`
+- `Build.gitStatus = Failed`
+- **但两个 ActionStep 状态不变**：GENERATE_APPLICATION 仍为 Success，PUSH_TO_GIT_PROVIDER 仍为 Running
 
 ### 5.4 Git 推送成功回调：状态入库
 
@@ -705,25 +756,28 @@ async updateBuildStatuses(
 
 基于代码中所有 `updateBuildStatuses()` 调用点的完整审计：
 
-| # | 场景 | Build.status | Build.gitStatus | PUSH_TO_GIT Step | 代码来源 |
-|---|------|-------------|-----------------|------------------|---------|
-| 1 | Build 创建初始化 | `Running` | `Waiting` | 未创建 | [L291](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L291) |
-| 2 | 代码生成失败 | `Failed` | `Canceled` | 未创建 | [L529](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L529) |
-| 3 | Git 推送成功回调 | `Completed` | `Completed` | `Success` | [L885](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L885) |
-| 4 | Git 推送成功但本地处理异常 | `Failed` | `Failed` | `Failed` | [L905](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L905) |
-| 5 | Git 推送失败回调 | `Failed` | `Failed` | `Failed` | [L948](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L948) |
-| 6 | 插件下载失败 | `Failed` | `Canceled` | 未创建 | [L1076](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1076) |
-| 7 | 代码生成成功但未配置 Git | `Completed` | `NotConnected` | 未创建 | [L1228](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1228) |
-| 8 | CREATE_PR_REQUEST Kafka 发送失败（内部吞异常） | **保持 `Running`** | **保持 `Waiting`** | **保持 `Running`（挂起）** | 无显式调用，见 §5.3 |
-| 9 | Build stale（Running 超过 5h）兜底 | `Failed` | `Failed` | 未修改 | [L1573](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1573) |
-| 10 | calcBuildStatus() 兜底：所有 Step Success | `Completed` | `Completed` | 未直接修改 | [L1595](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1595) |
-| 11 | calcBuildStatus() 兜底：任一 Step Failed | `Failed` | `Failed` | 未直接修改 | [L1603](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1603) |
+| # | 场景 | Build.status | Build.gitStatus | GENERATE Step | PUSH_TO_GIT Step | 代码来源 |
+|---|------|-------------|-----------------|---------------|------------------|---------|
+| 1 | Build 创建初始化 | `Running` | `Waiting` | `Running` | 未创建 | [L291](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L291) |
+| 2 | 代码生成失败 | `Failed` | `Canceled` | `Failed` | 未创建 | [L529](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L529) |
+| 3 | Git 推送成功回调 | `Completed` | `Completed` | `Success` | `Success` | [L885](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L885) |
+| 4 | Git 推送成功但本地处理异常 | `Failed` | `Failed` | `Success` | `Failed` | [L905](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L905) |
+| 5 | Git 推送失败回调 | `Failed` | `Failed` | `Success` | `Failed` | [L948](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L948) |
+| 6 | 插件下载失败 | `Failed` | `Canceled` | 未创建 | 未创建 | [L1076](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1076) |
+| 7 | 代码生成成功但未配置 Git | `Completed` | `NotConnected` | `Success` | 未创建 | [L1228](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1228) |
+| **8** | **CREATE_PR_REQUEST Kafka 发送失败（内部吞异常）** | **保持 `Running`** | **保持 `Waiting`** | **`Success`（正常完成）** | **`Running`（永久挂起）** | 见 §5.3 |
+| 9 | Build stale（Running 超过 5h）兜底 | `Failed` | `Failed` | 未修改 | 未修改 | [L1573](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1573) |
+| 10 | calcBuildStatus() 兜底：所有 Step Success | `Completed` | `Completed` | 未直接修改 | 未直接修改 | [L1595](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1595) |
+| 11 | calcBuildStatus() 兜底：任一 Step Failed | `Failed` | `Failed` | 未直接修改 | 未直接修改 | [L1603](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1603) |
+
+> **场景 #8 注解**：CREATE_PR_REQUEST 发送失败是唯一出现"GENERATE Step 已完成但 PUSH_TO_GIT Step 仍挂起"的状态不一致场景。原因是 `saveToGitProvider()` 内部吞掉异常后正常返回，`onCodeGenerationSuccess()` 继续执行并完成 GENERATE Step，而 PUSH_TO_GIT Step 因 `leaveStepOpen=true` 且异常未向外抛出而永久停留在 Running。
 
 ### 6.3 按阶段归类的状态流转
 
 ```
 Build 创建
   ├── status=Running, gitStatus=Waiting (#1)
+  │   GENERATE Step=Running
   │
   ├─[有私钥插件]→ 下载插件
   │     ├── 成功 → generate()
@@ -732,34 +786,62 @@ Build 创建
   └─[无私钥插件]→ generate()
         │
         ├── DSG 执行失败 → status=Failed, gitStatus=Canceled (#2)
+        │                  GENERATE Step=Failed
         │
-        └── DSG 执行成功 → saveToGitProvider()
+        └── DSG 执行成功（收到 CODE_GENERATION_SUCCESS_TOPIC）
+              │
+              ├── build.controller.ts 按顺序执行:
+              │     ① saveToGitProvider()
+              │     ② onCodeGenerationSuccess()
               │
               ├─[未配置 Git]→ status=Completed, gitStatus=NotConnected (#7)
+              │                PUSH_TO_GIT Step 不创建
+              │                GENERATE Step=Success（由 ② 标记）
               │
               └─[已配置 Git]→ 创建 PUSH_TO_GIT Step=Running
                     │
-                    ├── CREATE_PR_REQUEST Kafka 发送失败（吞异常）
-                    │     → Step 保持 Running（挂起）
-                    │     → status 保持 Running, gitStatus 保持 Waiting (#8)
-                    │     → 5h 后 stale 兜底: status=Failed, gitStatus=Failed (#9)
+                    ├── CREATE_PR_REQUEST Kafka 发送失败（内部吞异常）
+                    │     │ saveToGitProvider() 正常返回
+                    │     │ onCodeGenerationSuccess() 继续执行
+                    │     ├─ GENERATE Step=Success ✅（正常完成，由 ② 标记）
+                    │     ├─ PUSH_TO_GIT Step=Running ⚠️（永久挂起）
+                    │     ├─ status=Running, gitStatus=Waiting (#8)
+                    │     └─ 5h 后 stale 兜底: status=Failed, gitStatus=Failed (#9)
+                    │           （注意：两个 Step 状态不变）
                     │
-                    ├── Git 推送成功回调
-                    │     ├── 本地处理成功 → status=Completed, gitStatus=Completed (#3)
-                    │     └── 本地处理异常 → status=Failed, gitStatus=Failed (#4)
+                    ├── Git 推送成功回调 (CREATE_PR_SUCCESS_TOPIC)
+                    │     ├── 本地处理成功
+                    │     │     GENERATE Step=Success（先由 ② 标记）
+                    │     │     PUSH_TO_GIT Step=Success
+                    │     │     status=Completed, gitStatus=Completed (#3)
+                    │     └── 本地处理异常
+                    │           GENERATE Step=Success（先由 ② 标记）
+                    │           PUSH_TO_GIT Step=Failed
+                    │           status=Failed, gitStatus=Failed (#4)
                     │
-                    └── Git 推送失败回调
-                          → status=Failed, gitStatus=Failed (#5)
+                    └── Git 推送失败回调 (CREATE_PR_FAILURE_TOPIC)
+                          GENERATE Step=Success（先由 ② 标记）
+                          PUSH_TO_GIT Step=Failed
+                          status=Failed, gitStatus=Failed (#5)
 ```
 
-### 6.4 Step 状态汇总
+> **关键分类**：
+> - **正常完成类**：场景 #1（初始）、#2、#3、#6、#7 — 两个 Step 状态一致，Build 状态明确
+> - **挂起类（状态不一致）**：场景 #8 — GENERATE Step=Success 但 PUSH_TO_GIT Step=Running，Build.status 保持 Running
+> - **兜底类**：场景 #9、#10、#11 — Stale 或 calcBuildStatus 触发，修正 Build 状态但不修正 Step 状态
 
-| Step Name | 创建时机 | 完成时机 | 可能状态 |
-|-----------|---------|---------|---------|
-| ADD_TO_QUEUE | Build.create() | 创建即完成 | Success |
-| DOWNLOAD_PRIVATE_PLUGINS | 有私钥插件时 | 插件下载成功/失败 Kafka 回调 | Success / Failed |
-| GENERATE_APPLICATION | generate() | CODE_GENERATION_SUCCESS / FAILURE Kafka 回调 | Success / Failed / Running（挂起场景 #8） |
-| PUSH_TO_GIT_PROVIDER | saveToGitProvider()（有 Git 配置时） | CREATE_PR_SUCCESS / FAILURE Kafka 回调 | Success / Failed / Running（挂起场景 #8） |
+### 6.4 Step 状态汇总（完成 vs 挂起归类）
+
+| Step Name | 创建时机 | 正常完成时机 | 可能状态 | 挂起风险 |
+|-----------|---------|-------------|---------|---------|
+| ADD_TO_QUEUE | Build.create() | 创建即完成（瞬时操作） | Success（唯一） | ❌ 无挂起风险 |
+| DOWNLOAD_PRIVATE_PLUGINS | 有私钥插件时 | 插件下载成功/失败 Kafka 回调 | Success / Failed | ❌ 无挂起风险（异常会向外抛） |
+| **GENERATE_APPLICATION** | generate() | CODE_GENERATION_SUCCESS / FAILURE Kafka 回调 → `onCodeGenerationSuccess()` / `onCodeGenerationFailure()` | **Success / Failed** | ✅ **不会挂起**（CREATE_PR_REQUEST 发送失败后仍会由 `build.controller.ts` 正常完成） |
+| **PUSH_TO_GIT_PROVIDER** | saveToGitProvider()（有 Git 配置时） | CREATE_PR_SUCCESS / FAILURE Kafka 回调 → `onCreatePRSuccess()` / `onCreatePRFailure()` | Success / Failed / **Running** | ⚠️ **唯一会挂起的 Step**（CREATE_PR_REQUEST 发送失败时异常被内部吞，配合 `leaveStepOpen=true` 永久停留在 Running） |
+
+> **关键区别解释**：
+> - GENERATE_APPLICATION Step 的完成由 `build.controller.ts` 中 `onCodeGenerationSuccess()` 消息处理函数的第 ② 步触发，与 `saveToGitProvider()` 的内部异常无关（只要 saveToGitProvider 正常返回，第 ② 步就一定会执行）
+> - PUSH_TO_GIT_PROVIDER Step 的完成完全依赖未来的 CREATE_PR_SUCCESS / FAILURE Kafka 回调。如果 CREATE_PR_REQUEST 根本没发出去（被内部吞异常），就永远不会有回调，Step 永远 Running。
 
 ---
 
@@ -951,8 +1033,23 @@ onCodeGenerationFailure() 服务端   ❌（依赖上游去重）
 ### 9.2 异步 Step 的 leaveStepOpen 模式
 `actionService.run()` 的 `leaveStepOpenAfterSuccessfulExecution=true` 参数使 Step 在同步回调返回后仍保持 Running，等待未来的 Kafka 事件最终完成。这是长时间异步任务的标准处理模式。
 
-### 9.3 Step 挂起风险（代码实际行为）
-**CREATE_PR_REQUEST 发送失败会导致 PUSH_TO_GIT Step 永久挂起**。原因：异常被 `saveToGitProvider()` 内部 try-catch 吞噬，stepFunction 正常返回，配合 `leaveStepOpen=true`，`actionService.run()` 既不会标记 Success 也不会标记 Failed。唯一补救是 5 小时后的 stale 兜底。这是一个潜在的设计缺陷。
+### 9.3 Step 挂起风险与状态不一致（代码实际行为）
+
+**CREATE_PR_REQUEST 发送失败会导致「两个 Step 状态不一致」的半完成状态**，这是整个系统中唯一出现状态分裂的场景：
+
+| 对象 | 最终状态 | 原因 |
+|------|---------|------|
+| `GENERATE_APPLICATION` Step | **Success（正常完成）** | `saveToGitProvider()` 正常返回后，`build.controller.ts` 继续执行 `onCodeGenerationSuccess()`，该函数标记 GENERATE Step 为 Success |
+| `PUSH_TO_GIT_PROVIDER` Step | **Running（永久挂起）** | 异常被 `saveToGitProvider()` 内部 try-catch 吞噬 → stepFunction 正常返回 → `leaveStepOpen=true` 跳过 complete(Success) → 异常未向外抛跳过 complete(Failed) → Step 永久 Running |
+| `Build.status` | **Running** | PUSH_TO_GIT Step 仍为 Running，Build 状态未决 |
+| `Build.gitStatus` | **Waiting** | Git 请求未成功发出，仍处于等待状态 |
+
+**关键代码链**：
+1. [build.controller.ts#L87-L101](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.controller.ts#L87-L101)：顺序执行 `saveToGitProvider()` → `onCodeGenerationSuccess()`，前者不抛异常则后者必然执行
+2. [build.service.ts#L474-L477](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L474-L477)：`emitMessage()` 异常被内部 catch，只打日志不向外 throw
+3. [action.service.ts#L275-L295](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/action/action.service.ts#L275-L295)：`leaveStepOpen=true` + 无异常 = Step 保持 Running
+
+**唯一补救**：5 小时后 [isBuildStale()](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L1547-L1561) 兜底，将 `Build.status` 和 `Build.gitStatus` 标记为 Failed，但**两个 ActionStep 状态不变**（GENERATE 仍为 Success，PUSH_TO_GIT 仍为 Running）。这是一个潜在的设计缺陷。
 
 ### 9.4 Build.status 与 gitStatus 的双轴设计
 - `Build.status` 是**整体构建结果**，由代码生成 + Git 推送联合决定
