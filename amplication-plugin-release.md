@@ -356,7 +356,7 @@ Tarball.packageTarball()
 
 ##### ▶️ 情况二：`version = "9.9.9"`（合法 SemVer，但 npm 上不存在该版本）
 
-这是整个链路中最容易理解错的部分，必须区分**代码意图**、**实际执行路径**和**用户最终看到的构建日志**三层。
+这是整个链路中最复杂、最容易理解错的部分。必须区分**代码意图**、**实际执行路径**、**onError 传参**、**多层 catch 链路**和**用户最终看到的构建日志**五层。
 
 ---
 
@@ -403,36 +403,111 @@ plugin.version = "9.9.9"（合法 SemVer，但 npm 上无此版本）
   → requestedVersion 本身就是 undefined
   → JS 试图访问 undefined.version
   → 立即抛出原生 TypeError: Cannot read properties of undefined (reading 'version')
-  → ⚠️  if 分支内部的 logger.error 和 throw new Error **完全不会执行**
-  │
-  ▼
-[DynamicPackageInstallationManager.ts:L40-L43] try-catch 捕获 TypeError
-  → L41: onError(plugin) 触发
-       → [dynamic-package-installation.ts:L52-L57]
-       → await buildLogger.error(
-            "Failed to installed plugin: @xxx/plugin@9.9.9",
-            { ...TypeError 整个对象被展开 }
-          )
-  → L42: throw error  （重新抛出 TypeError）
-  │
-  ▼
-TypeError 冒泡到 DSG 顶层 → 整个代码生成构建失败
+  → ⚠️  if 分支内部的 logger.error 和 throw new Error **完全不会执行**（死代码）
 ```
 
 ---
 
-**用户在构建日志里实际看到的内容**
+**onError 钩子传参细节（Bug 1/3）**
 
-| 日志来源 | 实际输出 | 是否会出现 |
-|----------|---------|-----------|
-| Tarball 分支 2 友好错误 | `"@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."` | ❌ **永远不会出现**（TypeError 先发生，此分支不可达） |
-| Tarball 分支 2 抛错信息 | `Error: Could not find version 9.9.9 for @xxx/plugin. Please try...` | ❌ **永远不会出现**（同上） |
-| onError 钩子 [dynamic-package-installation.ts:L53-L55](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L53-L55) | `"Failed to installed plugin: @xxx/plugin@9.9.9"` + TypeError 对象的全部字段（stack、message 等） | ✅ 会出现 |
-| DSG 顶层未捕获异常 | `TypeError: Cannot read properties of undefined (reading 'version')` 及其堆栈 | ✅ 会出现（构建终止报错） |
+TypeError 首先被 [DynamicPackageInstallationManager.ts:L40-L43](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L40-L43) 捕获：
+
+```typescript
+} catch (error) {
+  onError && (await onError(plugin));   // ← ⚠️ 只传了 plugin，没有传 error！
+  throw error;
+}
+```
+
+对比 [HookErrorFunction 类型定义](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L72-L75)：
+
+```typescript
+export type HookErrorFunction = (
+  plugin: PackageInstallation,
+  error?: Error    // error 被声明为可选参数，但调用方实际上从来不传
+) => Promisable<void>;
+```
+
+调用方 [dynamic-package-installation.ts:L52-L57](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L52-L57)：
+
+```typescript
+onError: async (plugin, error) => {
+  await buildLogger.error(
+    `Failed to installed plugin: ${plugin.name}@${plugin.version}`,
+    { ...error }   // ← error 是 undefined！{ ...undefined } = {}（空对象）
+  );
+},
+```
+
+**实际写入构建日志的内容**：只有纯文本 `"Failed to installed plugin: @xxx/plugin@9.9.9"`，第二参数是**空对象 `{}`**，没有任何 TypeError 的 message、stack 或其他错误详情。用户从这条日志里只能看到插件安装失败，完全不知道为什么失败。
 
 ---
 
-> 🔍 **代码 Bug 结论**：`if (!requestedVersion.version)` 的写法有缺陷。正确写法应该是 `if (!requestedVersion || !requestedVersion.version)`，否则当 `requestedVersion` 为 `undefined`（版本不存在的唯一情况）时，先抛 TypeError 导致友好错误分支成为死代码。当前用户无法收到"请换版本或用最新版"的建议，只能看到晦涩的 TypeError 堆栈。
+**TypeError 完整冒泡与暴露路径（4 层 catch）**
+
+`DynamicPackageInstallationManager.install()` 在 L42 `throw error` 后，TypeError 经过 **4 层 catch** 才最终终止 DSG 进程，每层都以不同方式记录日志：
+
+```
+  │
+  ▼
+[DynamicPackageInstallationManager.install()] L42: throw TypeError
+  │
+  ▼
+dynamicPackagesInstallations() —— 无 try-catch，直接冒泡
+  │
+  ▼
+[create-data-service.ts:L34-L39] createDataService()
+  → await dynamicPackagesInstallations(...)
+     ⚠️  这段调用写在 try 块（L41 开始）的外面！
+     所以 [create-data-service.ts:L99-L104] 的 catch 捕获不到它
+     TypeError 直接冒泡
+  │
+  ▼
+第 1 层 catch：[generate-code.ts:L52-L63] generateCodeByResourceData()
+  → L61: internalLogger.error(error.message, error)
+       写入："Cannot read properties of undefined (reading 'version')" + 完整 error 对象
+  → L62: throw error  （继续冒泡）
+  │
+  ▼
+第 2 层 catch：[generate-code.ts:L84-L93] generateCode()
+  → L90: context.logger.error(`Failed to generate code: ${error.message}`)
+       写入构建日志："Failed to generate code: Cannot read properties of undefined (reading 'version')"
+  → L91: buildManagerNotifier.failure()   通知 BuildManager 标记构建失败
+  → L92: throw error  （继续冒泡）
+  │
+  ▼
+第 3 层 catch：[main.ts:L5-L8]
+  → L6: logger.error(err)    再次记录完整 err 对象（进程 stdout/stderr）
+  → L7: process.exit(1)      DSG 容器进程以非零状态退出
+  │
+  ▼
+DSG 进程终止，构建失败
+```
+
+---
+
+**用户在构建日志里实际能看到的所有内容**
+
+| 日志来源 | 实际输出内容 | 是否会出现 |
+|----------|-------------|-----------|
+| Tarball 分支 2 友好错误日志 | `"@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."` | ❌ **永远不出现**（TypeError 先发生，死代码） |
+| Tarball 分支 2 抛错信息 | `Error: Could not find version 9.9.9 for @xxx/plugin. Please try...` | ❌ **永远不出现**（同上，死代码） |
+| onError 钩子 `buildLogger.error` [dynamic-package-installation.ts:L53-L55](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L53-L55) | `"Failed to installed plugin: @xxx/plugin@9.9.9"` + `{}`（空对象，**无任何错误详情**） | ✅ 会出现，但对用户诊断问题几乎没有帮助 |
+| `generateCodeByResourceData()` `internalLogger.error` [generate-code.ts:L61](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/generate-code.ts#L61) | `"Cannot read properties of undefined (reading 'version')"` + 完整 error 对象（含 stack） | ✅ 会出现（内部日志，通常不向用户展示） |
+| `generateCode()` `context.logger.error` [generate-code.ts:L90](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/generate-code.ts#L90) | `"Failed to generate code: Cannot read properties of undefined (reading 'version')"` | ✅ 会出现在构建日志里（用户能看到） |
+| `main.ts` `logger.error(err)` [main.ts:L6](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/main.ts#L6) | 完整 TypeError 对象（含 stack） | ✅ 会出现在容器进程 stderr（运维层面可见） |
+
+---
+
+> 🔍 **三处代码 Bug 汇总**：
+>
+> 1. **Tarball 分支 2 写法缺陷** [Tarball.ts:L52](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52)：`if (!requestedVersion.version)` 应改为 `if (!requestedVersion || !requestedVersion.version)`。当前 `requestedVersion = undefined` 时先抛 TypeError，友好错误分支成为死代码。
+>
+> 2. **onError 不传 error 参数** [DynamicPackageInstallationManager.ts:L41](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L41)：`onError(plugin)` 应改为 `onError(plugin, error)`。当前钩子只能写纯文本消息，第二参数永远是空对象。
+>
+> 3. **安装阶段在 try 外面** [create-data-service.ts:L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/create-data-service.ts#L34-L39)：`dynamicPackagesInstallations()` 写在 L41 try 块外面，安装错误无法走 createDataService 内部统一的错误记录路径。
+>
+> 三重 Bug 叠加的用户体验：用户看不到"请换版本或用最新版"的友好建议，只能先看到一条没有任何错误详情的 `"Failed to installed plugin"`，再看到一条晦涩的 `"Failed to generate code: Cannot read properties of undefined (reading 'version')"`。
 
 ##### ▶️ 情况三：`version = "1.0.0"`（合法 SemVer，npm 上存在，但被标记 deprecated）
 
@@ -506,22 +581,36 @@ PluginInstallation.version
                    存在               （npm 上无此版本）
                           │            │
                           ▼            ▼
-                   ┌────────────┐  ┌──────────────────────────────────┐
-                   │ deprecated?│  │ TypeError 访问 undefined.version  │
-                   │ 是→warn    │  │ ↓                                │
-                   │ 否→无操作  │  │ onError 钩子：                    │
-                   └─────┬──────┘  │   "Failed to installed plugin"   │
-                         │          │ ↓                                │
-                         ▼          │ 重新 throw TypeError             │
-                   正常下载 tarball  │ ↓                                │
-                   解压到 modules/   │ 中断 DSG 构建                    │
-                         │          └──────────────────────────────────┘
-                         ▼
-               onAfterInstall 上报 BuildManager
-               （requestedFullPackageName 用原始 version）
+                   ┌────────────┐  ┌──────────────────────────────────────┐
+                   │ deprecated?│  │ TypeError: 访问 undefined.version    │
+                   │ 是→warn    │  │ ↓                                    │
+                   │ 否→无操作  │  │ DynamicPackageInstallationManager   │
+                   └─────┬──────┘  │   catch(plugin) → onError(plugin)    │
+                         │          │   ⚠️ 只传 plugin，不传 error！       │
+                         ▼          │   ↓                                    │
+                   正常下载 tarball  │   onError 钩子：                      │
+                   解压到 modules/   │     "Failed to installed plugin" + {} │
+                         │          │   ↓                                    │
+                         ▼          │   throw TypeError（重新抛出）          │
+               onAfterInstall       │   ↓                                    │
+               上报 BuildManager    │ ╔════════════════════════════════════╗  │
+               （用原始 version）   │ ║ createDataService 中在 try 外    ║  │
+                                    │ ║ generateCodeByResourceData: catch ║  │
+                                    │ ║   internalLogger.error(err)       ║  │
+                                    │ ║ generateCode: catch               ║  │
+                                    │ ║   "Failed to generate code: ..."  ║  │
+                                    │ ║   buildManagerNotifier.failure()  ║  │
+                                    │ ║ main.ts: catch                    ║  │
+                                    │ ║   logger.error(err) + exit(1)     ║  │
+                                    │ ╚════════════════════════════════════╝  │
+                                    │   ↓                                    │
+                                    │ DSG 进程终止，构建失败                │
+                                    └──────────────────────────────────────┘
 
-  ⚠️  Tarball 分支 2 中的友好错误日志和友好 Error 是死代码，
-      永远不会执行到（TypeError 先发生）。
+  ⚠️  3 处 Bug 汇总：
+      ① Tarball: if(!requestedVersion.version) 死代码
+      ② DynamicPackageInstallationManager: onError 不传 error 参数
+      ③ createDataService: 动态安装调用在 try 块外面
 ```
 
 ### 4.5 插件安装配置校验
