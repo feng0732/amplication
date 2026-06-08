@@ -8,12 +8,18 @@ Amplication 采用基于 **Kafka 消息队列** 的事件驱动架构，实现�
 ┌─────────────────────────────────────────────────────────────────┐
 │                        触发源 (Triggers)                         │
 │  GraphQL Resolver / REST Controller / 定时任务 / 外部事件        │
+│  - WorkspaceResolver.currentWorkspace()                         │
+│  - BuildResolver.createBuild()                                   │
+│  - ResourceBtmResolver.triggerBreakServiceIntoMicroservices()    │
+│  - UserController.notifyUseFeatureAnnouncement()                 │
+│  - OutdatedVersionAlertService (内部告警触发)                     │
 └────────────────────────────┬────────────────────────────────────┘
                              │ 业务方法调用
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    业务服务层 (Business Services)                 │
-│  BuildService / UserActionService / GptService 等                │
+│  BuildService / UserService / ResourceBtmService /               │
+│  GptService / OutdatedVersionAlertService                        │
 │  - 执行业务逻辑                                                   │
 │  - 通过 KafkaProducerService.emitMessage() 发布事件              │
 └────────────────────────────┬────────────────────────────────────┘
@@ -38,16 +44,19 @@ Amplication 采用基于 **Kafka 消息队列** 的事件驱动架构，实现�
 ┌─────────────────────────────────────────────────────────────────┐
 │                 订阅消费层 (Event Consumers)                      │
 │  @EventPattern / @MessagePattern 装饰器标注的 Controller 方法     │
-│  - amplication-server (BuildController 等)                        │
-│  - amplication-build-manager (BuildRunnerController)              │
-│  - notification-service (AppController)                           │
-│  - gpt-gateway (KafkaController)                                  │
+│  - amplication-server: BuildController / GptController /         │
+│                        DBSchemaImportController /                 │
+│                        UserActionController                      │
+│  - amplication-build-manager: BuildRunnerController              │
+│  - notification-service: AppController                           │
+│  - gpt-gateway: KafkaController                                   │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  执行层 (Execution Pipeline)                      │
 │  - ActionService.run(): 步骤化执行 + 状态管理                     │
+│  - Notification Pipeline (compose 中间件)                         │
 │  - NovuService: 通知触发                                          │
 │  - 各业务 Service: 领域逻辑执行                                    │
 └─────────────────────────────────────────────────────────────────┘
@@ -74,6 +83,8 @@ lib/
 │   └── value.ts      # 消息 Value 的 DTO（class-validator 装饰器）
 ├── code-generation-success/
 ├── user-build/
+├── user-action/
+├── gpt-conversation-start/
 ├── create-pr-request/
 └── ... (约 25+ 种事件类型)
 ```
@@ -108,24 +119,26 @@ export class Value {
 
 所有 Kafka 主题统一在 [KAFKA_TOPICS](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/schema-registry/src/index.ts#L29-L69) 枚举中维护：
 
-| 主题分类 | 主题名示例 | 用途 |
-|---------|-----------|------|
-| Build 管理 | `CODE_GENERATION_REQUEST_TOPIC` | 触发代码生成 |
-| | `CODE_GENERATION_SUCCESS_TOPIC` | 代码生成成功 |
-| | `CODE_GENERATION_FAILURE_TOPIC` | 代码生成失败 |
-| | `USER_BUILD_TOPIC` | 构建完成用户通知 |
-| | `DSG_LOG_TOPIC` | 代码生成日志 |
-| Git/PR | `CREATE_PR_REQUEST_TOPIC` | 发起 PR 创建 |
-| | `CREATE_PR_SUCCESS_TOPIC` | PR 创建成功 |
-| | `CREATE_PR_FAILURE_TOPIC` | PR 创建失败 |
-| | `KAFKA_REPOSITORY_PUSH_QUEUE` | 外部 Git push 事件 |
-| 插件 | `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | 下载私有插件请求 |
-| 用户/通知 | `USER_ACTION_TOPIC` | 用户操作事件 |
-| | `USER_ANNOUNCEMENT_TOPIC` | 功能公告 |
-| | `TECH_DEBT_CREATED_TOPIC` | 技术债务告警 |
-| AI | `AI_CONVERSATION_START_TOPIC` | GPT 对话开始 |
-| | `AI_CONVERSATION_COMPLETED_TOPIC` | GPT 对话完成 |
-| 权限 | `CHECK_USER_ACCESS_TOPIC` | 用户构建权限校验（请求/响应模式） |
+| 主题分类 | 主题名变量 | 实际主题值 | 用途 |
+|---------|-----------|-----------|------|
+| Build 管理 | `CODE_GENERATION_REQUEST_TOPIC` | `code-generation.request.internal.1` | 触发代码生成 |
+| | `CODE_GENERATION_SUCCESS_TOPIC` | `code-generation.success.internal.1` | 代码生成成功 |
+| | `CODE_GENERATION_FAILURE_TOPIC` | `code-generation.failure.internal.1` | 代码生成失败 |
+| | `USER_BUILD_TOPIC` | `user-build.internal.1` | 构建完成用户通知 |
+| | `DSG_LOG_TOPIC` | `dsg-log.internal.1` | 代码生成日志 |
+| Git/PR | `CREATE_PR_REQUEST_TOPIC` | `git.internal.PullRequest.request.1` | 发起 PR 创建 |
+| | `CREATE_PR_SUCCESS_TOPIC` | `git.internal.PullRequest.success.1` | PR 创建成功 |
+| | `CREATE_PR_FAILURE_TOPIC` | `git.internal.PullRequest.failure.1` | PR 创建失败 |
+| | `KAFKA_REPOSITORY_PUSH_QUEUE` | `git.external.push.queue.1` | 外部 Git push 事件 |
+| 插件 | `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | | 下载私有插件请求 |
+| 用户/通知 | `USER_ACTION_TOPIC` | `user-action.internal.1` | 用户订阅注册 |
+| | `USER_ANNOUNCEMENT_TOPIC` | `user-announcement.internal.1` | 功能公告广播 |
+| | `TECH_DEBT_CREATED_TOPIC` | `platform.internal.tech-debt.created.1` | 技术债务告警 |
+| AI | `AI_CONVERSATION_START_TOPIC` | `ai.internal.conversation.start.1` | GPT 对话开始 |
+| | `AI_CONVERSATION_COMPLETED_TOPIC` | `ai.internal.conversation.completed.1` | GPT 对话完成 |
+| 权限 | `CHECK_USER_ACCESS_TOPIC` | | 用户构建权限校验（请求/响应模式） |
+| 其他 | `USER_ACTION_LOG_TOPIC` | `user-action.internal.action-log.1` | 用户操作步骤日志 |
+| | `DB_SCHEMA_IMPORT_TOPIC` | `user-action.internal.db-schema-import.request.1` | DB Schema 导入请求 |
 
 ---
 
@@ -205,9 +218,9 @@ export class KafkaCustomTransport extends ServerKafka {
 
 ### 3.4 微服务启动方式
 
-每个需要消费 Kafka 事件的服务，都在其 `main.ts` 中连接 Kafka 微服务：
+每个需要消费 Kafka 事件的服务，都在其 `main.ts` 中连接 Kafka 微服务。
 
-以 [notification-service/src/main.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/main.ts) 为例：
+**使用 KafkaCustomTransport 的服务**（notification-service），见 [notification-service/src/main.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/main.ts)：
 
 ```typescript
 async function bootstrap() {
@@ -222,7 +235,7 @@ async function bootstrap() {
 }
 ```
 
-`amplication-server` 则使用默认配置（使用原生 `ServerKafka`），见 [amplication-server/src/main.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/main.ts#L41)：
+**使用原生 ServerKafka 的服务**（amplication-server），见 [amplication-server/src/main.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/main.ts#L41)：
 
 ```typescript
 app.connectMicroservice<MicroserviceOptions>(createNestjsKafkaConfig());
@@ -230,13 +243,17 @@ app.connectMicroservice<MicroserviceOptions>(createNestjsKafkaConfig());
 
 ---
 
-## 4. 触发入口分析
+## 4. 触发入口分析（按事件主题逐一梳理）
 
-### 4.1 构建触发：BuildService.create()
+### 4.1 构建触发：CODE_GENERATION_REQUEST_TOPIC
 
-代码位置: [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts#L268-L352)
+#### 4.1.1 最上层入口：BuildResolver.createBuild
 
-这是最核心的工作流触发入口。完整调用链如下：
+GraphQL mutation 入口，调用 `BuildService.create()`。
+
+#### 4.1.2 BuildService.create()
+
+代码位置: [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts)
 
 ```
 GraphQL Mutation (createBuild)
@@ -256,12 +273,12 @@ BuildResolver → BuildService.create()
        │     │
        │     └─ 无 → generate()
        │
-       └─ 4. generate() [见 4.1.1]
+       └─ 4. generate() [见 4.1.3]
 ```
 
-#### 4.1.1 generate() — 代码生成事件触发
+#### 4.1.3 generate() — 代码生成事件触发
 
-代码位置: [build.service.ts#L568-L618](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts#L568-L618)
+代码位置: [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts#L568-L618)
 
 ```typescript
 private async generate(logger, build, user): Promise<string> {
@@ -296,126 +313,311 @@ private async generate(logger, build, user): Promise<string> {
 - DSG 资源数据（可能很大）**不通过 Kafka 传输**，而是保存到共享文件系统
 - Kafka 消息只携带 `buildId` 和 `resourceId` 两个轻量标识
 
-#### 4.1.2 onCodeGenerationSuccess() — 构建成功后的通知触发
+#### 4.1.4 onCodeGenerationSuccess() — 构建成功后的多事件触发
 
-代码位置: [build.service.ts#L450-L495](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts#L450-L495)
+代码位置: [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts#L450-L495)
+
+当 BuildController 消费到 CODE_GENERATION_SUCCESS_TOPIC 时调用，发布两个事件：
+1. 调用 `saveToGitProvider()` → emit CREATE_PR_REQUEST_TOPIC
+2. emit USER_BUILD_TOPIC（构建完成用户通知）
+
+---
+
+### 4.2 用户订阅注册：USER_ACTION_TOPIC
+
+**⚠️ 实际发布源头不是 UserActionService，而是 UserService.setNotificationRegistry()**
+
+#### 4.2.1 触发入口：WorkspaceResolver.currentWorkspace()
+
+代码位置: [workspace.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts#L76-L92)
 
 ```typescript
-async onCodeGenerationSuccess(buildId: string): Promise<void> {
-  // ... 获取 build 关联数据 ...
-
-  // 发布用户构建通知事件
-  this.kafkaProducerService.emitMessage(KAFKA_TOPICS.USER_BUILD_TOPIC, <UserBuild.KafkaEvent>{
-    key: {},
-    value: {
-      commitId, commitMessage, resourceId, resourceName,
-      workspaceId, projectId, buildId, projectName,
-      createdAt: Date.now(),
-      externalId: encryptString(userId),
-      envBaseUrl: this.configService.get<string>(Env.CLIENT_HOST),
-    },
-  });
-
-  await this.actionService.complete(step, EnumActionStepStatus.Success);
+@Query(() => Workspace, { nullable: true })
+async currentWorkspace(@UserEntity() currentUser: User): Promise<Workspace | null> {
+  await this.analytics.trackWithContext({ properties: {}, event: EnumEventType.WorkspaceSelected });
+  await this.userService.setLastActivity(currentUser.id);
+  const externalId = await this.userService.setNotificationRegistry(currentUser);  // ← 触发点
+  return { ...currentUser.workspace, externalId };
 }
 ```
 
-### 4.2 用户操作触发：UserActionService
+每当用户切换工作区（查询 currentWorkspace）时，就会触发通知订阅注册。
 
-代码位置: [userAction.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/userAction/userAction.service.ts)
+#### 4.2.2 UserService.setNotificationRegistry()
+
+代码位置: [user.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/user/user.service.ts#L175-L202)
 
 ```typescript
-async createUserActionByTypeWithInitialStep(
-  userActionType, metadata, initialStepData, userId, resourceId?
+async setNotificationRegistry(user: User) {
+  const externalId = encryptString(user.id);
+  const canShowUserNotification = (await this.billingService.getBooleanEntitlement(...))?.hasAccess;
+
+  this.kafkaProducerService
+    .emitMessage(KAFKA_TOPICS.USER_ACTION_TOPIC, <UserAction.KafkaEvent>{
+      key: {},
+      value: {
+        userId: user.account.id,
+        externalId,
+        firstName: user.account.firstName,
+        lastName: user.account.lastName,
+        email: user.account.email,
+        action: UserAction.UserActionType.CURRENT_WORKSPACE,
+        enableUser: canShowUserNotification,
+      },
+    })
+    .catch((error) => this.logger.error(...));
+
+  return externalId;
+}
+```
+
+---
+
+### 4.3 功能公告广播：USER_ANNOUNCEMENT_TOPIC
+
+#### 4.3.1 触发入口：UserController.notifyUseFeatureAnnouncement()
+
+代码位置: [user.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/user/user.controller.ts)
+
+这是一个 **REST API** 入口（非 GraphQL）：
+
+```typescript
+@Controller("announce-new-feature")
+export class UserController {
+  @Post(`notifyUseFeatureAnnouncement/:token`)
+  async notifyUseFeatureAnnouncement(
+    @Param("token") token: string,
+    @Body() data: NotifyUseFeatureAnnouncementInput
+  ): Promise<boolean> {
+    // 校验 token 后调用
+    return this.userService.notifyUserFeatureAnnouncement(
+      userActiveDaysBack, notificationId
+    );
+  }
+}
+```
+
+需要携带配置的 `FEATURE_ANNOUNCEMENT_NOTIFICATION_TOKEN` 才能触发。
+
+#### 4.3.2 UserService.notifyUserFeatureAnnouncement()
+
+代码位置: [user.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/user/user.service.ts#L204-L269)
+
+查询最近 `userActiveDaysBack` 天内活跃的用户，对每个用户 emit 一条 USER_ANNOUNCEMENT_TOPIC 事件。
+
+---
+
+### 4.4 技术债务告警：TECH_DEBT_CREATED_TOPIC
+
+#### 4.4.1 触发源：OutdatedVersionAlertService
+
+代码位置: [outdatedVersionAlert.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts#L96-L119)
+
+当检测到服务存在过时依赖时，对工作区内每个用户 emit 一条 TECH_DEBT_CREATED_TOPIC 事件。
+
+---
+
+### 4.5 AI 对话（拆分单体架构）：AI_CONVERSATION_START_TOPIC
+
+**⚠️ 实际触发入口不是 GptResolver，而是 ResourceBtmResolver（GraphQL Mutation）**
+
+#### 4.5.1 最上层入口：ResourceBtmResolver.triggerBreakServiceIntoMicroservices()
+
+代码位置: [resourceBtm.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/resource/resourceBtm.resolver.ts#L20-L39)
+
+```typescript
+@Mutation(() => UserAction, {
+  nullable: true,
+  description: "Trigger the generation of recommendations for breaking a resource into microservices",
+})
+async triggerBreakServiceIntoMicroservices(
+  @Args({ name: "resourceId", type: () => String }) resourceId: string,
+  @UserEntity() user: User
 ): Promise<UserAction> {
-  return await this.prisma.userAction.create({
-    data: {
-      userActionType, metadata,
-      user: { connect: { id: userId } },
-      action: { create: { steps: { create: initialStepData } } },
-      ...(resourceId ? { resource: { connect: { id: resourceId } } } : {}),
-    },
-    include: { action: { include: { steps: true } } },
+  return this.resourceBtmService.triggerBreakServiceIntoMicroservices({
+    resourceId,
+    user,
   });
 }
 ```
 
-### 4.3 AI 对话触发：GptService
+#### 4.5.2 ResourceBtmService.triggerBreakServiceIntoMicroservices()
 
-触发入口在 amplication-server 的 GptResolver，发布 `AI_CONVERSATION_START_TOPIC` 事件，由 `gpt-gateway` 服务消费。
+代码位置: [resourceBtm.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/resource/resourceBtm.service.ts#L116-L155)
+
+```typescript
+async triggerBreakServiceIntoMicroservices({ resourceId, user }) {
+  // ...权限校验、获取资源实体...
+  const prompt = this.generatePromptForBreakTheMonolith(resource);
+  const conversationParams = [{ name: "userInput", value: prompt }];
+
+  const userAction = await this.gptService.startConversation(
+    ConversationTypeKey.BreakTheMonolith,
+    conversationParams,
+    user.id,
+    resourceId
+  );
+  return userAction;
+}
+```
+
+#### 4.5.3 GptService.startConversation()
+
+代码位置: [gpt.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/gpt/gpt.service.ts#L36-L65)
+
+```typescript
+async startConversation(conversationTypeKey, params, userId, resourceId?): Promise<UserAction> {
+  // 1. 创建 UserAction + Action + 初始 Step (START_CONVERSATION: Waiting)
+  const userAction = await this.userActionService.createUserActionByTypeWithInitialStep(
+    EnumUserActionType.GptConversation,
+    {},
+    CONVERSATION_INITIAL_STEP,
+    userId,
+    resourceId
+  );
+
+  // 2. 发布 AI_CONVERSATION_START_TOPIC 到 Kafka
+  const kafkaMessage: GptConversationStart.KafkaEvent = {
+    key: { requestUniqueId: userAction.id },
+    value: {
+      requestUniqueId: userAction.id,
+      messageTypeKey: conversationTypeKey,
+      params,
+    },
+  };
+  await this.kafkaProducerService.emitMessage(
+    KAFKA_TOPICS.AI_CONVERSATION_START_TOPIC,
+    kafkaMessage
+  );
+  return userAction;
+}
+```
+
+**调用链总览**：
+```
+ResourceBtmResolver.triggerBreakServiceIntoMicroservices() [GraphQL Mutation]
+           │
+           ▼
+ResourceBtmService.triggerBreakServiceIntoMicroservices()
+           │
+           ├─ 生成 prompt（包含资源实体信息）
+           │
+           ▼
+GptService.startConversation()
+           │
+           ├─ 创建 UserAction 记录（步骤状态管理）
+           │
+           └─ emit AI_CONVERSATION_START_TOPIC → gpt-gateway 消费
+```
+
+---
+
+### 4.6 AI 对话完成：AI_CONVERSATION_COMPLETED_TOPIC
+
+由 gpt-gateway 服务在处理完 AI 对话后发布，amplication-server 的 GptController 消费并调用 `GptService.onConversationCompleted()` 更新 UserAction 步骤状态和元数据。
 
 ---
 
 ## 5. 事件消费与订阅机制
 
-### 5.1 NestJS 装饰器订阅模式
+### 5.1 所有消费者方法总览（共 24 个）
 
-使用 `@EventPattern()` (fire-and-forget) 或 `@MessagePattern()` (request-response) 装饰器标注 Controller 方法。
+项目中共有 **5 个服务、7 个 Controller、24 个消费者方法**。
 
-#### 5.1.1 amplication-server：BuildController
+#### 5.1.1 amplication-server（4 个 Controller，17 个消费者方法）
 
-代码位置: [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.controller.ts)
+**BuildController**（13 个方法）— [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.controller.ts)：
 
-该 Controller 是构建工作流的**事件中枢**，消费所有与构建相关的 Kafka 事件：
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@MessagePattern` | `CHECK_USER_ACCESS_TOPIC` | `checkUserAccess()` | ✅ 有 |
+| `@EventPattern` | `CODE_GENERATION_NOTIFY_VERSION_TOPIC` | `onCodeGenerationNotifyVersion()` | ✅ 有 |
+| `@EventPattern` | `BUILD_PLUGIN_NOTIFY_VERSION_TOPIC` | `onPluginNotifyVersion()` | ✅ 有 |
+| `@EventPattern` | `CODE_GENERATION_SUCCESS_TOPIC` | `onCodeGenerationSuccess()` | ✅ 有 |
+| `@EventPattern` | `CODE_GENERATION_FAILURE_TOPIC` | `onCodeGenerationFailure()` | ✅ 有 |
+| `@EventPattern` | `CREATE_PR_SUCCESS_TOPIC` | `onPullRequestCreated()` | ✅ 有 |
+| `@EventPattern` | `CREATE_PR_FAILURE_TOPIC` | `onPullRequestFailure()` | ✅ 有 |
+| `@EventPattern` | `DSG_LOG_TOPIC` | `onDsgLog()` | ✅ 有 |
+| `@EventPattern` | `CREATE_PR_LOG_TOPIC` | `onCreatePullRequestLog()` | ✅ 有 |
+| `@EventPattern` | `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC` | `onDownloadPrivatePluginsSuccess()` | ✅ 有 |
+| `@EventPattern` | `DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC` | `onDownloadPrivatePluginsFailure()` | ✅ 有 |
+| `@EventPattern` | `DOWNLOAD_PRIVATE_PLUGINS_LOG_TOPIC` | `onDownloadPrivatePluginsLog()` | ✅ 有 |
 
-| 装饰器 | 订阅主题 | 处理方法 | 说明 |
-|--------|---------|---------|------|
-| `@MessagePattern` | `CHECK_USER_ACCESS_TOPIC` | `checkUserAccess()` | 请求-响应模式，校验用户权限 |
-| `@EventPattern` | `CODE_GENERATION_SUCCESS_TOPIC` | `onCodeGenerationSuccess()` | 代码生成成功 → 触发 PR 创建 + 用户通知 |
-| `@EventPattern` | `CODE_GENERATION_FAILURE_TOPIC` | `onCodeGenerationFailure()` | 代码生成失败 → 标记步骤失败 |
-| `@EventPattern` | `CREATE_PR_SUCCESS_TOPIC` | `onPullRequestCreated()` | PR 创建成功 → 标记构建完成 |
-| `@EventPattern` | `CREATE_PR_FAILURE_TOPIC` | `onPullRequestFailure()` | PR 创建失败 → 标记构建失败 |
-| `@EventPattern` | `DSG_LOG_TOPIC` | `onDsgLog()` | 代码生成日志 → 写入 ActionLog |
-| `@EventPattern` | `DOWNLOAD_PRIVATE_PLUGINS_*` | 对应方法 | 私有插件下载生命周期事件 |
+**DBSchemaImportController**（1 个方法）— [dbSchemaImport.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.controller.ts)：
 
-#### 5.1.2 amplication-build-manager：BuildRunnerController
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `DB_SCHEMA_IMPORT_TOPIC` | `onDBSchemaImportRequest()` | ✅ 有 |
 
-代码位置: [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts)
+**GptController**（1 个方法）— [gpt.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/gpt/gpt.controller.ts)：
 
-消费代码生成请求，实际调用 DSG (Data Service Generator) 执行代码生成：
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `AI_CONVERSATION_COMPLETED_TOPIC` | `onAiConversationCompleted()` | ❌ **无** |
 
-```typescript
-@EventPattern(KAFKA_TOPICS.CODE_GENERATION_REQUEST_TOPIC)
-async onCodeGenerationRequest(
-  @Payload() message: CodeGenerationRequest.Value
-): Promise<void> {
-  await this.buildRunnerService.runBuild(message.resourceId, message.buildId);
-}
-```
+GptController.onAiConversationCompleted() 直接使用 message 作为参数传递给 service，未做 DTO 转换。
 
-#### 5.1.3 notification-service：AppController
+**UserActionController**（1 个方法）— [action.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/action/action.controller.ts)：
 
-代码位置: [notification-service/src/app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.controller.ts)
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `USER_ACTION_LOG_TOPIC` | `onUserActionLog()` | ✅ 有 |
 
-消费用户通知相关的多个主题：
+#### 5.1.2 amplication-build-manager（1 个 Controller，3 个消费者方法）
 
-| 订阅主题 | 处理方法 |
-|---------|---------|
-| `user-action.internal.1` | `subscribeNotification()` |
-| `user-build.internal.1` | `notifyBuild()` |
-| `user-announcement.internal.1` | `notifyFeatureAnnouncement()` |
-| `platform.internal.tech-debt.created.1` | `notifyTechDebt()` |
+**BuildRunnerController**（3 个方法）— [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts)：
 
-所有方法统一调用 `appService.notificationService(message, topic)`。
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `PACKAGE_MANAGER_CREATE_SUCCESS` | `onPackageManagerCreateSuccess()` | ✅ 有 |
+| `@EventPattern` | `PACKAGE_MANAGER_CREATE_FAILURE` | `onPackageManagerCreateFailure()` | ✅ 有 |
+| `@EventPattern` | `CODE_GENERATION_REQUEST_TOPIC` | `onCodeGenerationRequest()` | ❌ **无** |
 
-#### 5.1.4 gpt-gateway：KafkaController
+`onCodeGenerationRequest()` 直接使用 `message.resourceId` 和 `message.buildId`，未做 DTO 转换。
 
-代码位置: [kafka.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/gpt-gateway/src/kafka/kafka.controller.ts)
+#### 5.1.3 notification-service（1 个 Controller，5 个消费者方法）
 
-```typescript
-@EventPattern(KAFKA_TOPICS.AI_CONVERSATION_START_TOPIC)
-async onAiConversationStart_1(@Payload() value, @Ctx() context: KafkaContext) {
-  this.conversationType.startConversion(messageInput);
-}
-```
+**AppController**（5 个方法）— [app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.controller.ts)：
 
-### 5.2 消息校验：plainToInstance
+所有 5 个方法**全部没有** plainToInstance，message 类型声明为 `{ [key: string]: any }`，直接透传给 AppService。
 
-每个消费者方法都使用 `class-transformer` 的 `plainToInstance()` 将 Kafka 原始消息转为 Schema Registry 定义的强类型 DTO，配合 `class-validator` 实现运行时校验：
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `"user-action.internal.1"` | `subscribeNotification()` | ❌ **无** |
+| `@EventPattern` | `"user-build.internal.1"` | `notifyBuild()` | ❌ **无** |
+| `@EventPattern` | `"user-announcement.internal.1"` | `notifyFeatureAnnouncement()` | ❌ **无** |
+| `@EventPattern` | `"user-preview-generation-completed.internal.1"` | `previewUserGenerationCompleted()` | ❌ **无** |
+| `@EventPattern` | `"platform.internal.tech-debt.created.1"` | `notifyTechDebt()` | ❌ **无** |
 
-```typescript
-const args = plainToInstance(CodeGenerationSuccess.Value, message);
-```
+注意：这里使用了**字符串字面量主题名**而非 `KAFKA_TOPICS` 枚举。
+
+#### 5.1.4 gpt-gateway（1 个 Controller，1 个消费者方法）
+
+**KafkaController**（1 个方法）— [kafka.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/gpt-gateway/src/kafka/kafka.controller.ts)：
+
+| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+|--------|---------|---------|---------------------|
+| `@EventPattern` | `AI_CONVERSATION_START_TOPIC` | `onAiConversationStart_1()` | ✅ 有 |
+
+### 5.2 plainToInstance DTO 校验情况总结
+
+**24 个消费者方法中，18 个使用了 plainToInstance，6 个没有使用：**
+
+| 未使用 plainToInstance 的方法 | 所在 Controller | 说明 |
+|------------------------------|----------------|------|
+| `onAiConversationCompleted()` | amplication-server/GptController | 直接透传 message |
+| `onCodeGenerationRequest()` | amplication-build-manager/BuildRunnerController | 直接访问 message 属性 |
+| `subscribeNotification()` | notification-service/AppController | 声明为 any |
+| `notifyBuild()` | notification-service/AppController | 声明为 any |
+| `notifyFeatureAnnouncement()` | notification-service/AppController | 声明为 any |
+| `previewUserGenerationCompleted()` | notification-service/AppController | 声明为 any |
+| `notifyTechDebt()` | notification-service/AppController | 声明为 any |
+
+### 5.3 NestJS 装饰器订阅模式
+
+使用 `@EventPattern()` (fire-and-forget，无返回值) 或 `@MessagePattern()` (request-response，需要返回值) 装饰器标注 Controller 方法。
+
+唯一使用 `@MessagePattern` 的是 `BuildController.checkUserAccess()`，用于用户构建权限校验的请求-响应模式。
 
 ---
 
@@ -455,6 +657,12 @@ export class AppService {
 ### 6.2 中间件（Notification Package）示例
 
 每个中间件检查 topic 是否匹配，匹配则向 `ctx.notifications` 数组添加通知任务，否则透传 context。
+
+#### subscribeUser 示例（USER_ACTION_TOPIC 处理）
+
+代码位置: [subscribeUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/notification-packages/subscribeUser.ts)
+
+处理 `user-action.internal.1` 主题，根据 `action` 和 `enableUser` 字段决定调用 Novu 的 `createSubscriber()` 还是 `deleteSubscriber()`。
 
 #### buildCompleted 示例
 
@@ -502,10 +710,12 @@ export const buildCompleted = async (notificationCtx: NotificationContext) => {
 Action (1) ────→ ActionStep (N) ────→ ActionLog (N)
   │                 │
   └─ build          └─ name (如 "GENERATE_APPLICATION")
-  └─ userAction     └─ status: Running / Success / Failed
+  └─ userAction     └─ status: Running / Success / Failed / Waiting
                      └─ message
                      └─ completedAt
 ```
+
+Action 通过 `actionId` 字段关联到 Build 或 UserAction。
 
 ### 7.2 run() 方法：步骤模板方法
 
@@ -536,20 +746,9 @@ async run<T>(
 - 将异步操作的生命周期（创建步骤 → 执行 → 成功/失败）统一封装
 - 对 Kafka 事件驱动的长流程，使用 `leaveStepOpenAfterSuccessfulExecution = true` 让步骤保持 Running，待后续消费事件回调时再标记完成
 
-### 7.3 emitLog 通过 Kafka
+### 7.3 UserAction 与 Action 的关系
 
-`createActionContext()` 返回一个闭包上下文，用于在长流程中通过 Kafka 发送步骤日志和状态更新：
-
-```typescript
-createActionContext(userActionId, step, topicName): ActionContext {
-  return {
-    onEmitUserActionLog: async (message, level, status, isStepCompleted) => {
-      const kafkaMessage = this.createKafkaMessageForUserActionLog(...)(...);
-      return this.kafkaProducerService.emitMessage(topicName, kafkaMessage);
-    }
-  };
-}
-```
+UserAction 是更高层的用户操作记录（如 GptConversation、DBSchemaImport），其 `actionId` 字段关联到 Action。UserActionService.createUserActionByTypeWithInitialStep() 负责创建 UserAction + Action + 初始 Step。
 
 ---
 
@@ -597,7 +796,7 @@ createActionContext(userActionId, step, topicName): ActionContext {
                     │ Kafka                        │ Kafka
                     ▼                              ▼
 ┌────────────────────────────────────┐  ┌──────────────────────────────────────┐
-│ 5a. git-sync-manager               │  │ 5b. notification-service             │
+│ 5a. git-sync-manager (ee 目录)     │  │ 5b. notification-service             │
 │     消费 CREATE_PR_REQUEST_TOPIC   │  │     消费 USER_BUILD_TOPIC            │
 │     调用 GitHub/GitLab API 创建 PR  │  │     compose 管道:                    │
 │     成功 → emit CREATE_PR_SUCCESS  │  │       subscribeUser → buildCompleted  │
@@ -616,47 +815,114 @@ createActionContext(userActionId, step, topicName): ActionContext {
 
 ---
 
-## 9. 关键协作模式总结
+## 9. AI 对话工作流：拆分单体架构（Break The Monolith）
 
-### 9.1 两种消息模式
-
-| 模式 | 装饰器 | 返回值 | 使用场景 |
-|------|--------|--------|---------|
-| 发布订阅 (Pub/Sub) | `@EventPattern` | `void` | 代码生成请求、日志、通知 |
-| 请求响应 (Req/Res) | `@MessagePattern` | `{value: ...}` | CHECK_USER_ACCESS_TOPIC 权限校验 |
-
-### 9.2 事件编排：Saga 模式
-
-构建工作流采用 **Saga 模式** 的事件驱动编排：
-- 没有中央协调器，每个消费者处理完后发布下一个事件
-- 步骤状态通过数据库 (ActionStep) 持久化，支持故障恢复
-- 通过 `buildId` / `actionId` 作为 Correlation ID 关联所有事件
-
-### 9.3 大对象传输策略
-
-DSGResourceData（可能包含实体、模块、插件等大量数据）**不通过 Kafka 传输**：
-- Producer 侧写入共享文件系统：`/amplication-data/dsg-resource-data/{buildId}/resource-data.json`
-- Kafka 消息仅携带 `buildId`
-- Consumer 侧从共享存储读取
-
-### 9.4 消费者注册机制
-
-NestJS Microservices 启动时扫描所有 Controller，收集 `@EventPattern` / `@MessagePattern` 装饰器标注的方法，注册到 `messageHandlers` Map 中。`KafkaCustomTransport.bindEvents()` 在连接 Kafka 时统一订阅所有主题。
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 1. 用户在前端点击 "Break The Monolith"                                        │
+│    GraphQL: mutation triggerBreakServiceIntoMicroservices(resourceId)        │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 2. amplication-server - ResourceBtmResolver                                   │
+│    └─ ResourceBtmService.triggerBreakServiceIntoMicroservices()              │
+│         ├─ 检查订阅权限（PreviewBreakTheMonolith 计费项）                     │
+│         ├─ 获取资源所有实体信息                                                │
+│         ├─ generatePromptForBreakTheMonolith() 生成 AI prompt                │
+│         └─ 调用 GptService.startConversation()                               │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 3. amplication-server - GptService.startConversation()                       │
+│    ├─ UserActionService.createUserActionByTypeWithInitialStep()              │
+│    │   创建 UserAction(type=GptConversation) + Action + Step(START_          │
+│    │   CONVERSATION:Waiting)                                                 │
+│    └─ emit AI_CONVERSATION_START_TOPIC                                       │
+│       { requestUniqueId, messageTypeKey="BREAK_THE_MONOLITH", params }      │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ Kafka
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 4. gpt-gateway - KafkaController                                              │
+│    @EventPattern(AI_CONVERSATION_START_TOPIC)                                │
+│    ├─ plainToInstance(GptConversationStart.Value, value)                     │
+│    └─ conversationType.startConversion(messageInput) → 调用 AI API           │
+│       (完成后 emit AI_CONVERSATION_COMPLETED_TOPIC)                          │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ Kafka
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 5. amplication-server - GptController                                         │
+│    @EventPattern(AI_CONVERSATION_COMPLETED_TOPIC)                            │
+│    └─ GptService.onConversationCompleted()                                   │
+│         ├─ 更新 Step(START_CONVERSATION:Success/Failed)                      │
+│         └─ 将 AI 返回结果存入 UserAction.metadata                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 10. 核心文件速查表
+## 10. 关键协作模式总结
+
+### 10.1 两种消息模式
+
+| 模式 | 装饰器 | 返回值 | 使用场景 |
+|------|--------|--------|---------|
+| 发布订阅 (Pub/Sub) | `@EventPattern` | `void` | 代码生成请求、日志、通知、AI 对话 |
+| 请求响应 (Req/Res) | `@MessagePattern` | `{value: ...}` | CHECK_USER_ACCESS_TOPIC 权限校验 |
+
+### 10.2 事件编排：Saga 模式
+
+构建工作流和 AI 对话工作流均采用 **Saga 模式** 的事件驱动编排：
+- 没有中央协调器，每个消费者处理完后发布下一个事件
+- 步骤状态通过数据库 (ActionStep) 持久化，支持故障恢复
+- 通过 `buildId` / `actionId` / `requestUniqueId` (即 userAction.id) 作为 Correlation ID 关联所有事件
+
+### 10.3 大对象传输策略
+
+DSGResourceData（可能包含实体、模块、插件等大量数据）**不通过 Kafka 传输**：
+- Producer 侧写入共享文件系统：`/amplication-data/dsg-resource-data/{buildId}/resource-data.json`
+- Kafka 消息仅携带 `buildId` 和 `resourceId`
+- Consumer 侧从共享存储读取
+
+### 10.4 消费者注册机制
+
+NestJS Microservices 启动时扫描所有 Controller，收集 `@EventPattern` / `@MessagePattern` 装饰器标注的方法，注册到 `messageHandlers` Map 中。`KafkaCustomTransport.bindEvents()` 在连接 Kafka 时统一订阅所有主题。
+
+### 10.5 主题引用方式不一致
+
+- amplication-server、amplication-build-manager、gpt-gateway：使用 `KAFKA_TOPICS.XXX` 枚举
+- notification-service AppController：使用**字符串字面量**（如 `"user-action.internal.1"`），但在 Notification Package 中使用 `KAFKA_TOPICS` 枚举做比较
+
+---
+
+## 11. 核心文件速查表
 
 | 组件 | 文件路径 |
 |------|---------|
 | 事件主题枚举 | [schema-registry/src/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/schema-registry/src/index.ts#L29-L69) |
-| Kafka 生产者 | [KafkaProducer.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts) |
+| Kafka 生产者服务 | [KafkaProducer.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/util/nestjs/kafka/src/producer/KafkaProducer.service.ts) |
 | Kafka 自定义传输 | [kafka.transport.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/util/nestjs/kafka/src/kafka.transport.ts) |
 | Kafka 配置工厂 | [createNestjsKafkaConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/libs/util/nestjs/kafka/src/createNestjsKafkaConfig.ts) |
-| 构建服务 (事件触发源) | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts) |
-| 构建控制器 (事件消费中枢) | [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.controller.ts) |
-| 构建执行器 (DSG消费) | [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts) |
-| 通知管道 | [app.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.service.ts) |
-| 通知消费者 | [app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.controller.ts) |
+| 构建服务 (BUILD 事件发布源) | [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.service.ts) |
+| 构建控制器 (BUILD 事件消费中枢) | [build.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/build/build.controller.ts) |
+| 用户服务 (USER_ACTION / USER_ANNOUNCEMENT 发布源) | [user.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/user/user.service.ts) |
+| 用户通知 REST 入口 | [user.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/user/user.controller.ts) |
+| 工作区 Resolver (USER_ACTION 触发入口) | [workspace.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/workspace/workspace.resolver.ts) |
+| 技术债务告警服务 (TECH_DEBT 发布源) | [outdatedVersionAlert.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/outdatedVersionAlert/outdatedVersionAlert.service.ts) |
+| 拆单体 Resolver (AI 对话触发入口) | [resourceBtm.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/resource/resourceBtm.resolver.ts) |
+| 拆单体服务 (AI 对话中间层) | [resourceBtm.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/resource/resourceBtm.service.ts) |
+| GPT 服务 (AI_CONVERSATION_START 发布源) | [gpt.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/gpt/gpt.service.ts) |
+| GPT 控制器 (AI_CONVERSATION_COMPLETED 消费者) | [gpt.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/gpt/gpt.controller.ts) |
+| 构建执行器 (代码生成消费者) | [build-runner.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-build-manager/src/build-runner/build-runner.controller.ts) |
+| 通知消费者 (5 个通知主题) | [app.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.controller.ts) |
+| 通知处理管道 (compose 中间件) | [app.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/app.service.ts) |
+| 通知中间件：用户订阅 | [subscribeUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/notification-packages/subscribeUser.ts) |
+| 通知中间件：构建完成 | [buildCompleted.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/notification-service/src/notification-packages/buildCompleted.ts) |
 | 步骤执行框架 | [action.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/action/action.service.ts) |
-| AI 对话消费者 | [kafka.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/gpt-gateway/src/kafka/kafka.controller.ts) |
+| 用户操作服务 | [userAction.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/userAction/userAction.service.ts) |
+| AI 对话启动消费者 | [kafka.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/gpt-gateway/src/kafka/kafka.controller.ts) |
+| DB Schema 导入消费者 | [dbSchemaImport.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/dbSchemaImport/dbSchemaImport.controller.ts) |
+| 用户操作日志消费者 | [action.controller.ts](file:///d:/fz/0601/solo-dogfeeding/code/106-amplication/packages/amplication-server/src/core/action/action.controller.ts) |
