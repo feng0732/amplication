@@ -230,30 +230,237 @@ compareVersions(currentVersion: string, version: string): number
 // 预发布版本（如 v1.0.0-beta）直接抛错不支持
 ```
 
-### 4.4 插件动态安装时的校验
+### 4.4 插件动态安装时的校验（精确对照代码）
 
-插件在**构建运行时**被动态下载安装，由 `@amplication/dsg-utils` 包完成。校验链路：
+插件在**构建运行时**被动态下载安装，由 `@amplication/dsg-utils` 包完成。整个处理流程分三层，每层对不同"异常版本"的处理方式不同。
 
-```
-DSG createDataService()
-  → dynamicPackagesInstallations()
-    → DynamicPackageInstallationManager.install()
-      → semver.valid(version) 校验  [DynamicPackageInstallationManager.ts:L24](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L24)
-      → Tarball.download()
-        → packument(name@version) 从 npm 获取元数据
-        → 校验版本是否存在 [Tarball.ts:L52-L64](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52-L64)
-        → 校验是否 deprecated 并 warn [Tarball.ts:L66-L70](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L66-L70)
-        → 下载 tarball 并解压到 pluginInstallationPath
-```
+#### 4.4.1 调用入口与数据来源
 
-版本不存在时的错误处理 [Tarball.ts:L54-L64](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L54-L64)：
+入口在 [dynamic-package-installation.ts:L30-L36](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L30-L36)：
 
 ```typescript
-if (!requestedVersion.version) {
-  const suggestionMessage = `Please try to install another version, or the latest version: ${latestVersion}.`;
-  await this.logger.error([`${name}@${version} is not available`, suggestionMessage].join(". "));
-  throw new Error([`Could not find version ${version} for ${name}`, suggestionMessage].join(". "));
+for (const plugins of packages.filter((plugin) => !plugin.isPrivate)) {
+  const plugin: PackageInstallation = {
+    name: plugins.npm,
+    version: plugins.version,     // 直接从 PluginInstallation.version 取，可能是 "latest" / "1.2.3" / "invalid" 等任意字符串
+    settings: plugins.settings,
+    pluginId: plugins.pluginId,
+  };
+  await manager.install(plugin, { ...hooks });
 }
+```
+
+`PluginInstallation.version` 是一个字符串字段（见 [models.ts:L2738](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/code-gen-types/src/models.ts#L2738)），默认值由 UI 或默认插件机制设置：
+- 用户手动指定 → 如 `"1.5.0"`
+- 默认插件（如 db-postgres）→ `"latest"`（见 [defaultPlugins.ts:L26](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/utils/dynamic-installation/defaultPlugins.ts#L26)）
+
+---
+
+#### 4.4.2 第一层：`DynamicPackageInstallationManager.install()` — SemVer 规范化
+
+核心代码 [DynamicPackageInstallationManager.ts:L21-L30](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L21-L30)：
+
+```typescript
+const { name, version, settings, pluginId } = plugin;
+onBeforeInstall && (await onBeforeInstall(plugin));
+const validVersion = valid(version);   // semver.valid() 规范化
+
+const tarball = new Tarball(
+  { name, version: validVersion, settings, pluginId },  // ← 传给 Tarball 的是 validVersion，不是原始 version
+  this.pluginInstallationPath,
+  this.logger
+);
+```
+
+`semver.valid()` 的返回值行为（npm `semver` 包）：
+
+| 输入 `version` | `valid(version)` 返回值 | 传给 Tarball 的值 |
+|----------------|------------------------|------------------|
+| `"1.2.3"` | `"1.2.3"`（规范化字符串） | `"1.2.3"` |
+| `"v1.2.3"` | `"1.2.3"`（自动去掉 v 前缀） | `"1.2.3"` |
+| `"1.2.3-beta.1"` | `"1.2.3-beta.1"` | `"1.2.3-beta.1"` |
+| `"latest"` | `null`（不是合法 SemVer） | `null` |
+| `"invalid-version"` | `null`（不是合法 SemVer） | `null` |
+| `"abc"` | `null` | `null` |
+| `""`（空串） | `null` | `null` |
+
+**关键事实**：`"latest"` 并不是被特殊识别的标签，而是因为它不是合法 SemVer，被 `valid()` 转为 `null`，间接触发 Tarball 中的 latest 分支。任何非 SemVer 字符串（如 `"abc"`、`"invalid"`）都会走到同一条路径。
+
+---
+
+#### 4.4.3 第二层：`Tarball.packageTarball()` — 分支决策与 npm 校验
+
+核心代码 [Tarball.ts:L28-L80](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L28-L80)：
+
+```typescript
+private async packageTarball({ name, version }: PackageInstallation) {
+  const fullPackageName = `${name}@${version}`;  // 注意：version 可能是 null，拼接成 "@xxx/plugin@null"
+  const response = await packument(fullPackageName); // pacote 会忽略 @null，实际请求的是包名本身的 packument
+  const latestTag = response["dist-tags"].latest;
+  const latestVersion = response.versions[latestTag];
+  const requestedVersion = response.versions[version || ""]; // version 为 null 时变成 response.versions[""] → undefined
+
+  // ─── 分支 1：version 为 null 或字符串 "latest" ───
+  if (!version || version === "latest") {
+    return {
+      tarball: latestVersion.dist.tarball,
+      version: {
+        requestedFullPackageName: fullPackageName,  // "@xxx/plugin@null"
+        packageName: name,
+        packageVersion: latestVersion.version,       // 实际解析到的版本号，如 "1.5.0"
+      },
+    };
+  }
+
+  // ─── 分支 2：version 是合法 SemVer，但 npm 上无此版本 ───
+  if (!requestedVersion.version) {
+    const suggestionMessage = `Please try to install another version, or the latest version: ${latestVersion}.`;
+    await this.logger.error([`${name}@${version} is not available`, suggestionMessage].join(". "));
+    throw new Error([`Could not find version ${version} for ${name}`, suggestionMessage].join(". "));
+  }
+
+  // ─── 分支 3：version 是合法 SemVer 且 npm 上存在 ───
+  if (requestedVersion.deprecated) {
+    await this.logger.warn(
+      `${name}@${version} is deprecated, update it to avoid issues in the code generation.`
+    );
+  }
+
+  return {
+    tarball: requestedVersion.dist.tarball,
+    version: {
+      requestedFullPackageName: fullPackageName,
+      packageName: name,
+      packageVersion: requestedVersion.version,
+    },
+  };
+}
+```
+
+**三种"异常"情况的精确处理对照**：
+
+##### ▶️ 情况一：`version = "latest"`（或任何非 SemVer 字符串：`"abc"`、`""`、`null`）
+
+```
+DynamicPackageInstallationManager
+  → valid("latest") = null
+  → 传给 Tarball version: null
+
+Tarball.packageTarball()
+  → !version → true  (因为 null 是 falsy)
+  → 走分支 1，下载 dist-tags.latest 指向的版本
+  → 返回 packageVersion = 实际最新版本号（如 "1.5.0"）
+```
+
+**不抛错，不降级，静默用最新版本**。注意代码中 `version === "latest"` 这个判断实际上是"死代码"——因为 `valid("latest")` 已将字符串 `"latest"` 转为 `null`，不可能再等于字符串 `"latest"`。该条件仅作为防御性双保险存在。
+
+##### ▶️ 情况二：`version = "9.9.9"`（合法 SemVer，但 npm 上不存在该版本）
+
+```
+DynamicPackageInstallationManager
+  → valid("9.9.9") = "9.9.9"
+  → 传给 Tarball version: "9.9.9"
+
+Tarball.packageTarball()
+  → !version → false
+  → version === "latest" → false
+  → requestedVersion = response.versions["9.9.9"] → undefined
+  → !requestedVersion.version → !undefined.version → 触发 TypeError（Cannot read properties of undefined）
+  → 异常被 install() 的 try-catch 捕获
+     → 触发 onError 钩子：logger.error("Failed to installed plugin...")
+     → 重新 throw error
+     → 整个 DSG 构建失败
+```
+
+**直接中断构建**，并向用户输出建议：尝试安装其他版本或使用最新版 `latestVersion`。
+
+> 🔍 代码细节：`if (!requestedVersion.version)` 实际上隐含了两个前提——`requestedVersion` 必须存在且其 `.version` 属性必须为真值。如果版本完全不存在（`requestedVersion` 是 `undefined`），访问 `.version` 会抛出 JS 原生 `TypeError`，而非进入 `if` 分支输出友好错误。这个异常最终被外层 `try-catch` 捕获后通过 `onError` 钩子输出构建日志。
+
+##### ▶️ 情况三：`version = "1.0.0"`（合法 SemVer，npm 上存在，但被标记 deprecated）
+
+```
+DynamicPackageInstallationManager
+  → valid("1.0.0") = "1.0.0"
+  → 传给 Tarball version: "1.0.0"
+
+Tarball.packageTarball()
+  → 跳过分支 1、2
+  → requestedVersion.deprecated → 真值
+  → logger.warn("xxx is deprecated, update it...")
+  → 继续执行分支 3，正常下载并返回 tarball
+```
+
+**仅警告，不中断，不降级**，继续使用该弃用版本完成构建。
+
+---
+
+#### 4.4.4 第三层：安装结果上报与版本号记录
+
+安装成功后的版本上报 [DynamicPackageInstallationManager.ts:L32-L38](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L32-L38)：
+
+```typescript
+if (!settings?.local) {
+  const installedVersion = await tarball.download();
+  onAfterInstall &&
+    (await onAfterInstall(plugin, {
+      ...installedVersion,
+      requestedFullPackageName: `${name}@${version}`, // ← 使用原始 version，不是 validVersion！
+    }));
+}
+```
+
+**关键细节**：上报给 BuildManager 的 `requestedFullPackageName` 使用**用户原始输入的 `version` 字符串**（如 `"latest"`），而非 Tarball 内部拼接的 `"@xxx/plugin@null"`，也不是规范化后的 SemVer。这样构建历史记录中看到的是：
+
+| 用户设置 `plugin.version` | 实际安装 `packageVersion` | 上报 `requestedFullPackageName` |
+|--------------------------|---------------------------|--------------------------------|
+| `"latest"` | `"1.5.0"` | `"@amplication/plugin-db-postgres@latest"` |
+| `"1.2.3"` | `"1.2.3"` | `"@amplication/plugin-db-postgres@1.2.3"` |
+| `"v1.2.3"` | `"1.2.3"` | `"@amplication/plugin-db-postgres@v1.2.3"` |
+
+---
+
+#### 4.4.5 校验流程汇总图
+
+```
+PluginInstallation.version
+  │  （字符串："latest" / "1.2.3" / "v1.2.3" / "9.9.9" / "invalid"）
+  ▼
+┌─────────────────────────────────────────────────┐
+│ DynamicPackageInstallationManager.install()      │
+│ semver.valid(version)                            │
+└──────────────┬──────────────────────────────────┘
+               │
+     ┌─────────┴──────────┐
+     │                    │
+  null               "1.2.3" 等合法 SemVer
+  （"latest"/"invalid"/""）
+     │                    │
+     ▼                    ▼
+┌────────────────┐   ┌──────────────────────────────┐
+│ Tarball 分支 1  │   │ Tarball 分支 2/3             │
+│ !version=true   │   │ !version=false              │
+│ 下载 latest 版  │   │ 查 response.versions[version]│
+│ 不报错          │   └──────────┬───────────────────┘
+└────────────────┘              │
+                          ┌─────┴──────┐
+                          │            │
+                   requestedVersion   requestedVersion = undefined
+                   存在               （版本不存在）
+                          │            │
+                          ▼            ▼
+                   ┌────────────┐  ┌────────────────────────┐
+                   │ deprecated?│  │ 报错 + 中断构建         │
+                   │ 是→warn    │  │ "Could not find version"│
+                   │ 否→无操作  │  └────────────────────────┘
+                   └─────┬──────┘
+                         │
+                         ▼
+                   正常下载 tarball
+                   解压到 pluginInstallationPath
+                         │
+                         ▼
+               onAfterInstall 上报 BuildManager
+               （requestedFullPackageName 用原始 version）
 ```
 
 ### 4.5 插件安装配置校验
@@ -384,15 +591,17 @@ workflow_dispatch (输入 version)
 │                                                                              │
 │  ⑩ DSG (data-service-generator) 容器启动                                    │
 │     → createDataService() [create-data-service.ts:L15-L105](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/create-data-service.ts#L15-L105)│
-│       → prepareDefaultPlugins()（如未装数据库插件，自动补 db-postgres@latest）│
+│       → prepareDefaultPlugins()（如未装数据库插件，自动补 db-postgres，version="latest"）│
 │       → dynamicPackagesInstallations() [dsg-utils]                           │
 │            → DynamicPackageInstallationManager.install()                     │
-│                 → semver.valid(version) 校验                                │
+│                 → semver.valid(version) 规范化（"latest"→null, "v1.2.3"→"1.2.3"）│
 │                 → Tarball.download()                                         │
-│                      → packument(name@version) 校验存在性                    │
-│                      → 检查 deprecated 并 warn                               │
+│                      → Tarball.packageTarball() 三分支决策：                  │
+│                         • version=null（含 "latest"/非法字符串）→ 下 latest 版 │
+│                         • 合法 SemVer 但 npm 不存在 → 抛错中断构建            │
+│                         • 合法 SemVer 存在 → deprecated? warn+继续 : 直接继续 │
 │                      → 下载 tarball 解压到 amplication_modules/             │
-│                 → 通知 BuildManager 记录实际安装的版本号                     │
+│                 → onAfterInstall：用原始 version 字符串上报 BuildManager     │
 │                                                                              │
 │  ⑪ prepareContext() → registerPlugins()                                      │
 │     → 动态 import 每个插件包的 default export                                │
@@ -418,12 +627,19 @@ const defaultPlugins: DefaultPlugin[] = [
     defaultCategoryPlugin: {
       pluginId: POSTGRESQL_PLUGIN_ID,
       npm: "@amplication/plugin-db-postgres",
-      version: "latest",  // 始终使用最新版本
-      enabled: true,
+      version: "latest",  // 注意：字符串 "latest" 不是合法 SemVer，经 semver.valid() 转为 null
+      enabled: true,      //       间接触发 Tarball 中 !version 分支 → 下载 npm dist-tags.latest
     },
   },
 ];
 // 用户已安装任一数据库插件 → 不补充；否则自动补 PostgreSQL
+```
+
+处理链路对照（详见 4.4.3 情况一）：
+```
+defaultCategoryPlugin.version = "latest"
+  → semver.valid("latest") = null
+  → Tarball: !null = true → 走分支 1 → 下载 npm latest 标签版本
 ```
 
 ### 5.5 私有插件的特殊路径
