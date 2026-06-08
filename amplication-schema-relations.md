@@ -519,7 +519,7 @@ export class DeleteEntityFieldArgs {
 
 ---
 
-### 6.5 UpdateToScalar 场景下 fkHolder 同步的潜在风险
+### 6.5 UpdateToScalar 场景下 fkHolder 同步的实际 Bug
 
 #### 6.5.1 fkHolder 同步逻辑
 
@@ -552,7 +552,20 @@ if (
 }
 ```
 
-#### 6.5.2 UpdateToScalar 场景下的执行时序问题
+#### 6.5.2 关键修正：`undefined !== null` 的实际值
+
+**之前的错误分析**：误以为 `undefined !== null` 返回 `false`。
+
+**JavaScript 实际行为**：
+```javascript
+undefined !== null   // → true   ✅ 不是 false！
+undefined === null   // → false
+undefined == null    // → true   (仅非严格相等时成立)
+```
+
+所以 `updateFieldProperties?.fkHolder !== null` 中，当 `fkHolder` 为 `undefined` 时，该条件**返回 `true`，同步逻辑会被执行！**
+
+#### 6.5.3 UpdateToScalar 场景下的完整执行链
 
 `updateField()` 中的执行顺序（结合 UpdateToScalar 调用）：
 
@@ -561,27 +574,109 @@ if (
  ① shouldDeleteRelated 判定 → true（Lookup → 非 Lookup）
  ② deleteRelatedField() → 删除对端 EntityField + ModuleAction + ModuleDto
  ③ prisma.entityField.update() → 将本端 dataType 改为 Json/String，
-                                  properties 被替换为标量类型的默认属性（无 fkHolder/relatedFieldId）
+                                  properties 被替换为 DATA_TYPE_TO_DEFAULT_PROPERTIES[Json] = {}（空对象）
  ④ fkHolder 同步检查（L3076-L3102）
 ```
 
-**在步骤 ④ 时：**
-- `field.dataType`：闭包变量，仍为 `EnumDataType.Lookup`（更新前的值）→ ✅ 条件成立
-- `updateFieldProperties.fkHolder`：因为步骤 ③ 中 properties 已被替换为 `DATA_TYPE_TO_DEFAULT_PROPERTIES[Json]`（空对象 `{}`），所以为 `undefined` → ❌ `undefined !== null` 条件不成立
-- `updateFieldProperties.relatedFieldId`：同样为 `undefined`
+**步骤 ④ 的条件判定：**
+| 条件子句 | 变量值 | 判定结果 |
+|---------|-------|---------|
+| `field.dataType === EnumDataType.Lookup` | `field` 是闭包变量，仍为更新前的 `Lookup` | ✅ `true` |
+| `updateFieldProperties?.fkHolder !== null` | `fkHolder` 为 `undefined`（空对象访问不存在的属性） | ✅ `undefined !== null` → **`true`** |
+| **整体条件** | | ✅ **`true`，进入同步逻辑！** |
 
-**实际结果**：因为 `fkHolder === undefined`，所以 `fkHolder !== null` 为 false，**同步逻辑被跳过，不会触发错误**。
+#### 6.5.4 Bug 分析：`permanentId: undefined` 时 getField 的行为
 
-#### 6.5.3 风险分析
+进入同步逻辑后，执行：
+
+```typescript
+const relatedField = await this.getField({
+  where: { permanentId: updateFieldProperties.relatedFieldId },
+  // ↑ relatedFieldId 同样为 undefined（空对象访问不存在属性）
+  include: { entityVersion: true },
+});
+```
+
+`getField()` 的实现（[entity.service.ts L3266-L3281](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3266-L3281)）：
+
+```typescript
+async getField(args: Prisma.EntityFieldFindFirstArgs): Promise<EntityField> {
+  const field = await this.prisma.entityField.findFirst({
+    ...args,
+    where: {
+      ...args.where,     // { permanentId: undefined }
+      entityVersion: { versionNumber: CURRENT_VERSION_NUMBER },
+    },
+  });
+  if (!field) {
+    throw new NotFoundException(
+      `Could not find an entity field for: ${JSON.stringify(args.where)}`
+    );
+  }
+  return field;
+}
+```
+
+**Prisma 对 `undefined` 值的处理**：Prisma Client 在构造查询时会**忽略值为 `undefined` 的字段**，不将其加入 WHERE 条件。因此实际执行的查询为：
+
+```prisma
+findFirst({
+  where: {
+    // permanentId: undefined → 被忽略，不出现在查询中
+    entityVersion: { versionNumber: 0 },
+  },
+  include: { entityVersion: true },
+})
+```
+
+这意味着：查询条件退化为"找当前版本（versionNumber=0）下的**任意第一条** EntityField 记录"。
+
+#### 6.5.5 Bug 的实际影响
+
+根据 Prisma 查询结果分两种情况：
+
+**情况 A：实体存在其他字段（大概率）**
+
+- 查询返回该实体当前版本下的**第一条任意字段**（与原关系完全无关）
+- 接着执行：
+  ```typescript
+  const relatedFieldProps = relatedField.properties as unknown as types.Lookup;
+  relatedFieldProps.fkHolder = (
+    updatedField.properties as unknown as types.Lookup
+  )?.fkHolder;   // → undefined
+  
+  await prisma.entityField.update({
+    where: { id: relatedField.id },
+    data: { properties: relatedFieldProps as unknown as Prisma.InputJsonValue },
+  });
+  ```
+- **结果**：一个无辜的无关字段被写入 `properties.fkHolder = undefined`
+  - 如果该字段本身是 Lookup 类型：其原本的 `fkHolder` 配置被清除为 `undefined`，可能导致外键持有方判定异常
+  - 如果该字段是非 Lookup 类型：其 properties JSON 中被无端写入 `fkHolder: null`/`undefined` 键值
+
+**情况 B：实体没有其他字段（小概率）**
+
+- 查询返回 `null`
+- `getField` 抛出 `NotFoundException`，异常信息为：
+  ```
+  Could not find an entity field for: {}
+  ```
+- 异常向上冒泡，导致本次 UpdateToScalar 操作整体失败
+
+#### 6.5.6 风险分析总结
 
 | 风险场景 | 是否实际发生 | 说明 |
 |---------|------------|------|
-| 对端字段已被删除后仍尝试读取 | ❌ 否 | `fkHolder` 为 undefined 短路跳过，不会执行 `getField()` |
-| 对端 properties 被错误写入无效 fkHolder | ❌ 否 | 同上，同步逻辑完全不执行 |
-| 本端更新后 properties 类型不一致 | ✅ 是 | `updatedField.properties` 已被强制转换为 Lookup 类型（typescript as 断言），但实际运行时是标量属性 |
-| 未来代码变更导致条件变化 | ⚠️ 潜在 | 如果 `DATA_TYPE_TO_DEFAULT_PROPERTIES` 中 Json 类型意外包含非空 `fkHolder`，或判断条件改为 `!== undefined`，将触发对已删除字段的访问 |
+| 条件判定被错误地通过 | ✅ 是 | `undefined !== null` 为 `true`，同步逻辑始终执行 |
+| 无关字段 properties 被污染 | ✅ 是（大概率） | 任意一条同版本字段被写入 `fkHolder: undefined` |
+| Lookup 字段原 fkHolder 配置丢失 | ⚠️ 潜在 | 如果被误写的字段恰好是另一个一对一 Lookup，其 fkHolder 被清除 |
+| 操作整体异常中断 | ⚠️ 小概率 | 实体仅含这一个字段时，`findFirst` 返回 null 抛出 NotFoundException |
+| TypeScript 类型断言掩盖问题 | ✅ 是 | `as unknown as types.Lookup` 强制类型转换绕过了编译期检查 |
 
-**当前代码恰好安全的关键原因**：标量类型的 `DATA_TYPE_TO_DEFAULT_PROPERTIES` 为空对象 `{}`，使得 `fkHolder` 取值为 `undefined`，与 `null` 的比较不通过，从而跳过了后续所有操作。这是一个隐式依赖，而非显式设计。
+**Bug 根本原因**：
+1. 条件使用 `!== null` 而非 `!= null` 或显式检查值存在
+2. Properties 更新后缺少类型校验，直接被强制断言为 Lookup 类型
+3. 未考虑 `shouldDeleteRelated` 已删除对端字段后，后续同步逻辑仍可能执行的时序问题
 
 ---
 
@@ -852,5 +947,5 @@ model Profile {
 | UpdateToScalar 对端影响 | 认为"不对对端字段做任何修改" | `updateField()` 内部的 `shouldDeleteRelated`（Lookup→非Lookup）自动触发 `deleteRelatedField()`，**对端 EntityField/ModuleAction/ModuleDto 全部被删除** | ❌ 描述完全错误 |
 | UpdateToScalar 本端转换 | 笼统说"转换为标量字段" | to-Many→`Json`（名称不变）；to-One→ID 标量类型（字段名加 `Id` 后缀，displayName 加 ` ID` 后缀） | ⚠️ 描述不够精确 |
 | UpdateToScalar 本端清理 | 未提及 | 本端 **ModuleAction 和 ModuleDto 未被清理**（`return` 跳过了清理代码），存在残留数据 | ❌ 潜在 Bug |
-| fkHolder 同步风险 | 未提及 | `updateField()` 中 fkHolder 同步使用 `!== null` 判定，恰好因为标量 properties 为空对象 `{}` 使得 `fkHolder` 为 `undefined` 而被跳过，属于**隐式依赖而非显式设计**；若条件改为 `!== undefined` 或默认属性变化，将触发访问已删除对端字段的异常 | ⚠️ 脆弱的隐式安全 |
+| fkHolder 同步风险 | 未提及 / 之前误认为恰好安全跳过 | **实际 Bug**：`undefined !== null` 为 `true`，条件通过后，`permanentId: undefined` 被 Prisma 忽略，查询退化为返回当前版本任意第一条字段，然后该无辜字段被写入 `fkHolder: undefined`，可能污染其他 Lookup 字段的外键配置；仅当实体无其他字段时才抛 NotFoundException 中断操作 | ❌ 确定性 Bug |
 | Blueprint 级联构建 | 未区分，可能误认为与实体关系有关 | 完全独立的机制，作用于 Resource 构建顺序（BFS 遍历 `parentShouldBuildWithChild`），与数据模型完全无关 | ❌ 需要明确区分 |
