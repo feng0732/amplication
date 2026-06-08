@@ -26,10 +26,11 @@ Amplication 的遥测系统由 **客户端（Browser）** 与 **服务端（Node
 │  │    (提取 header → req.analyticsSessionId)       │      │
 │  └──────────────────┬───────────────────────┘      │
 │                     │                               │
-│  ┌─────────────────────────────────────────────┐      │
-│  │    parseValidUnixTimestampOrUndefined          │      │
-│  │    (仅非负整数型 Unix 时间戳才通过校验)          │      │
-│  └──────────────────┬───────────────────────┘      │
+│  ┌──────────────────────────────────────────────────────┐ │
+│  │    parseValidUnixTimestampOrUndefined                   │ │
+│  │    (parseInt 贪婪前缀匹配：数字/空白+数字开头即通过，    │ │
+│  │     返回原始完整字符串而非解析后的数字)                   │ │
+│  └──────────────────────┬───────────────────────────────┘ │
 │                     │                               │
 │  ┌─────────────────────────────────────────────┐      │
 │  │       SegmentAnalyticsService                 │      │
@@ -254,7 +255,7 @@ useEffect(() => {
 
 **发送边界**：[segmentAnalytics.service.ts#L23-L28](file:///d:/fz/0601/solo-dogfeeding/code/109-amplication/packages/amplication-server/src/services/segmentAnalytics/segmentAnalytics.service.ts#L23-L28)：只有当 `segmentWriteKey` 存在且非空时，才初始化 `Analytics` 实例。所有上报方法开头都有 `if (!this.analytics) return;` 守卫。
 
-### 3.3 Session ID 拦截器与 Unix 时间戳校验
+### 3.3 Session ID 拦截器与 parseInt 前缀匹配校验
 
 #### 3.3.1 拦截器提取
 
@@ -391,7 +392,7 @@ public async identify(data: IdentifyData): Promise<void> {
 ```
 
 **anonymousId 使用条件**：
-- `identify` 始终同时发送 `userId` 和 `anonymousId`（只要校验通过）
+- `identify` 始终同时发送 `userId` 和 `anonymousId`（只要 `parseInt` 前缀解析为非负整数即视为"校验通过"，传入原始完整字符串；可能是 UUID/ULID/带后缀等非预期格式）
 - 用途：在用户注册/登录后，将之前匿名会话（anonymousId）与正式账号（userId）在 Segment 后台合并
 - 若 `analyticsSessionId` 校验未通过（返回 undefined），Segment SDK 将忽略 `anonymousId` 字段，仅按 `userId` 识别
 
@@ -435,14 +436,16 @@ const trackData: TrackParams = {
 
 **anonymousId 使用条件矩阵：**
 
-| 场景 | user.accountId | analyticsSessionId (校验后) | Segment 最终收到 |
-|------|---------------|-----------------------------|-----------------|
-| 已登录 + 合法 session id | 存在 (string) | 存在 (string，非负整数) | `userId` + `anonymousId` 同时发送 |
-| 已登录 + 非法/缺失 session id | 存在 (string) | `undefined` | 仅发送 `userId`，`anonymousId` 被忽略 |
-| 未登录 + 合法 session id | `undefined` | 存在 (string，非负整数) | 仅发送 `anonymousId` |
-| 未登录 + 非法/缺失 session id | `undefined` | `undefined` | 两者均缺失，Segment 可能拒绝或使用 SDK 自身 anonymousId |
+| 场景 | user.accountId | analyticsSessionId (parseInt 前缀解析后) | Segment 最终收到 |
+|------|---------------|-------------------------------------------|-----------------|
+| 已登录 + **纯数字 Unix 时间戳**（函数设计预期） | 存在 (string) | 原值（如 `"1717800000"`） | `userId` + `anonymousId` 同时发送，**关联正常** |
+| 已登录 + **数字开头的 UUID/ULID/带后缀/浮点/带空白前缀** | 存在 (string) | **原始完整字符串**（如完整 UUID、`" 123abc"`） | `userId` + `anonymousId` 同时发送，**灰色区域：值不符合 Segment 预期** |
+| 已登录 + **字母开头/空/负数/null/undefined** | 存在 (string) | `undefined`（parseInt 返回 NaN 或负数） | 仅发送 `userId`，`anonymousId` 被忽略 |
+| 未登录 + **纯数字 Unix 时间戳**（函数设计预期） | `undefined` | 原值（如 `"1717800000"`） | 仅发送 `anonymousId`，**关联正常** |
+| 未登录 + **数字开头的 UUID/ULID/带后缀/浮点/带空白前缀** | `undefined` | **原始完整字符串** | 仅发送 `anonymousId`，**灰色区域** |
+| 未登录 + **字母开头/空/负数/null/undefined** | `undefined` | `undefined` | 两者均缺失，Segment 可能拒绝或使用 SDK 自身 anonymousId |
 
-**关于注释与实际代码的差异**：注释写着 *"If the user is not logged in, use an anonymous ID"*，但实际上**无论用户是否登录**，只要 session id 校验通过，`anonymousId` 都会被发送。这种做法（同时传 userId + anonymousId）在 Segment 的最佳实践中被称为 **Identity Merge**，用于在用户登录后将之前的匿名行为与账号关联。
+**关于注释与实际代码的差异**：注释写着 *"If the user is not logged in, use an anonymous ID"*，但实际上**无论用户是否登录**，只要 `parseInt` 前缀解析为非负整数（即数字/空白+数字开头）即视为"校验通过"，`anonymousId` 就会被发送（原值透传，可能是 UUID/ULID/带后缀等非预期格式）。这种做法（同时传 userId + anonymousId）在 Segment 的最佳实践中被称为 **Identity Merge**，用于在用户登录后将之前的匿名行为与账号关联。
 
 最终发送到 Segment 的 Track 数据结构：
 
@@ -497,7 +500,7 @@ const trackData: TrackParams = {
 | 层级 | 控制变量 | 位置 | 说明 |
 |------|---------|------|------|
 | 整体 | `SEGMENT_WRITE_KEY_SECRET` | segmentAnalyticsOptionsService.ts | 无 Key 时，analytics 实例为 undefined，所有方法空操作 |
-| anonymousId 有效性 | `parseValidUnixTimestampOrUndefined` 逻辑内联 | segmentAnalytics.service.ts | session id 非非负整数格式时，等同于未发送 anonymousId |
+| anonymousId 有效性 | `parseValidUnixTimestampOrUndefined` 逻辑内联 | segmentAnalytics.service.ts | **parseInt 前缀解析失败（NaN 或负数）时才返回 undefined，等同于未发送；数字/空白+数字开头的任意字符串（含 UUID/ULID/浮点数/数字+后缀等）均原值透传** |
 
 ### 4.3 错误静默失败
 
@@ -531,19 +534,21 @@ const trackData: TrackParams = {
   │                                            │    → req.analyticsSessionId
   │                                            │
   │                                            │ 4. parseValidUnixTimestampOrUndefined()
-  │                                            │    仅当值为"非负整数字符串"时通过
-  │                                            │    非法值 → undefined
+  │                                            │    parseInt 贪婪前缀匹配：
+  │                                            │    - 数字/空白+数字开头 → 返回**原始完整字符串**
+  │                                            │      （含 UUID/ULID/浮点/数字+后缀等）
+  │                                            │    - 字母开头/NaN/负数   → 返回 undefined
   │                                            │
   │                                            │ 5. trackWithContext / trackManual / identify
   │                                            │    - userId = accountId（登录时）
-  │                                            │    - anonymousId = 校验通过的 session id
-  │                                            │      (可能为 undefined)
+  │                                            │    - anonymousId = 上一步结果
+  │                                            │      (原值透传 或 undefined)
   │                                            │
   │                                            │ 6. 发送到 Segment
   │                                            │    context.amplication.analyticsSessionId
   ▼                                            ▼
            Segment 后台根据 userId + anonymousId 进行用户合并
-                      （若 anonymousId 被过滤掉则无法合并）
+      （anonymousId 为原值透传时可能因格式不匹配而合并失败）
 ```
 
 **校准后的关键关联结论：**
