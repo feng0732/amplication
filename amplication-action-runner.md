@@ -76,46 +76,56 @@
 
 ## 二、排队机制与初始状态入库
 
-### 2.1 Build 创建与初始状态写入
+### 2.1 Build.create() 当刻的状态写入（代码核准）
 
-构建请求入口在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L268-L349) 的 `create()` 方法：
+构建请求入口在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L268-L349) 的 `create()` 方法。
+
+**代码核准：Build.create() 当刻只创建 1 个 Step：ADD_TO_QUEUE**
 
 ```typescript
-// build.service.ts#L268-L311
-async create(args: CreateBuildArgs): Promise<Build> {
-  // ...
-  const build = await this.prisma.build.create({
-    ...args,
-    data: {
-      ...args.data,
-      version,
-      createdAt: new Date(),
-      status: EnumBuildStatus.Running,        // Layer 3: Build.status = Running
-      gitStatus: EnumBuildGitStatus.Waiting,   // Layer 3: Build.gitStatus = Waiting
-      entityVersions: { connect: latestEntityVersions.map(v => ({ id: v.id })) },
-      action: {
-        create: {
-          steps: {
-            create: createInitialStepData(version, args.data.message), // Layer 2: 初始 Step
-          },
+// build.service.ts#L285-L311
+const build = await this.prisma.build.create({
+  ...args,
+  data: {
+    ...args.data,
+    version,
+    createdAt: new Date(),
+    status: EnumBuildStatus.Running,        // Layer 3: Build.status = Running
+    gitStatus: EnumBuildGitStatus.Waiting,   // Layer 3: Build.gitStatus = Waiting
+    entityVersions: { connect: latestEntityVersions.map(v => ({ id: v.id })) },
+    action: {
+      create: {
+        // ⚠️ 核准：此处只调用了 1 次 createInitialStepData()
+        steps: {
+          create: createInitialStepData(version, args.data.message), // Layer 2: 仅创建 ADD_TO_QUEUE Step
         },
       },
     },
-    include: { commit: true, resource: true },
-  });
-  // ...
-  // 有私钥插件 → 先下载插件；无插件 → 直接进入 generate()
-  if (resourcePrivatePlugins.length > 0) {
-    await this.downloadPrivatePlugins(logger, build, user, resourcePrivatePlugins);
-  } else {
-    await this.generate(logger, build, user);
-  }
+  },
+  include: { commit: true, resource: true },
+});
+
+// Build 入库完成后，根据是否有私钥插件决定下一个 Step：
+if (resourcePrivatePlugins.length > 0) {
+  await this.downloadPrivatePlugins(logger, build, user, resourcePrivatePlugins); // 创建 DOWNLOAD_PRIVATE_PLUGINS Step
+} else {
+  await this.generate(logger, build, user);                                        // 创建 GENERATE_APPLICATION Step
 }
 ```
 
-### 2.2 初始 Step 创建（ADD_TO_QUEUE）
+**Build.create() 返回当刻的数据库快照**：
+| 对象 | 状态 | 说明 |
+|------|------|------|
+| Build.status | `Running` | 入库即写入 |
+| Build.gitStatus | `Waiting` | 入库即写入 |
+| ActionStep[ADD_TO_QUEUE] | `Success` | 入库即写入，创建即完成 |
+| ActionStep[DOWNLOAD_PRIVATE_PLUGINS] | 不存在 | 仅当有私钥插件时才会创建 |
+| ActionStep[GENERATE_APPLICATION] | 不存在 | `generate()` 调用时才创建 |
+| ActionStep[PUSH_TO_GIT_PROVIDER] | 不存在 | 仅代码生成成功且配置了 Git 时才创建 |
 
-`createInitialStepData()` 在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L179-L208) 中创建第一个 Step：
+### 2.2 Step 1：ADD_TO_QUEUE（Build.create 当刻唯一创建的 Step）
+
+`createInitialStepData()` 在 [build.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L179-L208) 中定义：
 
 ```typescript
 // build.service.ts#L179-L208
@@ -126,7 +136,7 @@ export function createInitialStepData(
   return {
     message: "Adding task to queue",
     name: "ADD_TO_QUEUE",
-    status: EnumActionStepStatus.Success,   // 立即标记 Success（瞬时操作）
+    status: EnumActionStepStatus.Success,   // 立即标记 Success（瞬时操作，入库即完成）
     completedAt: new Date(),
     logs: {
       create: [
@@ -139,9 +149,29 @@ export function createInitialStepData(
 }
 ```
 
-### 2.3 代码生成 Step 创建与 Kafka 入队
+> **关键核准**：ADD_TO_QUEUE 是 Build.create() 事务中唯一创建的 Step。其他 Step（DOWNLOAD_PRIVATE_PLUGINS / GENERATE_APPLICATION / PUSH_TO_GIT_PROVIDER）都是后续流程按需创建的。
 
-`generate()` 方法创建 `GENERATE_APPLICATION` Step 并发送 Kafka 消息：
+### 2.3 Step 2a/2b：后续 Step 按需创建（代码核准）
+
+Build.create() 返回后，根据是否有私钥插件，分两条路径创建下一个 Step：
+
+```
+Build.create() 返回（仅 ADD_TO_QUEUE Step 存在）
+  │
+  ├─[无私钥插件]→ generate() 被调用
+  │                 → 创建 GENERATE_APPLICATION Step（Step 2）
+  │
+  └─[有私钥插件]→ downloadPrivatePlugins() 被调用
+                    → 创建 DOWNLOAD_PRIVATE_PLUGINS Step（Step 2）
+                    → 该 Step 成功回调后再调用 generate()
+                          → 创建 GENERATE_APPLICATION Step（Step 3）
+```
+
+### 2.4 GENERATE_APPLICATION Step 创建与 Kafka 入队（generate() 被调用时）
+
+**代码核准：GENERATE_APPLICATION Step 是 `generate()` 被调用时才创建的，不是 Build.create() 当刻创建的。**
+
+`generate()` 方法中调用 `actionService.run()` 创建 `GENERATE_APPLICATION` Step 并发送 Kafka 消息：
 
 ```typescript
 // build.service.ts#L568-L618
@@ -758,7 +788,9 @@ async updateBuildStatuses(
 
 | # | 场景 | Build.status | Build.gitStatus | GENERATE Step | PUSH_TO_GIT Step | 代码来源 |
 |---|------|-------------|-----------------|---------------|------------------|---------|
-| 1 | Build 创建初始化 | `Running` | `Waiting` | `Running` | 未创建 | [L291](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L291) |
+| 1 | **Build.create() 当刻**（仅 ADD_TO_QUEUE） | `Running` | `Waiting` | **不存在** | 不存在 | [L291](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L291) |
+| 1a | 无私钥插件 → generate() 被调用 | `Running` | `Waiting` | `Running` | 不存在 | [L568](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L568) |
+| 1b | 有私钥插件 → downloadPrivatePlugins() 被调用 | `Running` | `Waiting` | 不存在 | 不存在 | [L623](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L623) |
 | 2 | 代码生成失败 | `Failed` | `Canceled` | `Failed` | 未创建 | [L529](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L529) |
 | 3 | Git 推送成功回调 | `Completed` | `Completed` | `Success` | `Success` | [L885](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L885) |
 | 4 | Git 推送成功但本地处理异常 | `Failed` | `Failed` | `Success` | `Failed` | [L905](file:///d:/fz/0601/solo-dogfeeding/code/103-amplication/packages/amplication-server/src/core/build/build.service.ts#L905) |
@@ -775,30 +807,51 @@ async updateBuildStatuses(
 ### 6.3 按阶段归类的状态流转
 
 ```
-Build 创建
-  ├── status=Running, gitStatus=Waiting (#1)
-  │   GENERATE Step=Running
-  │
-  ├─[有私钥插件]→ 下载插件
-  │     ├── 成功 → generate()
-  │     └── 失败 → status=Failed, gitStatus=Canceled (#6)
-  │
-  └─[无私钥插件]→ generate()
-        │
-        ├── DSG 执行失败 → status=Failed, gitStatus=Canceled (#2)
-        │                  GENERATE Step=Failed
-        │
-        └── DSG 执行成功（收到 CODE_GENERATION_SUCCESS_TOPIC）
-              │
-              ├── build.controller.ts 按顺序执行:
-              │     ① saveToGitProvider()
-              │     ② onCodeGenerationSuccess()
-              │
-              ├─[未配置 Git]→ status=Completed, gitStatus=NotConnected (#7)
-              │                PUSH_TO_GIT Step 不创建
-              │                GENERATE Step=Success（由 ② 标记）
-              │
-              └─[已配置 Git]→ 创建 PUSH_TO_GIT Step=Running
+┌─────────────────────────────────────────────────────────────────┐
+│  阶段 1：Build.create() 当刻（仅 ADD_TO_QUEUE Step 存在）         │
+│    status=Running, gitStatus=Waiting (#1)                         │
+│    GENERATE Step = 不存在                                          │
+│    PUSH_TO_GIT Step = 不存在                                       │
+└─────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  阶段 2：根据私钥插件分支创建下一个 Step                            │
+│                                                                   │
+│  ├─[有私钥插件]→ downloadPrivatePlugins() 被调用 (#1b)            │
+│  │     ├── 创建 DOWNLOAD_PRIVATE_PLUGINS Step=Running             │
+│  │     │    GENERATE Step = 不存在                                  │
+│  │     │                                                           │
+│  │     ├── 插件下载成功回调 → 调用 generate()                      │
+│  │     │     → 创建 GENERATE Step=Running (#1a)                   │
+│  │     │                                                           │
+│  │     └── 插件下载失败回调 → status=Failed, gitStatus=Canceled (#6)
+│  │           GENERATE Step = 不存在（从未创建）                     │
+│  │                                                                 │
+│  └─[无私钥插件]→ generate() 被调用 (#1a)                          │
+│        → 创建 GENERATE Step=Running                                │
+└─────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+        generate() → 发送 CODE_GENERATION_REQUEST_TOPIC
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  阶段 3：DSG 代码生成                                              │
+│                                                                   │
+│  ├── DSG 执行失败回调 → status=Failed, gitStatus=Canceled (#2)    │
+│  │     GENERATE Step=Failed                                        │
+│  │                                                                 │
+│  └── DSG 执行成功（收到 CODE_GENERATION_SUCCESS_TOPIC）            │
+│        build.controller.ts 按顺序执行:                               │
+│          ① saveToGitProvider()                                    │
+│          ② onCodeGenerationSuccess()                              │
+│                                                                   │
+│        ├─[未配置 Git]→ status=Completed, gitStatus=NotConnected (#7)
+│        │                PUSH_TO_GIT Step 不创建                     │
+│        │                GENERATE Step=Success（由 ② 标记）         │
+│        │                                                           │
+│        └─[已配置 Git]→ 创建 PUSH_TO_GIT Step=Running               │
                     │
                     ├── CREATE_PR_REQUEST Kafka 发送失败（内部吞异常）
                     │     │ saveToGitProvider() 正常返回
@@ -826,19 +879,26 @@ Build 创建
 ```
 
 > **关键分类**：
-> - **正常完成类**：场景 #1（初始）、#2、#3、#6、#7 — 两个 Step 状态一致，Build 状态明确
+> - **初始状态类**：场景 #1、#1a、#1b — Build.create 后按是否有私钥插件进入不同分支，Step 按需创建
+> - **正常完成类**：场景 #2、#3、#6、#7 — 所有已存在的 Step 状态一致，Build 状态明确
 > - **挂起类（状态不一致）**：场景 #8 — GENERATE Step=Success 但 PUSH_TO_GIT Step=Running，Build.status 保持 Running
 > - **兜底类**：场景 #9、#10、#11 — Stale 或 calcBuildStatus 触发，修正 Build 状态但不修正 Step 状态
 
-### 6.4 Step 状态汇总（完成 vs 挂起归类）
+### 6.4 Step 状态汇总（按创建时机 + 完成/挂起归类）
 
-| Step Name | 创建时机 | 正常完成时机 | 可能状态 | 挂起风险 |
-|-----------|---------|-------------|---------|---------|
-| ADD_TO_QUEUE | Build.create() | 创建即完成（瞬时操作） | Success（唯一） | ❌ 无挂起风险 |
-| DOWNLOAD_PRIVATE_PLUGINS | 有私钥插件时 | 插件下载成功/失败 Kafka 回调 | Success / Failed | ❌ 无挂起风险（异常会向外抛） |
-| **GENERATE_APPLICATION** | generate() | CODE_GENERATION_SUCCESS / FAILURE Kafka 回调 → `onCodeGenerationSuccess()` / `onCodeGenerationFailure()` | **Success / Failed** | ✅ **不会挂起**（CREATE_PR_REQUEST 发送失败后仍会由 `build.controller.ts` 正常完成） |
-| **PUSH_TO_GIT_PROVIDER** | saveToGitProvider()（有 Git 配置时） | CREATE_PR_SUCCESS / FAILURE Kafka 回调 → `onCreatePRSuccess()` / `onCreatePRFailure()` | Success / Failed / **Running** | ⚠️ **唯一会挂起的 Step**（CREATE_PR_REQUEST 发送失败时异常被内部吞，配合 `leaveStepOpen=true` 永久停留在 Running） |
+**代码核准：4 个 Step 的创建时机严格按流程递进，不存在一次性全部创建的情况。**
 
+| Step Name | 编号 | 创建时机 | 正常完成时机 | 可能状态 | 挂起风险 |
+|-----------|------|---------|-------------|---------|---------|
+| ADD_TO_QUEUE | Step 1 | **Build.create() 事务内** | 创建即完成（瞬时操作，入库即 Success） | Success（唯一） | ❌ 无挂起风险 |
+| DOWNLOAD_PRIVATE_PLUGINS | Step 2（可选） | **downloadPrivatePlugins() 被调用时**（有私钥插件才创建） | 插件下载成功/失败 Kafka 回调 | Success / Failed | ❌ 无挂起风险（异常会向外抛） |
+| **GENERATE_APPLICATION** | Step 2 或 3 | **generate() 被调用时**（无私钥插件 = Step 2；有私钥插件且下载成功 = Step 3） | CODE_GENERATION_SUCCESS / FAILURE Kafka 回调 → `onCodeGenerationSuccess()` / `onCodeGenerationFailure()` | **Success / Failed** | ✅ **不会挂起**（CREATE_PR_REQUEST 发送失败后仍会由 `build.controller.ts` 第 ② 步正常完成） |
+| **PUSH_TO_GIT_PROVIDER** | Step 3 或 4（可选） | **saveToGitProvider() 被调用时**（代码生成成功且有 Git 配置才创建） | CREATE_PR_SUCCESS / FAILURE Kafka 回调 → `onCreatePRSuccess()` / `onCreatePRFailure()` | Success / Failed / **Running** | ⚠️ **唯一会挂起的 Step**（CREATE_PR_REQUEST 发送失败时异常被内部吞，配合 `leaveStepOpen=true` 永久停留在 Running） |
+
+> **Step 编号说明**：
+> - 最简路径（无私钥插件 + 无 Git）：Step 1 ADD_TO_QUEUE → Step 2 GENERATE_APPLICATION → 完成
+> - 完整路径（有私钥插件 + 有 Git）：Step 1 ADD_TO_QUEUE → Step 2 DOWNLOAD_PRIVATE_PLUGINS → Step 3 GENERATE_APPLICATION → Step 4 PUSH_TO_GIT_PROVIDER → 完成
+>
 > **关键区别解释**：
 > - GENERATE_APPLICATION Step 的完成由 `build.controller.ts` 中 `onCodeGenerationSuccess()` 消息处理函数的第 ② 步触发，与 `saveToGitProvider()` 的内部异常无关（只要 saveToGitProvider 正常返回，第 ② 步就一定会执行）
 > - PUSH_TO_GIT_PROVIDER Step 的完成完全依赖未来的 CREATE_PR_SUCCESS / FAILURE Kafka 回调。如果 CREATE_PR_REQUEST 根本没发出去（被内部吞异常），就永远不会有回调，Step 永远 Running。
@@ -972,9 +1032,14 @@ onCodeGenerationFailure() 服务端   ❌（依赖上游去重）
      │              │ DB: Build.create()           │             │               │
      │              │ status=Running, gitStatus=Waiting           │               │
      │              │ Step: ADD_TO_QUEUE=Success  │             │               │
-     │              │ Step: GENERATE_APPLICATION=Running        │               │
-     │              │ save DSGResourceData to FS  │             │               │
-     │              │ emit CODE_GENERATION_REQUEST─────────────>│               │
+     │              │   ⚠️ GENERATE Step 此时尚未创建              │               │
+     │              │              │              │             │               │
+     │              │ 分支判断：是否有私钥插件？    │             │               │
+     │              │  ├─ 有私钥插件 → 创建 DOWNLOAD Step         │               │
+     │              │  └─ 无私钥插件 → generate()                 │               │
+     │              │       → 创建 GENERATE Step=Running         │               │
+     │              │       → save DSGResourceData to FS         │               │
+     │              │       → emit CODE_GENERATION_REQUEST ─────────────────────>│
      │              │              │<──consume─────│             │               │
      │              │              │ read DSGResourceData from FS               │
      │              │              │ split Jobs: Server + AdminUI               │
@@ -1025,10 +1090,19 @@ onCodeGenerationFailure() 服务端   ❌（依赖上游去重）
 
 ## 九、关键设计要点（代码核准版）
 
-### 9.1 三层状态隔离设计
+### 9.1 三层状态隔离设计 + Step 递进创建
 - **Layer 1 Redis**：细粒度子 Job 状态，毫秒级聚合判断，无需查库
-- **Layer 2 ActionStep**：面向用户的步骤进度，每个 Step 独立生命周期和日志
-- **Layer 3 Build**：双轴最终状态，对外 API 展示
+- **Layer 2 ActionStep**：面向用户的步骤进度，每个 Step 独立生命周期和日志。**代码核准：4 个 Step 严格按流程递进创建，不存在 Build.create() 时一次性全部创建的情况**（详见 §6.4）。
+- **Layer 3 Build**：双轴最终状态（status + gitStatus），对外 API 展示
+
+**Step 递进创建顺序**（最简路径 vs 完整路径）：
+```
+最简路径（无私钥插件 + 无 Git）：
+  Step 1 ADD_TO_QUEUE → Step 2 GENERATE_APPLICATION → 完成
+
+完整路径（有私钥插件 + 有 Git）：
+  Step 1 ADD_TO_QUEUE → Step 2 DOWNLOAD_PRIVATE_PLUGINS → Step 3 GENERATE_APPLICATION → Step 4 PUSH_TO_GIT_PROVIDER → 完成
+```
 
 ### 9.2 异步 Step 的 leaveStepOpen 模式
 `actionService.run()` 的 `leaveStepOpenAfterSuccessfulExecution=true` 参数使 Step 在同步回调返回后仍保持 Running，等待未来的 Kafka 事件最终完成。这是长时间异步任务的标准处理模式。
