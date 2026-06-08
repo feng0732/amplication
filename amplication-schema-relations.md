@@ -22,34 +22,67 @@ Amplication 通过 `Lookup` 数据类型（`EnumDataType.Lookup`）统一表达�
 
 | 本端 allowMultipleSelection | 对端 allowMultipleSelection | 关系类型 |
 |---------------------------|---------------------------|---------|
-| false | false | **One-to-One**（一对一） |
+| false | false | **One-to-One**（严格一对一） |
 | false | true | **Many-to-One**（多对一，本端为"多"侧） |
 | true | false | **One-to-Many**（一对多，本端为"一"侧） |
 | true | true | **Many-to-Many**（多对多） |
 
-判定工具函数位于 [field.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/field/field.ts#L34-L73)：
+---
+
+## 二、to-One 判定的代码实现与命名歧义
+
+### ⚠️ 重要差异：`isOneToOneRelationField` 名不副实
+
+**之前可能的误解**：以为 `isOneToOneRelationField` 会同时检查两端的 `allowMultipleSelection` 来判定严格的 One-to-One。
+
+**代码实际情况**（[field.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/field/field.ts#L34-L42)）：
 
 ```typescript
-export const isRelationField = (field: EntityField) =>
-  field.dataType === EnumDataType.Lookup;
+export function isOneToOneRelationField(
+  field: EntityField
+): field is EntityLookupField {
+  if (!isRelationField(field)) {
+    return false;
+  }
+  const properties = field.properties as types.Lookup;
+  return !properties.allowMultipleSelection;  // ← 只检查本端！不检查对端！
+}
 
-export const isOneToOneRelationField = (field: EntityLookupField) =>
-  !field.properties.allowMultipleSelection &&
-  !field.properties.relatedField.properties.allowMultipleSelection;
-
-export const isToManyRelationField = (field: EntityLookupField) =>
-  field.properties.allowMultipleSelection;
+export function isToManyRelationField(
+  field: EntityField
+): field is EntityLookupField {
+  return isRelationField(field) && !isOneToOneRelationField(field);
+}
 ```
+
+### 2.1 正确的语义理解
+
+| 函数名 | 实际语义 | 包含的关系类型 |
+|--------|---------|-------------|
+| `isOneToOneRelationField(field)` | **to-One 判定**（本端是单值） | 严格 One-to-One + Many-to-One（"多"侧） |
+| `isToManyRelationField(field)` | **to-Many 判定**（本端是集合） | One-to-Many（"一"侧） + Many-to-Many |
+
+### 2.2 严格 One-to-One 判定仅用于外键策略
+
+真正需要同时检查两端的严格 One-to-One 判定，只在 [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts#L229-L241) 的外键持有方判定中内联实现：
+
+```typescript
+const isOneToOne =
+  !fieldProperties.allowMultipleSelection &&
+  !relatedFieldProperties.allowMultipleSelection;  // ← 同时检查两端
+```
+
+这个严格判定并未抽成独立的工具函数。
 
 ---
 
-## 二、外键策略（Foreign Key Strategy）
+## 三、外键策略（Foreign Key Strategy）
 
-### 2.1 外键持有方判定
+### 3.1 外键持有方判定
 
 在一对一关系中，只能有一侧持有外键列。Amplication 通过以下优先级判定哪一侧不生成外键（`isOneToOneWithoutForeignKey = true`）。
 
-核心逻辑位于 [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts#L185-L261)：
+核心逻辑位于 [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts#L229-L250)：
 
 ```typescript
 const isOneToOne =
@@ -74,40 +107,41 @@ else {
 
 | 条件 | 当前字段是否持有外键 |
 |------|------------------|
-| 非 One-to-One 关系 | 是（多对一中的"多"侧总是持有外键） |
-| One-to-One + 指定了 fkHolder = 当前字段 ID | 是 |
-| One-to-One + 指定了 fkHolder = 对方字段 ID | 否 |
-| One-to-One + 未指定 fkHolder + 当前 permanentId < 对方 | 是 |
-| One-to-One + 未指定 fkHolder + 当前 permanentId > 对方 | 否 |
+| 非严格 One-to-One 关系 | to-One 侧（Many-to-One 的"多"端）总是持有外键 |
+| 严格 One-to-One + 指定了 fkHolder = 当前字段 ID | 是 |
+| 严格 One-to-One + 指定了 fkHolder = 对方字段 ID | 否 |
+| 严格 One-to-One + 未指定 fkHolder + 当前 permanentId < 对方 | 是 |
+| 严格 One-to-One + 未指定 fkHolder + 当前 permanentId > 对方 | 否 |
 
-### 2.2 外键字段名
+### 3.2 外键字段名
 
 外键列名由 `fkFieldName` 属性控制，默认规则：
-- 若用户未显式指定：自动生成 `${fieldName}Id`
+- 若用户未显式指定：自动生成 `${field.name}Id`
 - 若用户显式指定：使用用户指定的名称
 
 ---
 
-## 三、Prisma Schema 生成规则
+## 四、Prisma Schema 生成规则
 
 Lookup 字段转换为 Prisma Schema 的核心逻辑位于 [create-prisma-schema-fields.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts#L280-L366)。
 
-### 3.1 三种生成场景
+### 4.1 三种生成场景
 
-#### 场景 A：Many-to-Many 或 无外键的 One-to-One
+#### 场景 A：to-Many 或 无外键的严格 One-to-One
 
 仅生成 Prisma 对象引用字段，不生成外键列：
 
 ```prisma
-// 例：One-to-Many 的"一"侧 或 Many-to-Many
-fieldName RelatedEntity @relation("RelationName")
+fieldName RelatedEntity[]  // to-Many
+// 或
+fieldName RelatedEntity?   // 无外键的 One-to-One
 ```
 
 条件：
-- `isToManyRelationField(field)`（多对多/一对多的"多"侧反向），或
-- `isOneToOneWithoutForeignKey === true`（一对一的无外键侧）
+- `isToManyRelationField(field)`（to-Many），或
+- `isOneToOneWithoutForeignKey === true`（严格一对一的无外键侧）
 
-#### 场景 B：持有外键的 One-to-One
+#### 场景 B：持有外键的严格 One-to-One
 
 生成对象字段 + 标量外键字段 + `@unique` 约束：
 
@@ -116,7 +150,7 @@ fieldName   RelatedEntity @relation("RelationName", fields: [fieldNameId], refer
 fieldNameId String        @unique // 一对一外键必须唯一
 ```
 
-#### 场景 C：Many-to-One（持有外键的"多"侧）
+#### 场景 C：Many-to-One（to-One 的"多"侧，持有外键）
 
 生成对象字段 + 标量外键字段（无 `@unique`，因为多对一允许多条记录指向同一实体）：
 
@@ -125,163 +159,358 @@ fieldName   RelatedEntity @relation("RelationName", fields: [fieldNameId], refer
 fieldNameId String
 ```
 
-### 3.2 Prisma 关系命名
+### 4.2 Prisma 关系命名
 
 Prisma 的 `@relation("RelationName")` 名称由两端字段的唯一标识组合生成，确保双向关系正确配对。
 
 ---
 
-## 四、关系对代码生成结构的影响
+## 五、嵌套 DTO 操作的实际生成逻辑
 
-### 4.1 DTO 层生成
+### ⚠️ 重要差异：枚举定义 ≠ 实际生成
 
-#### 4.1.1 嵌套输入 DTO 操作选项
+**之前可能的误解**：以为 `Create`、`Connect`、`ConnectOrCreate`、`Disconnect`、`Set` 五种操作都会生成。
 
-定义于 [create-nested-input-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts#L20-L26)：
+**代码实际情况**：枚举中虽然定义了 5 种，但**实际只生成了 3 种**，且 to-One 和 to-Many 的处理方式完全不同。
+
+### 5.1 枚举定义（仅为语义声明）
+
+位于 [create-nested-input-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts#L20-L26)：
 
 ```typescript
-export const NestedInputOperation = {
-  Create: 1 << 0,           // 嵌套创建
-  Connect: 1 << 1,          // 通过 ID 关联已有实体
-  ConnectOrCreate: 1 << 2,  // 关联或创建
-  Disconnect: 1 << 3,       // 解除关联（不删除目标实体）
-  Set: 1 << 4,              // 替换整个关联集合
-} as const;
+export enum NestedMutationOptions {
+  "Create" = "create",
+  "Connect" = "connect",
+  "ConnectOrCreate" = "connectOrCreate",
+  "Disconnect" = "disconnect",
+  "Set" = "set",
+}
 ```
 
-**toOne vs toMany 的 DTO 差异：**
+### 5.2 to-Many 嵌套 DTO 的实际生成
 
-| 操作 | toOne（单值关联） | toMany（集合关联） |
-|-----|------------------|------------------|
-| CreateNestedInput | `CreateNestedOneWithout...Input` | `CreateNestedManyWithout...Input` |
-| UpdateNestedInput | `UpdateNestedOneWithout...Input` | `UpdateManyWithout...Input` |
-| 可用操作 | Connect / Disconnect / Create / ConnectOrCreate | Connect / Disconnect / Create / ConnectOrCreate / Set |
+核心逻辑位于 [create-nested-input-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts#L44-L97)：
 
-DTO 生成的默认策略见 [dto-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/lib/dto-util.ts#L111-L137) 中的 `getDefaultDtosForRelatedEntity()`。
+```typescript
+function createNestedManyProperties(...): namedTypes.ClassProperty[] {
+  // ...
+  const mutationOptionsObjectProperties: namedTypes.ClassProperty[] = [
+    createProperty, // ← 始终包含 Connect
+  ];
+  // ↓ 只有 Update 场景的 toMany 才额外添加 Disconnect 和 Set
+  if (dtoType === EntityDtoTypeEnum.RelationUpdateManyWithoutSourceInput) {
+    mutationOptionsObjectProperties.push(disconnectProperty);
+    mutationOptionsObjectProperties.push(setProperty);
+  }
+  return mutationOptionsObjectProperties;
+}
+```
 
-### 4.2 Service 层生成
+**to-Many 实际生成矩阵：**
 
-Service 方法生成逻辑位于 [create-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/service/create-service.ts)。
+| DTO 类型 | 生成的操作 | 对应类名 |
+|---------|----------|---------|
+| `RelationCreateNestedManyWithoutSourceInput` | **仅 Connect** | `XxxCreateNestedManyWithoutYyyInput` |
+| `RelationUpdateManyWithoutSourceInput` | Connect + Disconnect + Set | `XxxUpdateManyWithoutYyyInput` |
 
-**toOne 关系（Parent 侧）：**
-- `getParent()`：获取关联的父实体
+> ❌ **Create 和 ConnectOrCreate 在当前代码中从未实际生成！**
 
-**toMany 关系（Children 侧）：**
-- `getChildren()`：分页获取子实体列表
-- `findChild()`：按 ID 查找特定子实体
-- `connectChild()` / `disconnectChild()`：关联/解除关联子实体
-- `updateChild()`：更新子实体
+### 5.3 to-One 关系的 DTO 处理
 
-API 端点生成由 [entity-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/lib/entity-util.ts) 的 `getDefaultActionsForRelationField()` 控制。
+**⚠️ 关键发现：to-One 关系不生成独立的嵌套 DTO 类！**
 
-### 4.3 ModuleAction 与 ModuleDto 自动同步
+位于 [create-field-class-property.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/create-field-class-property.ts#L479-L485)：
 
-在创建 Lookup 字段时，除了创建字段本身，还会同步创建对应的权限和 DTO。核心流程位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L2625-L2778) 的 `createField()`：
+```typescript
+if (isQuery || isEntityInputExceptRelationInput(dtoType) || isNestedInput) {
+  // to-One 的 CreateInput / UpdateInput 直接使用 WhereUniqueInput
+  return [builders.tsTypeReference(createWhereUniqueInputID(prismaField.type))];
+}
+```
 
-1. 创建本端 Lookup 字段
-2. 自动创建反向关联字段（调用 `createRelatedField()`）
-3. 为两端字段分别创建 ModuleAction（API 端点权限）
-4. 为两端字段分别创建 ModuleDto（输入/输出 DTO 配置）
+**to-One 的 DTO 行为：**
+
+| DTO 类型 | 生成的类型 | 实际效果 |
+|---------|----------|---------|
+| `CreateInput` | `XxxWhereUniqueInput` | 只有 `{ id: string }`，即仅支持 Connect 通过 ID |
+| `UpdateInput` | `XxxWhereUniqueInput` | 同上，仅支持 Connect 通过 ID |
+| 实体 ObjectType | `Xxx` | 完整实体对象类型 |
+
+> to-One 关系不支持 Disconnect、Create 等嵌套操作，只能通过 ID 关联或直接传 null。
+
+### 5.4 to-Many vs to-One DTO 差异汇总
+
+| 维度 | to-Many（isToManyRelationField） | to-One（isOneToOneRelationField） |
+|-----|--------------------------------|--------------------------------|
+| 是否生成独立嵌套 DTO 类 | ✅ 是 | ❌ 否，直接用 WhereUniqueInput |
+| Create 场景 | `CreateNestedManyWithout` 类，仅含 `connect` | `WhereUniqueInput`，仅含 `id` |
+| Update 场景 | `UpdateManyWithout` 类，含 `connect`/`disconnect`/`set` | `WhereUniqueInput`，仅含 `id` |
+| 支持的嵌套操作 | Connect、Disconnect、Set | Connect（通过 ID）或 null |
 
 ---
 
-## 五、删除语义与级联行为
+## 六、字段删除策略的完整实现
 
-### 5.1 关联字段删除策略
-
-定义于 [EnumRelatedFieldStrategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/EnumRelatedFieldStrategy.ts)：
-
-| 策略值 | 行为 |
-|-------|------|
-| `Delete` | 删除本端字段时，**级联删除**对端的关联字段 |
-| `UpdateToScalar` | 删除本端字段时，将对端关联字段**转换为标量字段**（保留数据列） |
-
-核心实现位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3119-L3257) 的 `deleteField()`：
+删除策略枚举定义于 [EnumRelatedFieldStrategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/EnumRelatedFieldStrategy.ts)：
 
 ```typescript
-async deleteField(
-  fieldId: string,
-  relatedFieldStrategy: EnumRelatedFieldStrategy,
-  ...
-) {
-  // ...
-  if (isRelationField(field)) {
-    const relatedField = await this.fieldService.findById(
-      field.properties.relatedFieldId
-    );
-    if (relatedField) {
-      switch (relatedFieldStrategy) {
-        case EnumRelatedFieldStrategy.Delete:
-          // 级联删除对端字段（包括其 ModuleAction 和 ModuleDto）
-          await this.deleteRelatedField(field, ...);
-          break;
-        case EnumRelatedFieldStrategy.UpdateToScalar:
-          // 将对端 Lookup 字段转换为标量字段（如 String）
-          await this.updateRelatedFieldToScalar(field, ...);
-          break;
+export enum EnumRelatedFieldStrategy {
+  Delete = "Delete",
+  UpdateToScalar = "UpdateToScalar",
+}
+```
+
+### 6.1 策略一：Delete（级联删除关联字段）
+
+核心逻辑位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3149-L3166)：
+
+```typescript
+if (field.dataType === EnumDataType.Lookup) {
+  const properties = field.properties as unknown as types.Lookup;
+  if (fieldStrategy === EnumRelatedFieldStrategy.Delete) {
+    try {
+      await this.deleteRelatedField(
+        properties.relatedFieldId,   // 对端字段 ID
+        properties.relatedEntityId,  // 对端实体 ID
+        user
+      );
+    } catch (error) {
+      // ⚠️ 容错：对端字段删除失败不阻塞本端删除
+      this.logger.error("Continue with FieldDelete even though...", error);
+    }
+  }
+}
+```
+
+`deleteRelatedField()` 额外做的清理工作（[entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L2849-L2898)）：
+- 删除对端 EntityField 记录
+- 同步删除对端关联的 `ModuleAction`（API 端点权限）
+- 同步删除对端关联的 `ModuleDto`（DTO 配置）
+
+### 6.2 策略二：UpdateToScalar（转换为标量字段）
+
+核心逻辑位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3167-L3198)：
+
+```typescript
+} else if (fieldStrategy === EnumRelatedFieldStrategy.UpdateToScalar) {
+  const allowMultipleSelection = properties.allowMultipleSelection;
+
+  // to-Many → Json；to-One → 关联实体 ID 的标量类型（通常是 String）
+  field.dataType = allowMultipleSelection
+    ? EnumDataType.Json
+    : await this.getRelatedFieldScalarTypeByRelatedEntityIdType(properties.relatedEntityId);
+
+  const data: EntityFieldUpdateInput = {
+    dataType: field.dataType,
+    // to-Many → 字段名不变；to-One → 自动加 Id 后缀
+    name: allowMultipleSelection ? field.name : `${field.name}Id`,
+    displayName: allowMultipleSelection ? field.displayName : `${field.displayName} ID`,
+    properties: DATA_TYPE_TO_DEFAULT_PROPERTIES[field.dataType],
+  };
+
+  await this.updateField({ data, where: { id: args.where.id } }, user);
+  return;  // ← 注意：策略二直接 return，不再执行后续的物理删除
+}
+```
+
+**UpdateToScalar 的字段转换规则：**
+
+| 原字段类型 | 转换后 dataType | 字段名变化 | 说明 |
+|----------|----------------|----------|------|
+| to-Many Lookup | `Json` | 不变 | 因为多值关系无法用简单标量表示 |
+| to-One Lookup | 关联实体 ID 的类型（通常 String） | `${name}Id` | 保留外键列作为普通标量字段 |
+
+> 注意：`UpdateToScalar` 是对**本端字段**进行转换，不对对端字段做任何修改。
+
+---
+
+## 七、实体删除：软删除机制
+
+### ⚠️ 重要发现：实体删除不是物理删除，而是软删除
+
+核心实现位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L941-L1024)：
+
+```typescript
+async deleteOneEntity(
+  args: DeleteOneEntityArgs,
+  user: User,
+  fieldStrategy = EnumRelatedFieldStrategy.Delete
+): Promise<Entity | null> {
+  return await this.useLocking(args.where.id, user, async (entity) => {
+    // 步骤1：找出所有引用该实体的 Lookup 字段并级联处理
+    const relatedEntityFields = await this.prisma.entityField.findMany({
+      where: {
+        dataType: EnumDataType.Lookup,
+        properties: { path: ["relatedEntityId"], equals: args.where.id },
+        entityVersion: { versionNumber: CURRENT_VERSION_NUMBER },
+      },
+    });
+    // ... 鉴权检查（auth 实体不可删除）...
+    for (const relatedEntityField of relatedEntityFields) {
+      await this.deleteField(
+        { where: { id: relatedEntityField.id } },
+        user,
+        fieldStrategy  // 对每个引用字段应用相同的删除策略
+      );
+    }
+
+    // 步骤2：删除该实体的默认 Module（含权限、DTO 配置）
+    await this.moduleService.deleteDefaultModuleForEntity(...);
+
+    // ⬇️ 步骤3：软删除（update，不是 delete！）
+    return this.prisma.entity.update({
+      where: args.where,
+      data: {
+        // 名称加前缀避免名称冲突，方便恢复
+        name: prepareDeletedItemName(entity.name, entity.id),
+        displayName: prepareDeletedItemName(entity.displayName, entity.id),
+        pluralDisplayName: prepareDeletedItemName(entity.pluralDisplayName, entity.id),
+        deletedAt: new Date(),  // ← 软删除标记
+        versions: {
+          update: {
+            where: { entityId_versionNumber: { ... } },
+            data: { deleted: true },  // ← 当前版本也标记删除
+          },
+        },
+      },
+    });
+  });
+}
+```
+
+### 7.1 软删除工具函数
+
+位于 [softDelete.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/util/softDelete.ts)：
+
+```typescript
+export function prepareDeletedItemName(currentValue: string, id: string): string {
+  return `__${id}_${currentValue}`;  // 例：__ent_abc123_User
+}
+
+export function revertDeletedItemName(currentValue: string, id: string): string {
+  return currentValue.replace(`__${id}_`, "");
+}
+```
+
+### 7.2 软删除的完整流程
+
+```
+用户触发 deleteOneEntity
+        │
+        ▼
+  1. 查找所有 relatedEntityId = 本实体 ID 的 Lookup 字段
+        │
+        ▼
+  2. 对每个引用字段执行 deleteField()（使用相同的 fieldStrategy）
+        │
+        ▼
+  3. 删除该实体的默认 Module（ModuleAction + ModuleDto）
+        │
+        ▼
+  4. prisma.entity.update() —— 软删除
+     ├─ name → __${id}_${name}  （避免名称唯一约束冲突）
+     ├─ displayName → __${id}_${displayName}
+     ├─ pluralDisplayName → __${id}_${pluralDisplayName}
+     ├─ deletedAt → new Date()   （软删除标记）
+     └─ versions[CURRENT].deleted → true
+```
+
+### 7.3 查询时的软删除过滤
+
+所有实体查询都会自动带上 `deletedAt: null` 条件（从测试用例可见，如 [entity.service.spec.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.spec.ts#L633)）：
+
+```typescript
+prisma.entity.findFirst({
+  where: {
+    id: ...,
+    deletedAt: null,  // ← 自动过滤已软删除的实体
+  },
+});
+```
+
+---
+
+## 八、实体关系 vs Blueprint 级联构建：两种完全独立的机制
+
+### ⚠️ 关键区分：完全不是同一套机制
+
+| 维度 | 实体关系（Entity Relation） | Blueprint 级联构建 |
+|------|--------------------------|------------------|
+| **作用对象** | Entity（数据模型实体） | Resource（服务、项目资源） |
+| **表达载体** | EntityField（Lookup 类型字段） | Relation Block + `ResourceRelationCache` 表 |
+| **核心数据** | `relatedEntityId`、`relatedFieldId`、`allowMultipleSelection`、`fkHolder` | `relationKey`、`relatedResources[]`、`parentShouldBuildWithChild` |
+| **影响范围** | 代码生成（Prisma Schema、DTO、Service、Controller） | 构建触发顺序 |
+| **级联语义** | 删除字段/实体时的联动处理 | 子资源构建时父资源也跟着构建 |
+| **核心代码** | [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts)、[prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts) | [relation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/relation/relation.service.ts) |
+
+### 8.1 Blueprint 级联构建机制
+
+核心实现位于 [relation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/relation/relation.service.ts#L219-L270)，使用 BFS 广度优先搜索：
+
+```typescript
+async getCascadingBuildableResourceIds(resourceIds: string[]): Promise<string[]> {
+  const visited = new Set<string>(resourceIds);
+  let queue = [...resourceIds];
+
+  while (queue.length > 0) {
+    const currentBatch = queue;
+    queue = [];
+    const newParents = await this.getBuildableParents(currentBatch);
+    // ↑ 查询 ResourceRelationCache 中
+    //   parentShouldBuildWithChild = true 且 childResourceId 在 currentBatch 中的记录
+    for (const parent of newParents) {
+      if (!visited.has(parent.parentResourceId)) {
+        visited.add(parent.parentResourceId);
+        queue.push(parent.parentResourceId);
       }
     }
   }
-  // 最后删除本端字段
-  await this.fieldService.delete(fieldId);
+  return Array.from(visited);
 }
 ```
 
-### 5.2 删除实体时的级联处理
+**级联构建的触发条件：**
+- Blueprint 中定义了关系 `parentShouldBuildWithChild: true`
+- 子资源（child）触发了构建
+- 自动将所有可达的父资源（parent）也加入构建队列
 
-位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L941) 的 `deleteOneEntity()`：
+### 8.2 两者对比图
 
-1. 查询所有引用该实体的 Lookup 字段（通过 `relatedEntityId` 匹配）
-2. 对每个引用字段执行级联策略（默认 `Delete`）
-3. 删除该实体自身的所有字段、ModuleAction、ModuleDto
-4. 最后删除实体记录
-
-### 5.3 数据库层面的级联
-
-**注意**：Amplication 生成的 Prisma Schema 默认**不包含** `onDelete: Cascade` 数据库级级联。删除语义主要在应用层（Service/Controller）控制，数据库外键默认使用 `ON DELETE RESTRICT` 或 Prisma 的默认行为。
-
-如需数据库级级联，需要在生成后手动修改 Prisma Schema 或通过自定义代码实现。
-
----
-
-## 六、Blueprint 级联构建
-
-除了实体间的数据关系，Amplication 在 Blueprint 资源层面还有**级联构建**机制。
-
-位于 [relation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/relation/relation.service.ts#L236-L270) 的 `getCascadingBuildableResourceIds()`：
-
-```typescript
-async getCascadingBuildableResourceIds(resourceId: string): Promise<string[]> {
-  // 使用 BFS 广度优先搜索
-  // 遍历所有 parentShouldBuildWithChild = true 的关系
-  // 收集所有需要随当前资源一起构建的父资源 ID
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Amplication 平台                           │
+├─────────────────────────────┬───────────────────────────────┤
+│     实体关系（数据层）        │   Blueprint 关系（资源层）     │
+├─────────────────────────────┼───────────────────────────────┤
+│ Entity A ──Lookup──▶ Entity B│  Resource A ◀───Relation──▶ Resource B │
+│  - 生成 Prisma @relation     │  - 仅控制构建顺序              │
+│  - 生成嵌套 DTO              │  - parentShouldBuildWithChild  │
+│  - 生成 Service 方法         │  - BFS 级联触发构建            │
+│  - 删除级联（Delete/ToScalar）│  - 与数据模型完全无关          │
+└─────────────────────────────┴───────────────────────────────┘
 ```
 
-**级联构建规则：**
-- 当资源 A 修改触发构建时，若资源 B 与 A 存在 `parentShouldBuildWithChild = true` 的关系，则 B 也会被构建
-- 支持多层级联（B 的父资源 C 也会被构建，以此类推）
-- 使用 BFS 算法避免循环依赖
-
 ---
 
-## 七、完整关系定义示例
+## 九、完整示例
 
-### 7.1 示例：User ↔ Post（一对多）
+### 9.1 示例：User ↔ Post（一对多）
 
 **配置：**
 - User 实体字段：`posts` (Lookup, allowMultipleSelection=true, relatedEntity=Post)
 - Post 实体字段：`author` (Lookup, allowMultipleSelection=false, relatedEntity=User)
 
+**判定：**
+- `posts`: `isToManyRelationField` → to-Many
+- `author`: `isOneToOneRelationField` → to-One（注意：函数名是 isOneToOne 但实际是 to-One）
+
 **生成的 Prisma Schema：**
 ```prisma
-// User 模型（一"侧，无外键）
 model User {
   id    String @id @default(cuid())
   posts Post[]
 }
 
-// Post 模型（"多"侧，持有外键）
 model Post {
   id       String @id @default(cuid())
   author   User   @relation(fields: [authorId], references: [id])
@@ -289,20 +518,23 @@ model Post {
 }
 ```
 
-**生成的 DTO 片段：**
+**生成的 DTO：**
 ```typescript
-// Post 创建时的嵌套输入
-class CreatePostInput {
-  author?: CreateNestedOneWithoutPostsInput; // Connect/Create/ConnectOrCreate
+// User CreateInput：to-Many → 独立嵌套 DTO，仅含 connect
+class CreateUserInput {
+  posts?: PostCreateNestedManyWithoutAuthorInput;
+}
+class PostCreateNestedManyWithoutAuthorInput {
+  connect?: PostWhereUniqueInput[];  // ← 仅 Connect！
 }
 
-// User 创建时的嵌套输入
-class CreateUserInput {
-  posts?: CreateNestedManyWithoutAuthorInput; // Connect/Create/ConnectOrCreate/Set
+// Post CreateInput：to-One → 直接用 WhereUniqueInput
+class CreatePostInput {
+  author?: UserWhereUniqueInput;  // 即 { id?: string }
 }
 ```
 
-### 7.2 示例：User ↔ Profile（一对一，User 持有外键）
+### 9.2 示例：User ↔ Profile（一对一，User 持有外键）
 
 **配置：**
 - User 实体字段：`profile` (Lookup, allowMultipleSelection=false, fkHolder=user.profile.fieldId)
@@ -310,14 +542,12 @@ class CreateUserInput {
 
 **生成的 Prisma Schema：**
 ```prisma
-// User 模型（持有外键侧）
 model User {
   id        String  @id @default(cuid())
   profile   Profile @relation(fields: [profileId], references: [id])
-  profileId String  @unique // 一对一外键必须唯一
+  profileId String  @unique
 }
 
-// Profile 模型（无外键侧）
 model Profile {
   id   String @id @default(cuid())
   user User?
@@ -326,19 +556,35 @@ model Profile {
 
 ---
 
-## 八、关键文件速查表
+## 十、关键文件速查表
 
 | 文件 | 职责 |
 |------|------|
 | [lookup.json](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/code-gen-types/src/schemas/lookup.json) | Lookup 字段属性 JSON Schema |
 | [code-gen-types.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/code-gen-types/src/code-gen-types.ts#L98-L106) | `LookupResolvedProperties`、`EntityLookupField` 类型定义 |
-| [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts#L185-L261) | 关系字段解析、外键持有方判定、fkFieldName 默认值 |
-| [field.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/field/field.ts) | 关系类型判定工具函数 |
+| [field.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/field/field.ts) | **to-One/to-Many 判定函数**（注意命名歧义） |
+| [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/prepare-context.ts#L185-L261) | 严格 One-to-One 判定、外键持有方判定、fkFieldName 默认值 |
 | [create-prisma-schema-fields.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/prisma/create-prisma-schema-fields.ts) | Lookup → Prisma Schema 字段转换 |
-| [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts) | 关系字段 CRUD、级联删除、双向字段同步 |
-| [EnumRelatedFieldStrategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/EnumRelatedFieldStrategy.ts) | 删除策略枚举定义 |
-| [create-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/service/create-service.ts) | Service 层方法生成 |
-| [create-nested-input-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts) | 嵌套输入 DTO 生成 |
+| [create-nested-input-dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts) | to-Many 嵌套 DTO 生成（仅 Connect / Connect+Disconnect+Set） |
+| [create-field-class-property.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/create-field-class-property.ts#L374-L486) | DTO 类型映射核心（to-One 直接用 WhereUniqueInput） |
+| [entity-dto-type-enum.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/dto/entity-dto-type-enum.ts) | DTO 类型枚举 |
+| [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts) | 关系字段 CRUD、级联删除、实体软删除 |
+| [EnumRelatedFieldStrategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/EnumRelatedFieldStrategy.ts) | 删除策略枚举（Delete / UpdateToScalar） |
+| [softDelete.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/util/softDelete.ts) | 软删除名称前缀工具 |
+| [create-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/data-service-generator/src/server/resource/service/create-service.ts) | Service 层方法生成（区分 to-One / to-Many） |
 | [entity-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/lib/entity-util.ts) | 关系字段默认 API Action |
 | [dto-util.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/libs/util/dsg-utils/src/lib/dto-util.ts) | 关系字段默认 DTO 配置 |
-| [relation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/relation/relation.service.ts) | Blueprint 资源级联构建 |
+| [relation.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/relation/relation.service.ts) | **Blueprint 级联构建**（与实体关系完全独立） |
+
+---
+
+## 十一、之前描述 vs 代码实际情况 对比汇总
+
+| 主题 | 之前描述 | 代码实际情况 | 结论 |
+|-----|---------|------------|------|
+| `isOneToOneRelationField` | 判定严格一对一（同时检查两端） | 只检查本端 `allowMultipleSelection`，实际是 **to-One** 判定 | ❌ 命名有歧义，函数名不准确 |
+| 嵌套 DTO 操作 | Create/Connect/ConnectOrCreate/Disconnect/Set 五种齐全 | **to-Many**：Create 场景仅 Connect，Update 场景 Connect+Disconnect+Set；**to-One**：无独立 DTO，直接用 WhereUniqueInput | ❌ Create 和 ConnectOrCreate 从未实际生成 |
+| to-One 的 DTO | 有独立的 `CreateNestedOneWithout...` 类 | 不生成独立嵌套 DTO，直接引用 `XxxWhereUniqueInput` | ❌ 与描述不一致 |
+| 实体删除 | 物理删除 | 软删除（`deletedAt` + 名称加前缀 + 版本标记 deleted） | ❌ 是软删除不是硬删除 |
+| UpdateToScalar | 笼统说"转换为标量字段" | to-Many→`Json`（名称不变）；to-One→ID 标量类型（字段名加 `Id` 后缀） | ⚠️ 描述不够精确 |
+| Blueprint 级联构建 | 未区分，可能误认为与实体关系有关 | 完全独立的机制，作用于 Resource 构建顺序，与数据模型无关 | ❌ 需要明确区分 |
