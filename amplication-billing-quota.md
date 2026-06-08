@@ -120,7 +120,7 @@ BillingService 提供三种额度查询方法，对应 Stigg 的三种 Entitleme
 
 ### 2.2 Feature 定义
 
-所有计费特性在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts) 中定义。枚举共 **28 行**，但由于 `AzureDevOps` 和 `AzureDevops`（大小写不同）共享同一个 feature id `"feature-azure-devops"`，实际为 **27 个独立特性**（详见 6.1 节核准说明）：
+所有计费特性在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts) 中定义。枚举共 **27 个成员**（L2-L28），但其中 `AzureDevOps` 与 `AzureDevops`（大小写不同）共享同一个 feature id `"feature-azure-devops"`，实际为 **26 个独立的 feature id**（详见 6.1 节核准说明）：
 
 ```typescript
 export enum BillingFeature {
@@ -410,20 +410,29 @@ if (error instanceof BillingLimitationError) {
 
 ### 6.1 计费特性（BillingFeature）准确数量
 
-在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts#L1-L29) 中枚举定义了 **28 行**，但实际只有 **27 个独立的 feature id**。原因是第 4 行 `AzureDevOps` 和第 5 行 `AzureDevops`（大小写不同）指向同一个字符串值 `"feature-azure-devops"`：
+在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts#L1-L29) 中：
+- **L1**：`export enum BillingFeature {`
+- **L2-L28**：枚举成员定义，共 **27 个成员**
+- **L29**：`}`
+
+其中 L4 `AzureDevOps` 和 L5 `AzureDevops`（大小写不同）指向同一个字符串值 `"feature-azure-devops"`：
 
 ```typescript
 AzureDevOps = "feature-azure-devops",   // L4
 AzureDevops = "feature-azure-devops",   // L5  —— 与上一行值重复
 ```
 
-这是 TypeScript 枚举的合法写法，会编译为两个不同的属性名映射到同一值。完整的 27 个独立特性：
+这是 TypeScript 枚举的合法写法，会编译为两个不同的属性名映射到同一值。因此：
+- **枚举成员数**：27 个
+- **独立 feature id 数**：26 个
 
-| # | 特性名 | Feature ID |
+完整的 26 个独立 feature id（对应 27 个枚举成员）：
+
+| # | 枚举成员名 | Feature ID |
 |---|--------|-----------|
 | 1 | AllowWorkspaceCreation | feature-allow-workspace-creation |
 | 2 | AwsCodeCommit | feature-awscodecommit |
-| 3 | AzureDevOps / AzureDevOps | feature-azure-devops |
+| 3 | AzureDevOps / AzureDevops | feature-azure-devops |
 | 4 | Bitbucket | feature-bitbucket |
 | 5 | BlockBuild | feature-block-build |
 | 6 | BranchPerResource | feature-branch-per-resource |
