@@ -524,9 +524,9 @@ GptService.startConversation()
 
 项目中共有 **5 个服务、7 个 Controller、24 个消费者方法**。
 
-#### 5.1.1 amplication-server（4 个 Controller，17 个消费者方法）
+#### 5.1.1 amplication-server（4 个 Controller，15 个消费者方法）
 
-**BuildController**（13 个方法）— [build.controller.ts](packages/amplication-server/src/core/build/build.controller.ts)：
+**BuildController**（12 个方法）— [build.controller.ts](packages/amplication-server/src/core/build/build.controller.ts)：
 
 | 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
 |--------|---------|---------|---------------------|
@@ -601,7 +601,7 @@ GptController.onAiConversationCompleted() 直接使用 message 作为参数传�
 
 ### 5.2 plainToInstance DTO 校验情况总结
 
-**24 个消费者方法中，18 个使用了 plainToInstance，6 个没有使用：**
+**24 个消费者方法中，17 个使用了 plainToInstance，7 个没有使用：**
 
 | 未使用 plainToInstance 的方法 | 所在 Controller | 说明 |
 |------------------------------|----------------|------|
