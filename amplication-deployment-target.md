@@ -454,37 +454,82 @@ ResourceResolver 类级别有 [@UseGuards(GqlAuthGuard)](file:///d:/fz/0601/solo
 ```
 
 对 `environments` ResolveField 的影响：
-1. **必须先通过 JWT 认证**（任何 GraphQL 操作的前提）
-2. **没有独立的 EnvironmentId 级权限校验**（该字段无 `@AuthorizeContext`，`authorizeContext()` 直接返回 true）
-3. **受父级 Resource 查询的间接保护**：要访问 `Resource.environments`，必须先查询到该 Resource。而 `resource()` Query（L68-72）上有 `@AuthorizeContext(AuthorizableOriginParameter.ResourceId, "where.id")`，只有能通过 ResourceId 校验的用户才能拿到父级 Resource 对象，进而访问嵌套的 environments
+1. **无独立 JWT 认证和权限校验**（ResolveField 不触发任何 Guard/Interceptor，详见 4.4.4 节 fieldResolverEnhancers 配置核准）
+2. **没有独立的 EnvironmentId 级权限校验**（@ResolveField 无 @AuthorizeContext，且 Guard 根本不被调用）
+3. **受父级 Resource 查询的间接保护**：要访问 `Resource.environments`，必须先通过顶级 Query 查询到该 Resource。而 `resource()` Query（L68-72）上有 `@AuthorizeContext(AuthorizableOriginParameter.ResourceId, "where.id")`，只有能通过 ResourceId 校验的用户才能拿到父级 Resource 对象，进而访问嵌套的 environments。ResolveField 层面完全依赖父级查询的安全性传递。
 
 #### 4.4.3 查询权限边界总结
 
 | 访问路径 | 是否受保护 | 保护方式 |
 |---------|----------|---------|
 | 直接按 ID 查询 Environment | ❌ 无法访问 | 无此 Query 端点 |
-| `query { resource(id) { environments } }` | ✅ | 父级 Resource 的 `@AuthorizeContext(ResourceId, ...)` |
-| `@AuthorizeContext(EnvironmentId, ...)` | ❌ 永不触发 | 无挂载点 |
-| JWT 认证 | ✅ | 类级 `@UseGuards(GqlAuthGuard)` |
+| `query { resource(id) { environments } }` | ✅ | 父级 Resource 的 `@AuthorizeContext(ResourceId, ...)`（顶级 Query 触发） |
+| `@AuthorizeContext(EnvironmentId, ...)` | ❌ 永不触发 | 无挂载点，且 ResolveField 不触发 Guard |
+| JWT 认证 | ✅（仅顶级方法） | 类级 `@UseGuards(GqlAuthGuard)` 对 @Query/@Mutation 生效，对 @ResolveField 不生效 |
 
-#### 4.4.4 两种权限装饰器的机制差异（影响所有父级路径）
+#### 4.4.4 GraphQLModule 的 fieldResolverEnhancers 配置核准（重大发现）
 
-在分析父级资源访问路径之前，必须先明确项目中两种装饰器的本质区别：
+**关键配置核查**：[app.module.ts:33-65](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L33-L65)
+
+```typescript
+GraphQLModule.forRootAsync<ApolloDriverConfig>({
+  driver: ApolloDriver,
+  useFactory: async (configService: ConfigService) => {
+    return {
+      autoSchemaFile: ...,
+      sortSchema: true,
+      debug: ...,
+      playground: ...,
+      introspection: ...,
+      context: (context) => { ... },
+      subscriptions: { ... },
+      // ❌ 完全没有 fieldResolverEnhancers 选项
+    };
+  },
+  ...
+});
+```
+
+**NestJS GraphQL v10 默认行为（官方文档确认）**：
+
+> In the GraphQL context, Nest does not run **enhancers** (the generic name for interceptors, guards and filters) at the field level. They only run for the top level `@Query()`/`@Mutation()`/`@Subscription()` method. You can tell Nest to execute interceptors, guards or filters for methods annotated with `@ResolveField()` by setting the `fieldResolverEnhancers` option.
+
+**结论**：当前 GraphQLModule **未配置 `fieldResolverEnhancers`**，意味着：
+
+| 增强器类型 | 对 `@Query()`/`@Mutation()`/`@Subscription()` | 对 `@ResolveField()` |
+|-----------|----------------------------------------------|---------------------|
+| 类级 `@UseGuards(GqlAuthGuard)` | ✅ 生效 | ❌ **完全不触发** |
+| 全局 `APP_INTERCEPTOR`（InjectContextInterceptor） | ✅ 生效 | ❌ **完全不触发** |
+| 方法级 `@UseGuards(...)` | ✅ 生效 | ❌ **完全不触发** |
+| 方法级 `@UseInterceptors(...)` | ✅ 生效 | ❌ **完全不触发** |
+
+**重要修正之前的错误理解**：之前的分析认为"ResolveField 仍然会触发类级 GqlAuthGuard，只是 authorizeContext() 在无 @AuthorizeContext 元数据时直接返回 true"；实际情况是 **GqlAuthGuard 和 InjectContextInterceptor 对 ResolveField 根本不会被调用**，不存在"返回 true"这一步——执行流程根本不进入 Guard/Interceptor 代码。
+
+核查佐证：
+- 全代码库 grep `fieldResolverEnhancers` → **零结果**
+- 全代码库所有 `@ResolveField` 方法上无任何 `@AuthorizeContext` 或 `@InjectContextValue` 装饰器（multiline grep 零命中）
+
+---
+
+#### 4.4.5 两种权限装饰器的机制差异（结合 fieldResolverEnhancers 现状）
+
+在分析父级资源访问路径之前，必须先明确项目中两种装饰器的本质区别，以及它们在 ResolveField 上的实际生效边界：
 
 | 机制 | `@AuthorizeContext` | `@InjectContextValue`（不带 permissions 参数） |
 |-----|--------------------|----------------------------------------------|
 | 生效位置 | `GqlAuthGuard.canActivate()`（Guard 阶段） | `InjectContextInterceptor.intercept()`（全局 Interceptor 阶段） |
-| 注册方式 | resolver 方法装饰器 + 类级 `@UseGuards(GqlAuthGuard)` | 全局 `APP_INTERCEPTOR`（[app.module.ts:80-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L80-L83)），对所有 resolver 生效 |
+| 注册方式 | resolver 方法装饰器 + 类级 `@UseGuards(GqlAuthGuard)` | 全局 `APP_INTERCEPTOR`（[app.module.ts:80-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L80-L83)） |
 | 核心行为 | 从请求参数中读出值，用 `VALIDATION_FUNCTIONS[parameterType]` 校验该值是否属于用户 workspace | 把 `user.workspace.id` 或 `user.id` **强制写入**请求参数的指定路径，覆盖用户输入 |
 | 权限校验 | ✅ 执行（workspace 归属 + 可选细粒度权限） | ❌ **不执行**。无 permissions 参数时仅做参数注入，`GqlAuthGuard.authorizeContext()` 在 [gql-auth.guard.ts:69-71](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L69-L71) 直接返回 true |
-| ResolveField 是否触发 | ✅ 触发（@UseGuards 在类级） | ✅ 触发（全局 APP_INTERCEPTOR） |
-| 无装饰器时 | 返回 true（放行） | 不做任何注入（放行） |
+| 对顶级 Query/Mutation | ✅ 触发 | ✅ 触发 |
+| **对 @ResolveField（当前配置）** | ❌ **完全不触发** | ❌ **完全不触发** |
+| 无装饰器时（顶级方法） | authorizeContext() 返回 true（放行） | 不做任何注入（放行） |
 
 两种装饰器均定义于：
 - [authorizeContext.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/authorizeContext.decorator.ts)
 - [injectContextValue.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/injectContextValue.decorator.ts)
 
-#### 4.4.5 父级资源访问路径与 environments 字段的权限继承链
+#### 4.4.6 父级资源访问路径与 environments 字段的权限继承链
 
 `Resource.environments` ResolveField（[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)）本身无任何装饰器，其保护完全依赖**父级 Resource 对象是通过哪条查询路径获取的**。以下逐一核对 3 条可达路径：
 
@@ -502,13 +547,13 @@ async resource(@Args() args: FindOneArgs): Promise<Resource | null> {
 ```
 
 保护链路：
-1. ✅ JWT 认证（类级 GqlAuthGuard）
+1. ✅ JWT 认证（类级 GqlAuthGuard，顶级 Query 触发）
 2. ✅ `@AuthorizeContext(ResourceId, "where.id")` — 用 `VALIDATION_FUNCTIONS[ResourceId]` 校验该 Resource 是否属于用户 workspace
 3. ✅ Resource 对象通过校验后，才会被 ResolveField 消费
-4. `environments` 无装饰器 → 直接放行
+4. `environments` 是 ResolveField → **GqlAuthGuard 和 InjectContextInterceptor 完全不触发**（因无 fieldResolverEnhancers 配置）→ 直接执行 Service 层
 5. `environmentService.findMany({ where: { resource: { id: resource.id } } })` — 用已校验的 resourceId 查询
 
-**结论**：✅ 安全。environments 继承了父级 Resource 的完整校验。
+**结论**：✅ 安全。environments 继承了父级 Resource 的完整校验。ResolveField 层面没有二次权限检查是架构设计的结果（依赖父级校验的传递性），而非漏洞。
 
 ---
 
@@ -527,14 +572,14 @@ async resources(@Args() args: FindManyResourceArgs): Promise<Resource[]> {
 ```
 
 保护链路：
-1. ✅ JWT 认证（类级 GqlAuthGuard）
+1. ✅ JWT 认证（类级 GqlAuthGuard，顶级 Query 触发）
 2. ⚠️ `@InjectContextValue(WorkspaceId, "where.project.workspace.id")` — **仅注入不校验**：将 `user.workspace.id` 强制写入 args.where.project.workspace.id，覆盖用户可能的越权输入
 3. ❌ 无 `@AuthorizeContext` → GqlAuthGuard 不做权限校验
 4. `resourceService.resources(args)` → `prepareResourceFindManyArgsForQuery()` 内部（[resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364)）：
    - 仅处理 `serviceTemplateId`、`projectIdFilter`、`properties` JSON 过滤
    - **强制追加** `deletedAt: null` 和 `archived: { not: true }`
    - **不再追加 workspace 过滤**（完全依赖 InjectContextInterceptor 已注入的 `where.project.workspace.id`）
-5. ResolveField `environments` 对每个返回的 Resource 逐个执行
+5. ResolveField `environments` 对每个返回的 Resource 逐个执行 → **GqlAuthGuard 和 InjectContextInterceptor 完全不触发**（因无 fieldResolverEnhancers 配置）→ 直接执行 Service 层
 
 **结论**：✅ 安全，但保护机制不同。不是"逐条校验归属"，而是"强制在查询条件中注入 workspace.id 限定范围"。`prepareResourceFindManyArgsForQuery()` 中的注释（L1329）显式说明了这一依赖："workspace.id is expected to be injected in the resolver middleware."
 
@@ -562,18 +607,18 @@ async resources(@Parent() project: Project): Promise<Resource[]> {
 ```
 
 保护链路（关键差异点）：
-1. ✅ JWT 认证（类级 GqlAuthGuard）
+1. ✅ JWT 认证（类级 GqlAuthGuard，顶级 Query 触发）
 2. ✅ `@AuthorizeContext(ProjectId, "where.id")` — 父级 Project 通过 workspace 归属校验
-3. ⚠️ `Project.resources` ResolveField：**完全无装饰器**
-   - `GqlAuthGuard.authorizeContext()` → 无元数据 → 直接返回 true
-   - `InjectContextInterceptor` → 无 `@InjectContextValue` → 不做参数注入
+3. ⚠️ `Project.resources` ResolveField：**GqlAuthGuard 和 InjectContextInterceptor 完全不触发**（因无 fieldResolverEnhancers 配置）
+   - 不存在"authorizeContext() 返回 true"这一步——Guard 根本不被调用
+   - 不存在"InjectContextInterceptor 不注入"这一步——Interceptor 根本不被调用
 4. `resourceService.resources({ where: { project: { id: project.id } } })`：
    - 传入的 args 中**没有** `where.project.workspace.id`
    - `prepareResourceFindManyArgsForQuery()` 不会补加 workspace 过滤（只追加 deletedAt 和 archived）
    - **最终 Prisma 查询条件仅为** `WHERE project.id = <已校验的projectId> AND deletedAt IS NULL AND archived != true`
-5. 每个 Resource 上的 `environments` ResolveField 同样无装饰器
+5. 每个 Resource 上的 `environments` ResolveField：同样，**GqlAuthGuard 和 InjectContextInterceptor 完全不触发** → 直接执行 Service 层
 
-**结论**：✅ 在正常调用链下安全。保护依赖"父级 Project 已通过 ProjectId 归属校验"→ project.id 可信 → 用此 id 查询出的 Resource 列表自然属于同一 workspace。但与路径 B 不同，此路径**没有在 Service 层二次注入 workspace.id 作为防御纵深**。若未来出现可绕过父级 Project 查询直接调用 `Project.resources` ResolveField 且传入任意 project 对象的场景，将存在越权风险。
+**结论**：✅ 在正常调用链下安全。保护依赖"父级 Project 已通过 ProjectId 归属校验"→ project.id 可信 → 用此 id 查询出的 Resource 列表自然属于同一 workspace。但与路径 B 不同，此路径**没有在 Service 层二次注入 workspace.id 作为防御纵深**。由于 ResolveField 根本不触发 Guard/Interceptor，任何对 ResolveField 级别的保护（如未来在 Project.resources 上加 @AuthorizeContext）都需要先启用 fieldResolverEnhancers 配置才能生效。
 
 ---
 
@@ -592,7 +637,7 @@ async resources(@Parent() project: Project): Promise<Resource[]> {
 | Service 层防御纵深 | findUnique 直接按 ID 查 | prepareResourceFindManyArgsForQuery 补 deletedAt/archived（不补 workspace） | prepareResourceFindManyArgsForQuery 补 deletedAt/archived（不补 workspace） |
 | environments 保护强度 | ✅ 最强（直接继承 ResourceId 校验） | ✅ 强（继承 workspace 范围注入） | ⚠️ 中等（依赖父级 Project 校验的传递性，无二次校验） |
 
-#### 4.4.6 Service 层内部绕过 resolver 调用 resources() 的情况
+#### 4.4.7 Service 层内部绕过 resolver 调用 resources() 的情况
 
 `resourceService.resources()` 在代码库中被大量内部调用（grep 命中 10+ 处）。这些内部调用均绕过 `@InjectContextValue` 装饰器（装饰器只对 Nest 路由入口生效）。核查代表性调用：
 
@@ -929,13 +974,14 @@ onCodeGenerationSuccess(message)
   - [validation-functions.ts:445-457](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L445-L457) （EnvironmentId）
   - [gql-auth.guard.ts:61-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L61-L83) （触发机制）
 
-#### 缺口 4：Resource.environments 缺少独立的 @AuthorizeContext 装饰器
+#### 缺口 4：Resource.environments 缺少独立的 @AuthorizeContext 装饰器，且即使添加也不会生效
 
-- **现状**：`environments` ResolveField（[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)）没有 `@AuthorizeContext` 装饰器，权限完全依赖父级 Resource 查询的保护。与同 resolver 中的其他 ResolveField（如 `entities`、`builds`）保持一致，但与 Entity/Build 存在独立 Query 端点且有独立权限校验的模式不同
+- **现状**：`environments` ResolveField（[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)）没有 `@AuthorizeContext` 装饰器，权限完全依赖父级 Resource 查询的保护。与同 resolver 中的其他 ResolveField（如 `entities`、`builds`）保持一致
+- **更严重的问题**：即便给 `environments` ResolveField 加上 `@AuthorizeContext(EnvironmentId, ...)`，**在当前配置下也不会生效**——因为 GraphQLModule 未配置 `fieldResolverEnhancers`，所有 ResolveField 都不会触发 Guard（详见缺口 12）。这意味着如果未来要给任何 ResolveField 加独立权限校验，必须先修改 GraphQLModule 配置
 - **边界情况**：若未来新增独立的 `environment(id: ID!)` Query，必须同时补上 `@AuthorizeContext(AuthorizableOriginParameter.EnvironmentId, "where.id")`，否则将形成越权漏洞
 - **相关文件**：
   - [resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)
-  - [gql-auth.guard.ts:69-71](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L69-L71) （无装饰器时直接放行逻辑）
+  - [app.module.ts:33-65](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L33-L65) （fieldResolverEnhancers 未配置）
 
 #### 缺口 5：ActionId 权限校验的 Deployment 关联分支为死代码
 
@@ -969,15 +1015,15 @@ onCodeGenerationSuccess(message)
   - [resource.resolver.ts:68-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L68-L83)
   - [project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)
 
-#### 缺口 9：Project.resources ResolveField 缺少防御纵深（无 workspace.id 二次注入）
+#### 缺口 9：Project.resources ResolveField 缺少防御纵深（Guard/Interceptor 不触发 + 无 workspace.id 二次注入）
 
-- **现状**：`Project.resources` ResolveField（[project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)）调用 `resourceService.resources({ where: { project: { id: project.id } } })`，但：
-  - 无 `@InjectContextValue(WorkspaceId, "where.project.workspace.id")`
-  - `prepareResourceFindManyArgsForQuery()` 不补加 workspace 过滤（只补 deletedAt/archived）
-  - 最终 SQL 仅靠 `project.id = <值>` 限定范围
-- **风险**：虽然在正常调用链下 project.id 来自已校验的父级 Project 对象，但若未来出现可绕过父级查询直接调用此 ResolveField 的场景，将存在越权风险。与路径 B `resources(where)` Query 相比缺少一层防御纵深
+- **现状**：`Project.resources` ResolveField（[project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)）调用 `resourceService.resources({ where: { project: { id: project.id } } })`，存在两层缺失：
+  1. **Guard/Interceptor 完全不触发**：因 GraphQLModule 未配置 `fieldResolverEnhancers`，类级 `@UseGuards(GqlAuthGuard)` 和全局 `APP_INTERCEPTOR` 对此 ResolveField 无效
+  2. **Service 层不兜底**：`prepareResourceFindManyArgsForQuery()` 不补加 workspace 过滤（只补 deletedAt/archived），最终 SQL 仅靠 `project.id = <值>` 限定范围
+- **风险**：在正常调用链下 project.id 来自已校验的父级 Project 对象，暂安全。但若未来出现可绕过父级查询直接调用此 ResolveField 且传入任意 project 对象的场景，将存在越权风险。与路径 B `resources(where)` Query 相比缺少两层防御纵深
 - **相关文件**：
   - [project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)
+  - [app.module.ts:33-65](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L33-L65) （fieldResolverEnhancers 未配置）
   - [resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364) （`prepareResourceFindManyArgsForQuery` 不补 workspace 过滤）
 
 #### 缺口 10：resourceService.resources() 完全依赖调用方传入 workspace.id，Service 层自身不兜底
@@ -994,6 +1040,24 @@ onCodeGenerationSuccess(message)
 - **相关文件**：
   - [resource.service.ts:83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L83)
   - [environment.service.ts:12](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts#L12)
+
+#### 缺口 12（架构级）：GraphQLModule 未配置 fieldResolverEnhancers，所有 ResolveField 都不触发 Guard 和 Interceptor
+
+- **现状**：[app.module.ts:33-65](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L33-L65) 的 GraphQLModule.forRootAsync 配置中**完全没有 `fieldResolverEnhancers` 选项**。根据 NestJS GraphQL v10 官方文档，默认情况下 enhancers（guards、interceptors、filters）**只在顶级 @Query/@Mutation/@Subscription 上运行，不在 @ResolveField 上运行**
+- **实际影响**：
+  1. 全代码库 20+ 个 Resolver 类上的类级 `@UseGuards(GqlAuthGuard)` **对 ResolveField 完全无效**
+  2. 全局注册的 `APP_INTERCEPTOR`（InjectContextInterceptor、AnalyticsSessionIdInterceptor）**对 ResolveField 完全无效**
+  3. 任何在 @ResolveField 方法上添加的 @AuthorizeContext、@InjectContextValue、@UseGuards、@UseInterceptors **当前都不会生效**
+  4. 影响所有嵌套字段查询：`project(id) { resources }`、`resource(id) { environments }`、`resource(id) { builds }`、`resource(id) { entities }`、`workspace(id) { projects }` 等等，全依赖父级顶级查询的安全性传递
+- **风险评估**：
+  - 当前无直接越权漏洞（所有 ResolveField 都通过 @Parent() 使用已校验父级对象的 id 做限定查询）
+  - 但这是一种"隐性安全契约"，后续开发者若新增 ResolveField 忘记用父级 id 限定，或假设"类级 Guard 会兜底"，将引入越权漏洞
+  - 若未来需要在 ResolveField 层面做独立权限校验，必须**先启用 fieldResolverEnhancers**，否则加了装饰器也白加
+- **启用选项**（若未来修复）：在 GraphQLModule.forRoot 配置中添加 `fieldResolverEnhancers: ['guards', 'interceptors', 'filters']`。官方文档警告："Enabling enhancers for field resolvers can cause performance issues as they will be executed for each field in your query"
+- **相关文件**：
+  - [app.module.ts:33-65](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L33-L65)
+  - [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts) （类级装饰器注册 20+ 处）
+  - [inject-context.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/interceptors/inject-context.interceptor.ts) （全局 APP_INTERCEPTOR 注册）
 
 ---
 
@@ -1022,7 +1086,7 @@ onCodeGenerationSuccess(message)
 | | [injectContextValue.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/injectContextValue.decorator.ts) | `@InjectContextValue` 装饰器定义（设置 INJECT_CONTEXT_VALUE metadata，可选 permissions） |
 | | [inject-context.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/interceptors/inject-context.interceptor.ts) | `InjectContextInterceptor`（全局 APP_INTERCEPTOR，强制注入 user.workspace.id / user.id） |
 | | [InjectableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/InjectableOriginParameter.ts) | `UserId`、`WorkspaceId`（仅两种可注入参数类型） |
-| | [app.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L80-L83) | InjectContextInterceptor 注册为全局 APP_INTERCEPTOR |
+| | [app.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts) | InjectContextInterceptor 注册为全局 APP_INTERCEPTOR（L80-83）; **GraphQLModule 未配置 fieldResolverEnhancers（L33-65）—— 所有 ResolveField 不触发 Guard 和 Interceptor** |
 | | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L644) | `Build.containerStatusQuery/UpdatedAt`（L496-497，预留未启用）, `Environment`（L615-627）, `Deployment`（L629-644）, `EnumDeploymentStatus` 枚举 |
 | | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | `ResourceId`（L10）、`ProjectId`（L26）、`EnvironmentId`（L19）、`DeploymentId`（L20）枚举定义 |
 | | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | `ResourceId` 校验（L161-182）, `ProjectId` 校验（L78-96）, `DeploymentId` 校验（L267-286，仅 count，无调用方）, `ActionId` 校验含 deployments OR 分支（L212-266，死分支）, `EnvironmentId` 校验（L445-457，无调用方） |
