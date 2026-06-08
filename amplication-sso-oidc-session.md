@@ -474,50 +474,289 @@ new GraphQLWsLink(
 );
 ```
 
-### 3.6 后端 JWT 验证
+### 3.6 后端 JWT 验证（四步校验代码链路
 
-在 [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L15-L48)：
+JWT 验证是整个认证体系的核心。系统通过 NestJS Passport 守卫驱动，每个请求都会经过以下 **4 个连续校验，每个环节失败都会抛出 `UnauthorizedException`（HTTP 401）：
+
+```
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  Step 1: JWT 签名校验（Passport 框架层）                │
+                    │  - 从 Authorization: Bearer <token> 提取 token  │
+                    │  - 使用 JWT_SECRET 验证 HMAC-SHA256 签名       │
+                    │  - 解析 payload 为 JwtDto                               │
+                    └────────────────────────┬────────────────────────────┘
+                                             │ 签名有效
+                                             ▼
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  Step 2: Token 类型分支判断                                   │
+                    │  - payload.type === "ApiToken" ?                      │
+                    │      ├─ 是 → Step 2a: API Token 滑动过期校验    │
+                    │      └─ 否 → 跳过，直接进入 Step 3                │
+                    └────────────────────────┬────────────────────────────┘
+                                             │ 通过
+                                             ▼
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  Step 3: 用户软删除校验                             │
+                    │  - getAuthUser({ id: payload.userId })           │
+                    │  - Prisma 查询强制过滤 deletedAt IS NULL           │
+                    └────────────────────────┬────────────────────────────┘
+                                             │ 找到用户
+                                             ▼
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  Step 4: 附加（可选）: RBAC 授权校验                       │
+                    │  - GqlAuthGuard.authorizeContext()                   │
+                    │  - validateAccess() 根据 Roles/Resources               │
+                    └─────────────────────────────────────────────────────────────┘
+```
+
+下面对每个 Step 的代码做精确拆解。
+
+---
+
+#### Step 1: JWT 签名校验（Passport 框架层）
+
+**代码位置**：
+- [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L31-L35)（守卫入口）
+- [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L9-L20)（策略配置）
+- [auth.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.module.ts#L36-L43)（JWT 模块配置）
+
+**执行流程**：
+
+```
+GqlAuthGuard.canActivate()
+    │
+    ▼
+super.canActivate(context)  // 调用 NestJS AuthGuard('jwt')
+    │
+    ▼
+Passport 内部：
+  ① jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken()
+     → 从请求头提取: Authorization: Bearer <jwt>
+  ② 使用 secretOrKey: JWT_SECRET
+     → 使用 jsonwebtoken.verify() 校验签名
+  ③ 校验通过 → 解析出 payload: JwtDto
+  ④ 调用自定义 JwtStrategy.validate(req, payload)
+```
+
+**JwtStrategy 构造函数**（修正之前的错误：代码中没有 `ignoreExpiration`）：
 
 ```typescript
+// [jwt.strategy.ts L10-L20
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(configService: ConfigService, private authService: AuthService) {
+  constructor(
+    private readonly authService: AuthService,
+    readonly configService: ConfigService
+  ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      ignoreExpiration: true,   // ⚠️ 即使存在 exp claim 也忽略（因为根本没设置）
+      passReqToCallback: true,
       secretOrKey: configService.get("JWT_SECRET"),
+      // ⚠️ 注意：代码中没有 ignoreExpiration
+      // 实际行为由 JwtModule 配置默认值 ignoreExpiration=false
+      // 但因为签发时未设置 expiresIn，JWT 中根本没有 exp claim，
+      // 所以即使 ignoreExpiration 默认值 false 也不会触发过期检查
     });
   }
+```
 
-  async validate(req, payload: JwtDto): Promise<AuthUser> {
-    // API Token 额外校验滑动过期
-    if (payload.type === EnumTokenType.ApiToken) {
-      const jwt = ExtractJwt.fromAuthHeaderAsBearerToken()(req);
-      const isValid = await this.authService.validateApiToken({
-        userId: payload.userId,
-        tokenId: payload.tokenId,
-        token: jwt,
-      });
-      if (!isValid === true) {
-        throw new UnauthorizedException();
-      }
-    }
+**关于 `exp` claim 为什么不会存在的证据链**：
 
-    // ⚠️ 所有 Token 都要检查用户是否存在（含软删除检查）
-    const user = await this.authService.getAuthUser({ id: payload.userId });
-    if (!user) {
+| 配置项 | 代码位置 | 实际值 |
+|-------|---------|-------|
+| `JwtModule.signOptions` | [auth.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.module.ts#L37-L43) | 未配置 |
+| `jwtService.sign(payload, options?)` | [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L517-L546) | options 为空 |
+| `JwtDto` 接口 | [jwt.dto.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/dto/jwt.dto.ts) | 业务载荷无 `exp` 字段 |
+
+因此，实际签发的 JWT **不包含 `exp`（过期时间）claim**；`jsonwebtoken` 默认仍会加入 `iat`（签发时间），但 `iat` 不会触发过期校验。`jsonwebtoken.verify()` 由于找不到 `exp`，不会触发过期检查。即使 `ignoreExpiration` 默认为 `false` 也无效。
+
+---
+
+#### Step 2: API Token 滑动过期校验
+
+**代码位置**：
+- [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L22-L34)（分支判断）
+- [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L421-L452)（滑动过期校验实现）
+
+**JwtStrategy 中的判断逻辑**：
+
+```typescript
+// [jwt.strategy.ts L22-L34]
+async validate(req, payload: JwtDto): Promise<AuthUser> {
+  if (payload.type === EnumTokenType.ApiToken) {
+    const jwt = ExtractJwt.fromAuthHeaderAsBearerToken()(req);
+    // ⚠️ 注意：此处将原始 JWT 明文传给 validateApiToken
+    const isValid = await this.authService.validateApiToken({
+      userId: payload.userId,
+      tokenId: payload.tokenId,
+      token: jwt,
+    });
+    if (!isValid === true) {
       throw new UnauthorizedException();
     }
-    return user;
   }
+  // ...后续 Step 3
 }
 ```
 
-**验证链路完整边界**：
-1. Passport-JWT 自动校验 JWT 签名（密钥 `JWT_SECRET`）
-2. `ignoreExpiration: true` 跳过 exp 检查
-3. API Token 额外走 `validateApiToken` 检查滑动过期 + 用户未删除
-4. User Token 只检查用户存在性（`getAuthUser` 过滤 `deletedAt != null`）
+**`validateApiToken` 实现 — 原子操作的精确边界**：
+
+```typescript
+// [auth.service.ts L421-L452]
+const TOKEN_EXPIRY_DAYS = 30;
+
+async validateApiToken(args: {
+  userId: string;
+  tokenId: string;
+  token: string;   // ⚠️ token 参数虽然传入，但函数体内没有使用
+}): Promise<boolean> {
+  // 计算 30 天前此刻的精确时间点
+  const lastAccessThreshold = subDays(new Date(), TOKEN_EXPIRY_DAYS);
+
+  // 原子操作：查找 + 更新 lastAccessAt
+  const apiToken = await this.prismaService.apiToken.updateMany({
+    where: {
+      userId: args.userId,       // ① 匹配用户 ID
+      id: args.tokenId,       // ② 匹配 API Token 记录 ID
+      lastAccessAt: {
+        gt: lastAccessThreshold,  // ③ 严格大于 T-30 天
+      },
+      user: {
+        deletedAt: null,        // ④ 关联用户未软删除
+      },
+    },
+    data: {
+      lastAccessAt: new Date(),  // 校验通过则原子更新，续期
+    },
+  });
+
+  return apiToken.count === 1;  // 精确匹配 1 行才算成功
+}
+```
+
+**边界细节**：
+
+| 条件 | 精确含义 | 边界说明 |
+|-------|---------|---------|
+| `lastAccessAt: { gt: lastAccessThreshold }` | `lastAccessAt > NOW - 30天` | 严格大于，不含等于 | 恰好 30×24h 前的那一刻已失效 |
+| `user: { deletedAt: null }` | 关联用户未被软删除 | 通过 Prisma 嵌套过滤 | 用户被删则 API Token 同时失效 |
+| `apiToken.count === 1` | 精确匹配 1 条记录 | 防并发、防伪造 | 多行匹配都不允许 |
+
+**关于 `token` 参数为何传入但未使用的设计意图**：
+
+`validateApiToken` 虽然接收了明文 `token` 参数，但**没有进行 bcrypt 比对**。原因：
+- 因为 API Token 的明文 JWT 已经由 Step 1 的 Passport 签名校验过，签名正确意味着 `userId` 和 `tokenId` 未被篡改
+- 数据库存储的 bcrypt 哈希（`passwordService.hashPassword(token)`）只用于：
+  - 创建时给用户展示预览（`previewChars = token.slice(-8)`）和删除前由用户通过预览字符肉眼确认
+  - 防止数据库泄露后攻击者无法直接从数据库获取明文
+
+**API Token 完整生命周期**：
+
+```
+创建时：
+  createApiToken()
+    ├── token = prepareApiToken(user, tokenId)   // 签发 JWT，包含 tokenId claim
+    ├── previewChars = token.slice(-8)  // 只展示后 8 字符
+    ├── hashedToken = bcrypt.hash(token)   // 只存储哈希
+    └── 返回明文 token，只此一次返回给用户
+
+校验时：
+  validateApiToken()
+    ├── JWT 签名校验 → 解析出 userId + tokenId（Step 1）
+    ├── 数据库 UPDATE WHERE userId + tokenId + lastAccessAt > T-30d
+    └── bcrypt 哈希不参与校验（签名已保证完整性）
+
+删除时：
+  deleteApiToken(id)
+    └── 用户通过 previewChars 视觉确认，再删除
+```
+
+---
+
+#### Step 3: 用户软删除校验
+
+**代码位置**：
+- [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L36-L42)
+- [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L548-L550)
+- [user.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/user/user.service.ts#L43-L72)
+
+**调用链路**：
+
+```
+JwtStrategy.validate()
+    │
+    ▼
+authService.getAuthUser({ id: payload.userId })
+    │
+    ▼
+userService.getAuthUser(where)
+    │
+    ▼
+userService.findUsers(args)
+    │
+    ▼
+prisma.user.findMany({
+  where: {
+    ...args.where,      // { id: "xxx" }
+    deletedAt: null,    // ⚠️ 强制注入：deletedAt IS NULL
+  },
+  include: { account: true, workspace: true },
+  take: 1,
+})
+    │
+    ▼
+返回 null（用户被软删除）或 AuthUser 对象
+```
+
+**`findUsers` 强制注入 `deletedAt: null` 的证据**：
+
+```typescript
+// [user.service.ts L43-L51]
+findUsers(args: Prisma.UserFindManyArgs): Promise<User[]> {
+  return this.prisma.user.findMany({
+    ...args,
+    where: {
+      ...args.where,
+      deletedAt: null,  // ⚠️ 硬编码：无论传入什么 where 都会被软删除的用户查不到
+    },
+  });
+}
+```
+
+**关于 `User.ts 模型**虽然 [User.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/models/User.ts) GraphQL 类型中只暴露了 `lastActive`，没有 `deletedAt` 字段，但 Prisma Schema 层面存在 `deletedAt`（数据库层存在、GraphQL API 层不可见），只用于软删除实现。
+
+**`JwtStrategy` 最终判断**：
+
+```typescript
+// [jwt.strategy.ts L36-L42
+const user = await this.authService.getAuthUser({
+  id: payload.userId,
+});
+if (!user) {
+  // 用户不存在（含被软删除）→ 401
+  throw new UnauthorizedException();
+}
+return user;  // 校验通过，挂载到 req.user
+```
+
+---
+
+#### Step 4: RBAC 授权校验（资源级）
+
+这一步是认证（用户是谁）之后的授权（用户能做什么），由 `GqlAuthGuard.authorizeContext()` 执行资源级权限校验，不在本次讨论范围。
+
+---
+
+#### 四步校验失败触发条件汇总表
+
+| Step | 校验项 | 失败条件 | 异常 |
+|-------|---------|-----------|------|
+| 1 | JWT 签名 | ① Token 格式错误 ② `JWT_SECRET` 变更导致验签失败 | Passport 自动抛 401 |
+| 1 | JWT 格式合法 | ① Token 为空 ② Bearer 前缀缺失 | Passport 自动抛 401 |
+| 2 | API Token 滑动过期 | `lastAccessAt <= NOW - 30天` | `UnauthorizedException` |
+| 2 | API Token 用户 | 关联用户被软删除 | `UnauthorizedException` |
+| 3 | 用户存在性 | 用户被软删除 / ID 不存在 | `UnauthorizedException` |
+| 4 | RBAC 权限 | 资源级权限不足 | `ForbiddenException` |
 
 ---
 
@@ -784,7 +1023,7 @@ async bulkUpdateWorkspaceProjectsAndResourcesLicensed(useUserLastActive: boolean
      │                                         │    └─> AuthGuard('jwt').canActivate()
      │                                         │        └─> JwtStrategy.validate()
      │                                         │            ├─> Passport 校验签名
-     │                                         │            ├─> ignoreExpiration: true
+     │                                         │            ├─> JWT 无 exp claim → 不过期
      │                                         │            ├─> [API Token] validateApiToken()
      │                                         │            │    └─> lastAccessAt > NOW-30day ?
      │                                         │            │        ├─ Yes → update lastAccessAt
@@ -840,7 +1079,7 @@ async bulkUpdateWorkspaceProjectsAndResourcesLicensed(useUserLastActive: boolean
 
 #### 潜在风险与改进建议
 
-1. **User JWT 永久有效（高风险）**：`JwtModule` 未设置 `signOptions.expiresIn`，`JwtStrategy` 显式 `ignoreExpiration: true`。Token 一旦泄露可被永久使用。**建议**：设置 `expiresIn: "1d"`，新增 refresh token 或依赖 IdP 会话实现无感续签。
+1. **User JWT 永久有效（高风险）**：`JwtModule` 未配置 `signOptions.expiresIn`，`jwtService.sign()` 调用时也未传 options，导致签发的 JWT **不包含 `exp` claim**。jsonwebtoken.verify() 因找不到 `exp` 字段不会触发过期检查（即使 `ignoreExpiration` 默认是 `false` 也无效）。Token 一旦泄露可被永久使用。**建议**：设置 `expiresIn: "1d"`，新增 refresh token 或依赖 IdP 会话实现无感续签。
 
 2. **无 Token 撤销机制（高风险）**：除用户软删除外，无法主动撤销 User JWT。改密码、权限变更后，旧 Token 仍然有效。**建议**：引入短期 JWT + Redis 黑名单，或在 JWT 中加入 token 版本号，用户变更时递增版本。
 
