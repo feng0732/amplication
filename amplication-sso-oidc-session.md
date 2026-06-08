@@ -374,38 +374,425 @@ async prepareApiToken(...): Promise<string> {
    → ⚠️ 旧 JWT 仍然有效（签名正确、无 exp），可继续使用
 ```
 
-### 3.4 API Token 滑动续期（精确边界）
+### 3.4 API Token 完整生命周期深度分析
 
-在 [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L425-L452)：
+API Token 是 Amplication 用于 CI/CD、自动化脚本等非交互场景的认证凭据。其设计在安全性（bcrypt 哈希存储）、可用性（30 天滑动续期）和用户体验（预览字符、过期可视化）之间做了精细权衡。下面从数据库模型到前端展示逐层拆解。
+
+---
+
+#### 3.4.1 数据库模型（Prisma Schema）
+
+**代码位置**：[schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L182-L194)
+
+```prisma
+model ApiToken {
+  id           String   @id @default(cuid())        // cuid 全局唯一 ID
+  createdAt    DateTime @default(now())              // 创建时间
+  updatedAt    DateTime @updatedAt                   // 自动更新时间戳
+  name         String                                 // 用户自定义名称
+  userId       String                                 // 所属用户 ID（外键）
+  token        String                                 // bcrypt 哈希后的 JWT 明文
+  previewChars String                                 // 明文 token 的最后 8 个字符（用于视觉识别）
+  lastAccessAt DateTime                               // 最后一次有效访问时间（滑动续期基准）
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name], map: "ApiToken.userId_name_unique")  // 同一用户 token 名称唯一
+}
+```
+
+**GraphQL 暴露类型**（[ApiToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/dto/ApiToken.ts)）：
+```typescript
+export class ApiToken {
+  id!: string;
+  createdAt!: Date;
+  updatedAt!: Date;
+  name!: string;
+  userId!: string;
+  token?: string;         // ⚠️ nullable：只有创建时返回明文，后续查询为 null
+  previewChars!: string;  // 始终返回，用于列表展示
+  lastAccessAt!: Date;    // 用于过期计算
+}
+```
+
+**关键边界**：
+- `token` 字段在 GraphQL schema 中是 `nullable: true` — **只有创建 mutation 的返回值会携带明文 token**，所有查询（`userApiTokens`）返回的 `token` 字段均为 `null`。这保证明文 token **只在创建瞬间可见一次**。
+- `@@unique([userId, name])` — 同一用户不能创建两个同名 token，但不同用户可以。
+
+---
+
+#### 3.4.2 创建流程（完整链路）
+
+```
+前端 NewApiToken                     auth.resolver.ts                    auth.service.ts
+     │                                    │                                  │
+     │ 1. 用户填写 token name             │                                  │
+     │    (Formik 校验 name 非空)         │                                  │
+     │───────────────────────────────────>│                                  │
+     │                                    │                                  │
+     │                                    │ 2. @UseGuards(GqlAuthGuard)     │
+     │                                    │    校验 User JWT 合法            │
+     │                                    │                                  │
+     │                                    │ 3. @AuthorizeContext(           │
+     │                                    │      AuthorizableOriginParameter.None,
+     │                                    │      "",                        │
+     │                                    │      "apiToken.create")        │
+     │                                    │    校验创建权限                  │
+     │                                    │                                  │
+     │                                    │ 4. 注入 userId 到 data.user    │
+     │                                    │    args.data.user = {           │
+     │                                    │      connect: { id: user.id } }│
+     │                                    │──────────────────────────────────>│
+     │                                    │                                  │ 5. getAuthUser() 检查用户存在
+     │                                    │                                  │    （含软删除过滤）
+     │                                    │                                  │
+     │                                    │                                  │ 6. tokenId = cuid()
+     │                                    │                                  │ 7. prepareApiToken() 签发 JWT
+     │                                    │                                  │    （type: ApiToken, 含 tokenId）
+     │                                    │                                  │
+     │                                    │                                  │ 8. previewChars = token.slice(-8)
+     │                                    │                                  │ 9. hashedToken = bcrypt.hash(token)
+     │                                    │                                  │
+     │                                    │                                  │ 10. prisma.apiToken.create({
+     │                                    │                                  │       id: tokenId,
+     │                                    │                                  │       lastAccessAt: new Date(),
+     │                                    │                                  │       previewChars,
+     │                                    │                                  │       token: hashedToken,
+     │                                    │                                  │       ...
+     │                                    │                                  │     })
+     │                                    │                                  │
+     │                                    │ 11. 返回明文 token（仅此一次）    │
+     │<───────────────────────────────────│<──────────────────────────────────│
+     │                                    │                                  │
+     │ 12. 提示用户"Make sure to copy..."  │                                  │
+     │     + 一次性 Copy Token 按钮       │                                  │
+```
+
+**创建实现的精确代码**（[auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L390-L420)）：
+
+```typescript
+async createApiToken(args: CreateApiTokenArgs): Promise<ApiToken> {
+  // Step 5: 用户存在性检查（含软删除过滤）
+  const user = await this.getAuthUser({
+    id: args.data.user.connect.id,
+    deletedAt: null,
+  });
+  if (!user) {
+    throw new AmplicationError(
+      `No user found with ID: ${args.data.user.connect.id}`
+    );
+  }
+
+  const tokenId = cuid();                                     // Step 6
+  const token = await this.prepareApiToken(user, tokenId);    // Step 7: 签发 JWT
+  const previewChars = token.slice(-TOKEN_PREVIEW_LENGTH);    // Step 8: 取最后 8 字符
+  const hashedToken = await this.passwordService.hashPassword(token);  // Step 9: bcrypt 哈希
+
+  // Step 10: 入库
+  const apiToken = await this.prismaService.apiToken.create({
+    data: {
+      ...args.data,
+      id: tokenId,
+      lastAccessAt: new Date(),   // 初始化为创建时间
+      previewChars,
+      token: hashedToken,         // 只存哈希，不存明文
+    },
+  });
+
+  apiToken.token = token;   // Step 11: 临时挂载明文到返回对象（只这一次）
+  return apiToken;
+}
+```
+
+**前端创建界面**（[NewApiToken.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/NewApiToken.tsx)）：
+- 只需要填写 `name`（最小长度 1）
+- 创建成功后触发埋点 `AnalyticsEventNames.ApiTokenCreate`
+- 使用 `cache.modify` 将新 token 插入 Apollo 缓存列表
+
+---
+
+#### 3.4.3 bcrypt Hash 和 previewChars 的设计意图
+
+这是 API Token 设计中最精妙的部分：**bcrypt 哈希存储，但不参与校验**。
+
+**bcrypt Hash 的用途**（不是用于校验）：
+
+| 用途 | 说明 |
+|------|------|
+| 数据库泄露防护 | 即使攻击者获取数据库备份，看到的是 bcrypt 哈希（默认 10+ salt rounds），无法反推明文 JWT |
+| 视觉确认辅助 | 通过 previewChars 肉眼比对，间接确认数据库记录与用户持有的明文对应 |
+
+**为什么 hash 不参与校验**：
+JWT 签名（HMAC-SHA256，密钥 `JWT_SECRET`）已经保证了 `userId` 和 `tokenId` 的完整性。攻击者无法伪造 payload 中的 `tokenId` 字段。因此 `validateApiToken` 只需用 `userId + tokenId` 做条件即可，无需再进行 bcrypt 比对（性能开销大）。
+
+**previewChars 的生成和用途**：
+
+```typescript
+// auth.service.ts
+const TOKEN_PREVIEW_LENGTH = 8;
+const previewChars = token.slice(-TOKEN_PREVIEW_LENGTH);  // 取明文 JWT 最后 8 字符
+```
+
+前端展示（[ApiTokenListItem.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/ApiTokenListItem.tsx#L75-L78)）：
+```typescript
+<span className={`${CLASS_NAME}__token-preview`}>
+  ***********{apiToken.previewChars}   // 11 个星号 + 最后 8 字符
+</span>
+```
+
+显示效果示例：`***********aBc123Xy`
+
+用户删除 token 时，可通过预览字符确认删的是对的那个（虽然还有 token name 作为主要识别方式）。
+
+---
+
+#### 3.4.4 列表查询可见性边界
+
+**Resolver 层**（[auth.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.resolver.ts#L97-L101)）：
+
+```typescript
+@Query(() => [ApiToken])
+@UseGuards(GqlAuthGuard)
+async userApiTokens(@UserEntity() user: User): Promise<ApiToken[]> {
+  // ⚠️ 直接用当前登录用户的 ID 查询，无需额外权限校验
+  return this.authService.getUserApiTokens({ where: { id: user.id } });
+}
+```
+
+**Service 层**（[auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L471-L491)）：
+
+```typescript
+async getUserApiTokens(args: FindOneArgs): Promise<ApiToken[]> {
+  return this.prismaService.apiToken.findMany({
+    where: {
+      userId: args.where.id,   // 只查当前用户自己的 tokens
+    },
+    select: {
+      id: true,
+      createdAt: true,
+      updatedAt: true,
+      name: true,
+      previewChars: true,      // 返回预览字符
+      lastAccessAt: true,      // 返回最后访问时间（前端算过期）
+      userId: true,
+      // ⚠️ 注意：select 中没有 token 字段！
+      // 所以返回值中 token 是 undefined / null
+    },
+    orderBy: {
+      createdAt: Prisma.SortOrder.desc,  // 新创建的排在前面
+    },
+  });
+}
+```
+
+**可见性边界结论**：
+- 用户**只能看到自己创建的 tokens**（`where: { userId: args.where.id }`）
+- 返回的 token 列表**绝对不包含明文 token**（`select` 中没有 `token` 字段）
+- 列表按 `createdAt desc` 倒序，新创建的排在最前
+
+---
+
+#### 3.4.5 前端列表过期状态展示（视觉与计算）
+
+前端通过 `lastAccessAt` 计算过期状态，并以视觉样式呈现。
+
+**过期计算逻辑**（[ApiTokenListItem.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/ApiTokenListItem.tsx#L15-L37)）：
+
+```typescript
+const EXPIRATION_DAYS = 30;
+
+// 在组件内部：
+const expirationDate = addDays(
+  new Date(apiToken.lastAccessAt),   // 基准：最后一次有效访问时间
+  EXPIRATION_DAYS                     // 加 30 天得到理论过期时间
+);
+
+const expired = differenceInDays(new Date(), expirationDate) > 0;
+// ⚠️ differenceInDays 只比较"天"的整数差，忽略时分秒
+// new Date() - expirationDate > 0 days → 已过期
+```
+
+**展示元素**：
+
+| 元素 | 位置 | 未过期状态 | 已过期状态 |
+|------|------|-----------|-----------|
+| 过期时间文本 | 右侧 | `Expiration in 25 days`（`TimeSince` 组件） | `Expiration 2 days ago` |
+| 左侧图标背景色 | 面板左 tag | 默认灰色 | 浅红色背景 + 红色边框 + 红色图标 |
+| 过期时间图标 | `TimeSince` 内部 | 默认色 | 红色圆形背景 |
+| 新建 token 高亮 | 面板 tag | **创建瞬间**：青绿色背景 + 青绿色边框 | — |
+
+对应 SCSS（[ApiTokenListItem.scss](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/ApiTokenListItem.scss#L13-L26)）：
+
+```scss
+&--expired {
+  .api-token-list-item {
+    &__panel-tag {
+      background-color: var(--theme-light-red-transparent);  // 浅红背景
+      border: 1px solid var(--theme-light-red);              // 红色边框
+      color: var(--theme-light-red);                         // 红色图标
+    }
+    &__expiration {
+      .time-since__icon {
+        background-color: var(--theme-light-red);            // 红色圆形图标背景
+      }
+    }
+  }
+}
+```
+
+**前端说明文案**（[ApiTokenList.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/ApiTokenList.tsx#L89-L99)）：
+
+> API tokens are used to authenticate requests to the Amplication API. They are specifically required for Integrations from third party services.
+> Tokens are valid for 30 days following creation or last use. **The 30 day expiration period automatically refreshes with each API.**
+> Tokens are created with the permissions of the user who creates them, and each user can only see their own tokens.
+
+**⚠️ 重要：前端过期展示 ≠ 后端实时失效**
+
+前端只是基于 `lastAccessAt` 的**乐观估算**，真正的失效由后端 `validateApiToken` 在每次请求时精确判定。可能存在以下边界情况：
+
+| 场景 | 前端显示 | 后端实际状态 | 说明 |
+|------|---------|-------------|------|
+| 最后一次使用是 29 天前 | 显示"1天后过期" | 有效（`lastAccessAt > NOW-30d`） | 一致 |
+| 最后一次使用是 30 天整前 0 毫秒 | 显示"今天过期" / "刚刚过期"（取决于 TimeSince 实现） | **已失效**（`gt` 严格大于） | 前端可能显示未过期，实际请求会 401 |
+| 最后一次使用是 31 天前 | 显示"1天前过期" | 失效 | 一致 |
+| 用户被软删除 | 显示正常（前端不知道） | 失效（`user.deletedAt != null`） | 前端展示正常，实际请求 401 |
+
+---
+
+#### 3.4.6 删除授权边界
+
+**删除的双层校验**：
+
+```
+前端 DeleteApiToken                    auth.resolver.ts                 validation-functions.ts
+     │                                     │                                   │
+     │ 1. 点击垃圾桶图标                    │                                   │
+     │────────────────────────────────────>│                                   │
+     │                                     │                                   │
+     │                                     │ 2. 弹出确认对话框                 │
+     │<────────────────────────────────────│                                   │
+     │                                     │                                   │
+     │ 3. 用户确认 "Delete"                │                                   │
+     │────────────────────────────────────>│                                   │
+     │                                     │                                   │
+     │                                     │ 4. @UseGuards(GqlAuthGuard)      │
+     │                                     │    校验 User JWT                  │
+     │                                     │                                   │
+     │                                     │ 5. @AuthorizeContext(            │
+     │                                     │      AuthorizableOriginParameter.ApiTokenId,
+     │                                     │      "where.id")                  │
+     │                                     │    ↓ 调用                          │
+     │                                     │                                   │ 6. VALIDATION_FUNCTIONS[ApiTokenId]
+     │                                     │                                   │    prisma.apiToken.count({
+     │                                     │                                   │      where: {
+     │                                     │                                   │        id: originId,       // token ID
+     │                                     │                                   │        userId: user.id,    // ⚠️ 当前用户 ID
+     │                                     │                                   │      }
+     │                                     │                                   │    })
+     │                                     │                                   │    ↓ count === 1 ?
+     │                                     │                                   │
+     │                                     │ 7. 权限校验通过                    │
+     │                                     │───────────────────────────────────│
+     │                                     │                                   │
+     │                                     │ 8. authService.deleteApiToken()  │
+     │                                     │    prisma.apiToken.delete({       │
+     │                                     │      where: { id: args.where.id }│
+     │                                     │    })                              │
+     │                                     │ 9. refetchQueries GET_API_TOKENS │
+     │<────────────────────────────────────│                                   │
+     │                                     │                                   │
+```
+
+**权限校验的精确实现**（[validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L198-L211)）：
+
+```typescript
+[AuthorizableOriginParameter.ApiTokenId]: async (
+  prisma: PrismaService,
+  originId: string,     // 要删除的 token ID
+  workspaceId: string,  // 未使用（ApiToken 是用户级资源，非工作区级）
+  user: AuthUser        // 当前登录用户
+) => {
+  const matching = await prisma.apiToken.count({
+    where: {
+      id: originId,       // token ID 匹配
+      userId: user.id,    // ⚠️ 关键：必须属于当前用户
+    },
+  });
+  return { canAccessWorkspace: matching === 1 };
+  // ⚠️ 返回字段名是 canAccessWorkspace，但实际语义是"能否操作该 token"
+  // 这是因为复用了统一的 ValidationResponse 类型
+};
+```
+
+**删除授权边界结论**：
+- **用户只能删除自己的 tokens**，即使知道别人的 token ID 也无法删除
+- 删除后前端立即通过 `refetchQueries` 刷新列表
+- 删除确认文案：*"This API token will stop working immediately. Are you sure you want to delete this token?"*
+
+---
+
+#### 3.4.7 后端滑动失效（validateApiToken 原子操作）
+
+这是 API Token 有效性的**最终判定点**，在每次 API 请求时由 `JwtStrategy.validate()` 触发。
+
+**精确代码**（[auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L421-L452)）：
 
 ```typescript
 const TOKEN_EXPIRY_DAYS = 30;
 
-async validateApiToken(args): Promise<boolean> {
+async validateApiToken(args: {
+  userId: string;
+  tokenId: string;
+  token: string;   // ⚠️ 参数虽然传入，但函数体内**从未使用**！
+}): Promise<boolean> {
   const lastAccessThreshold = subDays(new Date(), TOKEN_EXPIRY_DAYS);
 
-  // 原子操作：查找符合条件的 token 并同时更新 lastAccessAt
+  // 原子操作：查找 + 更新在同一条 SQL 中完成
   const apiToken = await this.prismaService.apiToken.updateMany({
     where: {
-      userId: args.userId,
-      id: args.tokenId,
-      lastAccessAt: { gt: lastAccessThreshold },  // ⚠️ 边界：> 30天前，非 >=
-      user: { deletedAt: null },                   // 用户未软删除
-      // ⚠️ token hash 正确性由 JWT 签名保障，此处不再额外比对
+      userId: args.userId,                          // 条件 1: 用户 ID
+      id: args.tokenId,                             // 条件 2: Token 记录 ID
+      lastAccessAt: { gt: lastAccessThreshold },    // 条件 3: lastAccessAt 严格大于 30 天前
+      user: {
+        deletedAt: null,                            // 条件 4: 关联用户未软删除
+      },
     },
     data: {
-      lastAccessAt: new Date(),  // 滑动续期：只有条件满足才会重置
+      lastAccessAt: new Date(),  // 所有条件满足 → 原子更新，滑动续期
     },
   });
 
+  // 精确匹配 1 条记录才算成功
+  // 防止并发下出现重复匹配或多匹配
   return apiToken.count === 1;
 }
 ```
 
-**精确边界**：
-- `lastAccessAt > T-30天` 而非 `>=`，意味着精确 30×24h 前那一刻已经失效
-- `updateMany` 是原子操作：续期和校验在同一 SQL 中完成，避免并发问题
-- 若 `lastAccessAt` 超过阈值，`updateMany` 返回 `count === 0`，校验失败
+**四个 where 条件的精确边界**：
+
+| 条件 | 精确含义 | 失败场景 |
+|------|---------|---------|
+| `userId: args.userId` | token 属于 JWT 中声明的用户 | token 被篡改 userId 不匹配 |
+| `id: args.tokenId` | token 记录 ID 匹配 | token 不存在 / 已删除 |
+| `lastAccessAt: { gt: lastAccessThreshold }` | **严格大于** `NOW - 30 天` | 恰好 30×24h 前或更早 → 已过期 |
+| `user: { deletedAt: null }` | 通过 Prisma 关联查询，用户未被软删除 | 用户被软删除 → token 同步失效 |
+
+**`token` 参数传入但未使用的设计解释**：
+如 3.4.3 节所述，JWT 签名已保证 `userId` 和 `tokenId` 无法被篡改，bcrypt 比对在此处是冗余操作（且 bcrypt 性能开销大，约 100ms/次），因此设计者选择只做数据库条件匹配。
+
+**滑动续期的原子性保证**：
+`updateMany` 是单条 SQL，`where` 匹配和 `data` 更新在同一个事务中完成。即使两个请求同时到达，也只有一个能拿到 `count === 1`，不会出现续期竞态。
+
+**后端失效 vs 前端展示的差异**：
+
+| 判断维度 | 前端（ApiTokenListItem） | 后端（validateApiToken） |
+|---------|------------------------|------------------------|
+| 过期基准 | `lastAccessAt + 30 天` | `NOW - 30 天` 作阈值 |
+| 精度 | `differenceInDays`（天级整数，忽略时分秒） | 精确到毫秒（`gt` 严格大于） |
+| 用户软删除 | 无法感知（前端不查） | 通过 Prisma 嵌套查询 `user.deletedAt` 判定 |
+| 触发时机 | 渲染列表时（静态估算） | **每次** API 请求时（实时判定） |
+| 结果性质 | 乐观提示（仅供参考） | 最终判定（直接决定 401） |
+
+---
 
 ### 3.5 前端令牌获取与持久化
 
