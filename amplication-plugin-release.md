@@ -356,25 +356,83 @@ Tarball.packageTarball()
 
 ##### ▶️ 情况二：`version = "9.9.9"`（合法 SemVer，但 npm 上不存在该版本）
 
+这是整个链路中最容易理解错的部分，必须区分**代码意图**、**实际执行路径**和**用户最终看到的构建日志**三层。
+
+---
+
+**代码意图（Tarball 分支 2 想做什么）**
+
+代码 [Tarball.ts:L52-L64](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52-L64) 的设计初衷是：
+
+```typescript
+if (!requestedVersion.version) {
+  // 想输出："@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."
+  await this.logger.error(
+    [`${name}@${version} is not available`, suggestionMessage].join(". ")
+  );
+  // 想抛出：Error("Could not find version 9.9.9 for @xxx/plugin. Please try...")
+  throw new Error(
+    [`Could not find version ${version} for ${name}`, suggestionMessage].join(". ")
+  );
+}
 ```
-DynamicPackageInstallationManager
+
+**但这段代码实际上永远不会执行。**
+
+---
+
+**实际执行路径（对照代码逐行）**
+
+```
+plugin.version = "9.9.9"（合法 SemVer，但 npm 上无此版本）
+  │
+  ▼
+[DynamicPackageInstallationManager.ts:L24]
   → valid("9.9.9") = "9.9.9"
-  → 传给 Tarball version: "9.9.9"
-
-Tarball.packageTarball()
-  → !version → false
-  → version === "latest" → false
+  → 传给 Tarball version = "9.9.9"
+  │
+  ▼
+[Tarball.ts:L39]
+  → response = await packument("@xxx/plugin@9.9.9")
+    （pacote 返回包完整 packument，包含所有已存在版本，但不含 9.9.9）
+  → latestVersion = response.versions["1.5.0"]（假设 latest 是 1.5.0）
   → requestedVersion = response.versions["9.9.9"] → undefined
-  → !requestedVersion.version → !undefined.version → 触发 TypeError（Cannot read properties of undefined）
-  → 异常被 install() 的 try-catch 捕获
-     → 触发 onError 钩子：logger.error("Failed to installed plugin...")
-     → 重新 throw error
-     → 整个 DSG 构建失败
+  │
+  ▼
+[Tarball.ts:L52] if (!requestedVersion.version)
+  → requestedVersion 本身就是 undefined
+  → JS 试图访问 undefined.version
+  → 立即抛出原生 TypeError: Cannot read properties of undefined (reading 'version')
+  → ⚠️  if 分支内部的 logger.error 和 throw new Error **完全不会执行**
+  │
+  ▼
+[DynamicPackageInstallationManager.ts:L40-L43] try-catch 捕获 TypeError
+  → L41: onError(plugin) 触发
+       → [dynamic-package-installation.ts:L52-L57]
+       → await buildLogger.error(
+            "Failed to installed plugin: @xxx/plugin@9.9.9",
+            { ...TypeError 整个对象被展开 }
+          )
+  → L42: throw error  （重新抛出 TypeError）
+  │
+  ▼
+TypeError 冒泡到 DSG 顶层 → 整个代码生成构建失败
 ```
 
-**直接中断构建**，并向用户输出建议：尝试安装其他版本或使用最新版 `latestVersion`。
+---
 
-> 🔍 代码细节：`if (!requestedVersion.version)` 实际上隐含了两个前提——`requestedVersion` 必须存在且其 `.version` 属性必须为真值。如果版本完全不存在（`requestedVersion` 是 `undefined`），访问 `.version` 会抛出 JS 原生 `TypeError`，而非进入 `if` 分支输出友好错误。这个异常最终被外层 `try-catch` 捕获后通过 `onError` 钩子输出构建日志。
+**用户在构建日志里实际看到的内容**
+
+| 日志来源 | 实际输出 | 是否会出现 |
+|----------|---------|-----------|
+| Tarball 分支 2 友好错误 | `"@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."` | ❌ **永远不会出现**（TypeError 先发生，此分支不可达） |
+| Tarball 分支 2 抛错信息 | `Error: Could not find version 9.9.9 for @xxx/plugin. Please try...` | ❌ **永远不会出现**（同上） |
+| onError 钩子 [dynamic-package-installation.ts:L53-L55](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L53-L55) | `"Failed to installed plugin: @xxx/plugin@9.9.9"` + TypeError 对象的全部字段（stack、message 等） | ✅ 会出现 |
+| DSG 顶层未捕获异常 | `TypeError: Cannot read properties of undefined (reading 'version')` 及其堆栈 | ✅ 会出现（构建终止报错） |
+
+---
+
+> 🔍 **代码 Bug 结论**：`if (!requestedVersion.version)` 的写法有缺陷。正确写法应该是 `if (!requestedVersion || !requestedVersion.version)`，否则当 `requestedVersion` 为 `undefined`（版本不存在的唯一情况）时，先抛 TypeError 导致友好错误分支成为死代码。当前用户无法收到"请换版本或用最新版"的建议，只能看到晦涩的 TypeError 堆栈。
 
 ##### ▶️ 情况三：`version = "1.0.0"`（合法 SemVer，npm 上存在，但被标记 deprecated）
 
@@ -445,22 +503,25 @@ PluginInstallation.version
                           ┌─────┴──────┐
                           │            │
                    requestedVersion   requestedVersion = undefined
-                   存在               （版本不存在）
+                   存在               （npm 上无此版本）
                           │            │
                           ▼            ▼
-                   ┌────────────┐  ┌────────────────────────┐
-                   │ deprecated?│  │ 报错 + 中断构建         │
-                   │ 是→warn    │  │ "Could not find version"│
-                   │ 否→无操作  │  └────────────────────────┘
-                   └─────┬──────┘
-                         │
-                         ▼
-                   正常下载 tarball
-                   解压到 pluginInstallationPath
-                         │
+                   ┌────────────┐  ┌──────────────────────────────────┐
+                   │ deprecated?│  │ TypeError 访问 undefined.version  │
+                   │ 是→warn    │  │ ↓                                │
+                   │ 否→无操作  │  │ onError 钩子：                    │
+                   └─────┬──────┘  │   "Failed to installed plugin"   │
+                         │          │ ↓                                │
+                         ▼          │ 重新 throw TypeError             │
+                   正常下载 tarball  │ ↓                                │
+                   解压到 modules/   │ 中断 DSG 构建                    │
+                         │          └──────────────────────────────────┘
                          ▼
                onAfterInstall 上报 BuildManager
                （requestedFullPackageName 用原始 version）
+
+  ⚠️  Tarball 分支 2 中的友好错误日志和友好 Error 是死代码，
+      永远不会执行到（TypeError 先发生）。
 ```
 
 ### 4.5 插件安装配置校验
@@ -598,7 +659,10 @@ workflow_dispatch (输入 version)
 │                 → Tarball.download()                                         │
 │                      → Tarball.packageTarball() 三分支决策：                  │
 │                         • version=null（含 "latest"/非法字符串）→ 下 latest 版 │
-│                         • 合法 SemVer 但 npm 不存在 → 抛错中断构建            │
+│                         • 合法 SemVer 但 npm 不存在 → TypeError（访问 undefined.version）│
+│                                              → onError: "Failed to installed plugin"│
+│                                              → rethrow TypeError → 中断 DSG  │
+│                                              （注意：友好错误分支是死代码）     │
 │                         • 合法 SemVer 存在 → deprecated? warn+继续 : 直接继续 │
 │                      → 下载 tarball 解压到 amplication_modules/             │
 │                 → onAfterInstall：用原始 version 字符串上报 BuildManager     │
