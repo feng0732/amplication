@@ -463,6 +463,128 @@ deleteField(strategy=UpdateToScalar)
 
 ---
 
+### 6.4 UpdateToScalar 的可达性分析
+
+#### 6.4.1 公开删除入口不支持传入策略
+
+**GraphQL Resolver 定义**（[entity.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.resolver.ts#L285-L296)）：
+
+```typescript
+@Mutation(() => EntityField, { nullable: false })
+async deleteEntityField(
+  @UserEntity() user: User,
+  @Args() args: FindOneArgs   // ← 只有 where 参数，无 fieldStrategy
+): Promise<EntityField | null> {
+  return this.entityService.deleteField(args, user);  // ← 不传第三参数
+}
+```
+
+**DTO 类型定义**（[DeleteEntityFieldArgs.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/DeleteEntityFieldArgs.ts)）：
+
+```typescript
+@ArgsType()
+export class DeleteEntityFieldArgs {
+  @Field(() => WhereUniqueInput, { nullable: false })
+  where!: WhereUniqueInput;   // ← 仅 where，无 strategy 字段
+}
+```
+
+同理，实体删除的公开入口 [DeleteOneEntityArgs.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/dto/DeleteOneEntityArgs.ts) 和对应 Resolver 也仅接受 `where` 参数。
+
+**可达性结论：**
+
+| 入口 | 是否暴露 fieldStrategy | 实际使用策略 |
+|-----|----------------------|------------|
+| `deleteEntityField` GraphQL Mutation | ❌ 否 | `Delete`（默认值） |
+| `deleteEntity` GraphQL Mutation | ❌ 否 | `Delete`（默认值） |
+| `entityService.deleteField()` 内部调用 | ✅ 是 | 由调用方决定 |
+| `entityService.deleteOneEntity()` 内部调用 | ✅ 是 | 由调用方决定 |
+
+**前端/外部 API 用户无法选择 UpdateToScalar 策略**，该策略仅限服务器内部代码使用。
+
+---
+
+#### 6.4.2 全项目调用点汇总
+
+| 调用位置 | 策略参数 | 使用场景 |
+|---------|---------|---------|
+| [entity.resolver.ts L295](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.resolver.ts#L295) | （不传，默认 `Delete`） | 公开 GraphQL 接口删除字段 |
+| [entity.resolver.ts L118](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.resolver.ts#L118) | （不传，默认 `Delete`） | 公开 GraphQL 接口删除实体 |
+| [entity.service.ts L705](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L705) | `EnumRelatedFieldStrategy.Delete` | Prisma Schema 同步时删除不在新 Schema 中的字段 |
+| [entity.service.ts L801](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L801) | `EnumRelatedFieldStrategy.Delete` | Prisma Schema 同步时重建字段 |
+| [entity.service.ts L974](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L974) | 透传 `fieldStrategy` 参数（默认 `Delete`） | 删除实体时级联处理所有引用该实体的 Lookup 字段 |
+| [resource.service.ts L1117-L1120](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1117-L1120) | **`EnumRelatedFieldStrategy.UpdateToScalar`** | **跨服务移动实体（Redesign Project 功能）**：从原服务删除实体时保留外键数据列，避免数据丢失 |
+
+**唯一使用 UpdateToScalar 的场景**：[resource.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1117-L1120) 中 Redesign Project（项目重构）功能将实体从一个服务迁移到另一个服务时，在原服务端删除实体使用 `UpdateToScalar`，目的是保留外键列及其数据，避免迁移过程中的数据丢失。
+
+---
+
+### 6.5 UpdateToScalar 场景下 fkHolder 同步的潜在风险
+
+#### 6.5.1 fkHolder 同步逻辑
+
+位于 [entity.service.ts L3076-L3102](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3076-L3102)：
+
+```typescript
+const updateFieldProperties =
+  updatedField.properties as unknown as types.Lookup;
+
+if (
+  field.dataType === EnumDataType.Lookup &&            // ← 检查更新前的字段类型
+  updateFieldProperties?.fkHolder !== null              // ← 检查更新后的 fkHolder
+) {
+  // 获取对端字段
+  const relatedField = await this.getField({
+    where: { permanentId: updateFieldProperties.relatedFieldId },
+    include: { entityVersion: true },
+  });
+
+  // 将本端的 fkHolder 值同步到对端字段的 properties
+  const relatedFieldProps = relatedField.properties as unknown as types.Lookup;
+  relatedFieldProps.fkHolder = (
+    updatedField.properties as unknown as types.Lookup
+  )?.fkHolder;
+
+  await this.prisma.entityField.update({
+    where: { id: relatedField.id },
+    data: { properties: relatedFieldProps as unknown as Prisma.InputJsonValue },
+  });
+}
+```
+
+#### 6.5.2 UpdateToScalar 场景下的执行时序问题
+
+`updateField()` 中的执行顺序（结合 UpdateToScalar 调用）：
+
+```
+时序：
+ ① shouldDeleteRelated 判定 → true（Lookup → 非 Lookup）
+ ② deleteRelatedField() → 删除对端 EntityField + ModuleAction + ModuleDto
+ ③ prisma.entityField.update() → 将本端 dataType 改为 Json/String，
+                                  properties 被替换为标量类型的默认属性（无 fkHolder/relatedFieldId）
+ ④ fkHolder 同步检查（L3076-L3102）
+```
+
+**在步骤 ④ 时：**
+- `field.dataType`：闭包变量，仍为 `EnumDataType.Lookup`（更新前的值）→ ✅ 条件成立
+- `updateFieldProperties.fkHolder`：因为步骤 ③ 中 properties 已被替换为 `DATA_TYPE_TO_DEFAULT_PROPERTIES[Json]`（空对象 `{}`），所以为 `undefined` → ❌ `undefined !== null` 条件不成立
+- `updateFieldProperties.relatedFieldId`：同样为 `undefined`
+
+**实际结果**：因为 `fkHolder === undefined`，所以 `fkHolder !== null` 为 false，**同步逻辑被跳过，不会触发错误**。
+
+#### 6.5.3 风险分析
+
+| 风险场景 | 是否实际发生 | 说明 |
+|---------|------------|------|
+| 对端字段已被删除后仍尝试读取 | ❌ 否 | `fkHolder` 为 undefined 短路跳过，不会执行 `getField()` |
+| 对端 properties 被错误写入无效 fkHolder | ❌ 否 | 同上，同步逻辑完全不执行 |
+| 本端更新后 properties 类型不一致 | ✅ 是 | `updatedField.properties` 已被强制转换为 Lookup 类型（typescript as 断言），但实际运行时是标量属性 |
+| 未来代码变更导致条件变化 | ⚠️ 潜在 | 如果 `DATA_TYPE_TO_DEFAULT_PROPERTIES` 中 Json 类型意外包含非空 `fkHolder`，或判断条件改为 `!== undefined`，将触发对已删除字段的访问 |
+
+**当前代码恰好安全的关键原因**：标量类型的 `DATA_TYPE_TO_DEFAULT_PROPERTIES` 为空对象 `{}`，使得 `fkHolder` 取值为 `undefined`，与 `null` 的比较不通过，从而跳过了后续所有操作。这是一个隐式依赖，而非显式设计。
+
+---
+
 ## 七、实体删除：软删除机制
 
 ### ⚠️ 重要发现：实体删除不是物理删除，而是软删除
@@ -725,7 +847,10 @@ model Profile {
 | 嵌套 DTO 操作 | Create/Connect/ConnectOrCreate/Disconnect/Set 五种齐全 | **to-Many**：Create 场景仅 Connect，Update 场景 Connect+Disconnect+Set；**to-One**：无独立 DTO，直接用 WhereUniqueInput | ❌ Create 和 ConnectOrCreate 从未实际生成 |
 | to-One 的 DTO | 有独立的 `CreateNestedOneWithout...` 类 | 不生成独立嵌套 DTO，直接引用 `XxxWhereUniqueInput`（只能通过 ID 关联） | ❌ 与描述不一致 |
 | 实体删除 | 物理删除 | 软删除（`deletedAt` + 名称加 `__${id}_` 前缀 + 当前版本标记 `deleted=true`） | ❌ 是软删除不是硬删除 |
+| UpdateToScalar 可达性 | 可能认为公开 API 可以选择策略 | `DeleteEntityFieldArgs` 和 `DeleteOneEntityArgs` 都只有 `where` 参数，Resolver 不传第三参数，**公开入口仅使用默认 Delete 策略**，UpdateToScalar 仅限服务器内部调用 | ❌ 外部不可达 |
+| UpdateToScalar 使用场景 | 未明确说明，可能认为通用功能 | 全项目仅 [resource.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1117-L1120) 一处使用：**Redesign Project 跨服务移动实体**，目的是保留外键列数据避免迁移丢失 | ⚠️ 专用功能，非通用删除选项 |
 | UpdateToScalar 对端影响 | 认为"不对对端字段做任何修改" | `updateField()` 内部的 `shouldDeleteRelated`（Lookup→非Lookup）自动触发 `deleteRelatedField()`，**对端 EntityField/ModuleAction/ModuleDto 全部被删除** | ❌ 描述完全错误 |
 | UpdateToScalar 本端转换 | 笼统说"转换为标量字段" | to-Many→`Json`（名称不变）；to-One→ID 标量类型（字段名加 `Id` 后缀，displayName 加 ` ID` 后缀） | ⚠️ 描述不够精确 |
 | UpdateToScalar 本端清理 | 未提及 | 本端 **ModuleAction 和 ModuleDto 未被清理**（`return` 跳过了清理代码），存在残留数据 | ❌ 潜在 Bug |
+| fkHolder 同步风险 | 未提及 | `updateField()` 中 fkHolder 同步使用 `!== null` 判定，恰好因为标量 properties 为空对象 `{}` 使得 `fkHolder` 为 `undefined` 而被跳过，属于**隐式依赖而非显式设计**；若条件改为 `!== undefined` 或默认属性变化，将触发访问已删除对端字段的异常 | ⚠️ 脆弱的隐式安全 |
 | Blueprint 级联构建 | 未区分，可能误认为与实体关系有关 | 完全独立的机制，作用于 Resource 构建顺序（BFS 遍历 `parentShouldBuildWithChild`），与数据模型完全无关 | ❌ 需要明确区分 |
