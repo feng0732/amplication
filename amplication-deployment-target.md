@@ -467,6 +467,145 @@ ResourceResolver 类级别有 [@UseGuards(GqlAuthGuard)](file:///d:/fz/0601/solo
 | `@AuthorizeContext(EnvironmentId, ...)` | ❌ 永不触发 | 无挂载点 |
 | JWT 认证 | ✅ | 类级 `@UseGuards(GqlAuthGuard)` |
 
+#### 4.4.4 两种权限装饰器的机制差异（影响所有父级路径）
+
+在分析父级资源访问路径之前，必须先明确项目中两种装饰器的本质区别：
+
+| 机制 | `@AuthorizeContext` | `@InjectContextValue`（不带 permissions 参数） |
+|-----|--------------------|----------------------------------------------|
+| 生效位置 | `GqlAuthGuard.canActivate()`（Guard 阶段） | `InjectContextInterceptor.intercept()`（全局 Interceptor 阶段） |
+| 注册方式 | resolver 方法装饰器 + 类级 `@UseGuards(GqlAuthGuard)` | 全局 `APP_INTERCEPTOR`（[app.module.ts:80-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L80-L83)），对所有 resolver 生效 |
+| 核心行为 | 从请求参数中读出值，用 `VALIDATION_FUNCTIONS[parameterType]` 校验该值是否属于用户 workspace | 把 `user.workspace.id` 或 `user.id` **强制写入**请求参数的指定路径，覆盖用户输入 |
+| 权限校验 | ✅ 执行（workspace 归属 + 可选细粒度权限） | ❌ **不执行**。无 permissions 参数时仅做参数注入，`GqlAuthGuard.authorizeContext()` 在 [gql-auth.guard.ts:69-71](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L69-L71) 直接返回 true |
+| ResolveField 是否触发 | ✅ 触发（@UseGuards 在类级） | ✅ 触发（全局 APP_INTERCEPTOR） |
+| 无装饰器时 | 返回 true（放行） | 不做任何注入（放行） |
+
+两种装饰器均定义于：
+- [authorizeContext.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/authorizeContext.decorator.ts)
+- [injectContextValue.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/injectContextValue.decorator.ts)
+
+#### 4.4.5 父级资源访问路径与 environments 字段的权限继承链
+
+`Resource.environments` ResolveField（[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)）本身无任何装饰器，其保护完全依赖**父级 Resource 对象是通过哪条查询路径获取的**。以下逐一核对 3 条可达路径：
+
+---
+
+**路径 A：`query { resource(id) { environments } }` — 单资源直查**
+
+```typescript
+// [resource.resolver.ts:68-72]
+@Query(() => Resource, { nullable: true })
+@AuthorizeContext(AuthorizableOriginParameter.ResourceId, "where.id")
+async resource(@Args() args: FindOneArgs): Promise<Resource | null> {
+  return this.resourceService.resource(args);
+}
+```
+
+保护链路：
+1. ✅ JWT 认证（类级 GqlAuthGuard）
+2. ✅ `@AuthorizeContext(ResourceId, "where.id")` — 用 `VALIDATION_FUNCTIONS[ResourceId]` 校验该 Resource 是否属于用户 workspace
+3. ✅ Resource 对象通过校验后，才会被 ResolveField 消费
+4. `environments` 无装饰器 → 直接放行
+5. `environmentService.findMany({ where: { resource: { id: resource.id } } })` — 用已校验的 resourceId 查询
+
+**结论**：✅ 安全。environments 继承了父级 Resource 的完整校验。
+
+---
+
+**路径 B：`query { resources(where) { environments } }` — 资源列表查询**
+
+```typescript
+// [resource.resolver.ts:74-83]
+@Query(() => [Resource], { nullable: false })
+@InjectContextValue(
+  InjectableOriginParameter.WorkspaceId,
+  "where.project.workspace.id"
+)
+async resources(@Args() args: FindManyResourceArgs): Promise<Resource[]> {
+  return this.resourceService.resources(args);
+}
+```
+
+保护链路：
+1. ✅ JWT 认证（类级 GqlAuthGuard）
+2. ⚠️ `@InjectContextValue(WorkspaceId, "where.project.workspace.id")` — **仅注入不校验**：将 `user.workspace.id` 强制写入 args.where.project.workspace.id，覆盖用户可能的越权输入
+3. ❌ 无 `@AuthorizeContext` → GqlAuthGuard 不做权限校验
+4. `resourceService.resources(args)` → `prepareResourceFindManyArgsForQuery()` 内部（[resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364)）：
+   - 仅处理 `serviceTemplateId`、`projectIdFilter`、`properties` JSON 过滤
+   - **强制追加** `deletedAt: null` 和 `archived: { not: true }`
+   - **不再追加 workspace 过滤**（完全依赖 InjectContextInterceptor 已注入的 `where.project.workspace.id`）
+5. ResolveField `environments` 对每个返回的 Resource 逐个执行
+
+**结论**：✅ 安全，但保护机制不同。不是"逐条校验归属"，而是"强制在查询条件中注入 workspace.id 限定范围"。`prepareResourceFindManyArgsForQuery()` 中的注释（L1329）显式说明了这一依赖："workspace.id is expected to be injected in the resolver middleware."
+
+**脆弱点**：如果内部调用方绕过 resolver 直接调用 `resourceService.resources()` 且忘记传入 `where.project.workspace.id`，将导致越权（当前代码库中 service 内部确实存在多处绕过调用，但均传入了特定的 projectId 等限定条件，未发现越权漏洞）。
+
+---
+
+**路径 C：`query { project(id) { resources { environments } } }` — Project 嵌套 → Resource 列表 → environments**
+
+```typescript
+// [project.resolver.ts:53-57]  — 父级 Project 查询
+@Query(() => Project, { nullable: true })
+@AuthorizeContext(AuthorizableOriginParameter.ProjectId, "where.id")
+async project(@Args() args: FindOneArgs): Promise<Project | null> {
+  return this.projectService.findUnique(args);
+}
+
+// [project.resolver.ts:103-108]  — Project.resources 嵌套字段
+@ResolveField(() => [Resource])
+async resources(@Parent() project: Project): Promise<Resource[]> {
+  return this.resourceService.resources({
+    where: { project: { id: project.id } },
+  });
+}
+```
+
+保护链路（关键差异点）：
+1. ✅ JWT 认证（类级 GqlAuthGuard）
+2. ✅ `@AuthorizeContext(ProjectId, "where.id")` — 父级 Project 通过 workspace 归属校验
+3. ⚠️ `Project.resources` ResolveField：**完全无装饰器**
+   - `GqlAuthGuard.authorizeContext()` → 无元数据 → 直接返回 true
+   - `InjectContextInterceptor` → 无 `@InjectContextValue` → 不做参数注入
+4. `resourceService.resources({ where: { project: { id: project.id } } })`：
+   - 传入的 args 中**没有** `where.project.workspace.id`
+   - `prepareResourceFindManyArgsForQuery()` 不会补加 workspace 过滤（只追加 deletedAt 和 archived）
+   - **最终 Prisma 查询条件仅为** `WHERE project.id = <已校验的projectId> AND deletedAt IS NULL AND archived != true`
+5. 每个 Resource 上的 `environments` ResolveField 同样无装饰器
+
+**结论**：✅ 在正常调用链下安全。保护依赖"父级 Project 已通过 ProjectId 归属校验"→ project.id 可信 → 用此 id 查询出的 Resource 列表自然属于同一 workspace。但与路径 B 不同，此路径**没有在 Service 层二次注入 workspace.id 作为防御纵深**。若未来出现可绕过父级 Project 查询直接调用 `Project.resources` ResolveField 且传入任意 project 对象的场景，将存在越权风险。
+
+---
+
+**路径 D（不存在）：`query { environment(id) { ... } }`**
+- 无此 Query 端点，完全不可达。
+
+---
+
+三条可达路径的权限保护对比：
+
+| 维度 | 路径 A：resource(id) | 路径 B：resources(where) | 路径 C：project(id).resources |
+|-----|---------------------|------------------------|------------------------------|
+| 装饰器类型 | @AuthorizeContext | @InjectContextValue | 父级 @AuthorizeContext + ResolveField 无装饰器 |
+| 校验粒度 | 单条 Resource 逐条校验 | 批量（SQL WHERE 注入 workspace.id） | 仅父级 Project 单条校验 |
+| 权限校验函数 | VALIDATION_FUNCTIONS[ResourceId] | 无（依赖参数注入） | VALIDATION_FUNCTIONS[ProjectId] |
+| Service 层防御纵深 | findUnique 直接按 ID 查 | prepareResourceFindManyArgsForQuery 补 deletedAt/archived（不补 workspace） | prepareResourceFindManyArgsForQuery 补 deletedAt/archived（不补 workspace） |
+| environments 保护强度 | ✅ 最强（直接继承 ResourceId 校验） | ✅ 强（继承 workspace 范围注入） | ⚠️ 中等（依赖父级 Project 校验的传递性，无二次校验） |
+
+#### 4.4.6 Service 层内部绕过 resolver 调用 resources() 的情况
+
+`resourceService.resources()` 在代码库中被大量内部调用（grep 命中 10+ 处）。这些内部调用均绕过 `@InjectContextValue` 装饰器（装饰器只对 Nest 路由入口生效）。核查代表性调用：
+
+| 调用位置 | 传入 where 条件 | 是否安全 |
+|---------|---------------|---------|
+| [resource.service.ts:230](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L230) | `project.id + resourceType` | ✅ 限定 project |
+| [resource.service.ts:749](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L749) | `project.id + name` | ✅ 限定 project |
+| [resource.service.ts:1385](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1385) | （resolver 入口，走装饰器） | ✅ 见路径 B |
+| [build.service.ts:1441](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/build/build.service.ts#L1441) | `project.id` | ✅ 限定 project |
+| [project.resolver.ts:105](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L105) | `project.id`（来自已校验的 @Parent Project） | ✅ 见路径 C |
+
+所有内部调用均传入了 `project.id` 或其他限定条件，未发现无条件全表扫描调用。
+
 ### 4.5 Environment/Deployment 业务写入缺失的核查
 
 #### 4.5.1 Environment 写入核查
@@ -819,7 +958,36 @@ onCodeGenerationSuccess(message)
 - **相关文件**：
   - [build.service.ts:1501-1516](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/build/build.service.ts#L1501-L1516)
 
-#### 缺口 8：DEFAULT_ENVIRONMENT_NAME 常量重复定义
+#### 缺口 8：三条父级 Resource 查询路径的权限保护机制不一致
+
+- **现状**：获取 Resource 对象有 3 条路径，使用了 3 种不同的保护模式：
+  - 路径 A `resource(id)`：用 `@AuthorizeContext(ResourceId, ...)` **逐条校验归属**
+  - 路径 B `resources(where)`：用 `@InjectContextValue(WorkspaceId, ...)` **强制注入 workspace 范围**（不逐条校验）
+  - 路径 C `project(id).resources`：父级用 `@AuthorizeContext(ProjectId, ...)` 校验后，ResolveField **完全无装饰器**，仅用 project.id 过滤
+- **风险**：三种机制语义不同，后续开发者新增路径时容易选错或遗漏。路径 C 尤其脆弱，完全依赖父级校验的传递性
+- **相关文件**：
+  - [resource.resolver.ts:68-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L68-L83)
+  - [project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)
+
+#### 缺口 9：Project.resources ResolveField 缺少防御纵深（无 workspace.id 二次注入）
+
+- **现状**：`Project.resources` ResolveField（[project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)）调用 `resourceService.resources({ where: { project: { id: project.id } } })`，但：
+  - 无 `@InjectContextValue(WorkspaceId, "where.project.workspace.id")`
+  - `prepareResourceFindManyArgsForQuery()` 不补加 workspace 过滤（只补 deletedAt/archived）
+  - 最终 SQL 仅靠 `project.id = <值>` 限定范围
+- **风险**：虽然在正常调用链下 project.id 来自已校验的父级 Project 对象，但若未来出现可绕过父级查询直接调用此 ResolveField 的场景，将存在越权风险。与路径 B `resources(where)` Query 相比缺少一层防御纵深
+- **相关文件**：
+  - [project.resolver.ts:103-108](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts#L103-L108)
+  - [resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364) （`prepareResourceFindManyArgsForQuery` 不补 workspace 过滤）
+
+#### 缺口 10：resourceService.resources() 完全依赖调用方传入 workspace.id，Service 层自身不兜底
+
+- **现状**：`prepareResourceFindManyArgsForQuery()`（[resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364)）内部只处理 `serviceTemplateId`、`projectIdFilter`、`properties` 过滤，并强制追加 `deletedAt: null` 和 `archived: { not: true }`，但**不追加 workspace 限定**。注释 L1329 显式说明"workspace.id is expected to be injected in the resolver middleware"。Service 层内部 10+ 处调用均绕过装饰器，但传入了 project.id 等其他限定条件，暂未发现漏洞
+- **风险**：后续新增内部调用若忘记传入任何限定条件，将导致越权查询。Service 层自身不做 workspace 兜底是一种架构选择，但属于隐性契约，容易被打破
+- **相关文件**：
+  - [resource.service.ts:1320-1364](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1320-L1364)
+
+#### 缺口 11：DEFAULT_ENVIRONMENT_NAME 常量重复定义
 
 - **现状**：在 `resource.service.ts:83` 和 `environment.service.ts:12` 各定义了一份
 - **影响**：低风险，可维护性问题
@@ -847,10 +1015,17 @@ onCodeGenerationSuccess(message)
 | | [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts) | `DSGResourceData` 类型 |
 | **Runtime Binding（预留）** | [environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts) | `createDefaultEnvironment`（L22-45，仅测试调用）, `getDefaultEnvironment`（无调用）, `findMany` |
 | | [environment/dto/](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/dto/) | `Environment` DTO、`CreateEnvironmentArgs`、`EnvironmentWhereInput`、`EnvironmentCreateInput` 等（全部已定义但无独立 Mutation 消费） |
-| | [resource.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts) | `environments` ResolveField（L130-135，只读查询，无独立 @AuthorizeContext） |
+| | [resource.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts) | `resource(id)` Query（L68-72，@AuthorizeContext ResourceId）, `resources(where)` Query（L74-83，@InjectContextValue WorkspaceId）, `environments` ResolveField（L130-135，只读查询，无独立 @AuthorizeContext） |
+| | [project.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/project/project.resolver.ts) | `project(id)` Query（L53-57，@AuthorizeContext ProjectId）, `resources` ResolveField（L103-108，无装饰器，直接用 project.id 查 Resource） |
+| | [resource.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts) | `resources()`（L1385-1389）, `prepareResourceFindManyArgsForQuery()`（L1320-1364，补 deletedAt/archived，不补 workspace 过滤） |
+| | [authorizeContext.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/authorizeContext.decorator.ts) | `@AuthorizeContext` 装饰器定义（设置 AUTHORIZE_CONTEXT metadata） |
+| | [injectContextValue.decorator.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/decorators/injectContextValue.decorator.ts) | `@InjectContextValue` 装饰器定义（设置 INJECT_CONTEXT_VALUE metadata，可选 permissions） |
+| | [inject-context.interceptor.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/interceptors/inject-context.interceptor.ts) | `InjectContextInterceptor`（全局 APP_INTERCEPTOR，强制注入 user.workspace.id / user.id） |
+| | [InjectableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/InjectableOriginParameter.ts) | `UserId`、`WorkspaceId`（仅两种可注入参数类型） |
+| | [app.module.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/app.module.ts#L80-L83) | InjectContextInterceptor 注册为全局 APP_INTERCEPTOR |
 | | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L644) | `Build.containerStatusQuery/UpdatedAt`（L496-497，预留未启用）, `Environment`（L615-627）, `Deployment`（L629-644）, `EnumDeploymentStatus` 枚举 |
-| | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | `EnvironmentId`（L19）、`DeploymentId`（L20）枚举定义 |
-| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | `DeploymentId` 校验（L267-286，仅 count，无调用方）, `ActionId` 校验含 deployments OR 分支（L212-266，死分支）, `EnvironmentId` 校验（L445-457，无调用方） |
+| | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | `ResourceId`（L10）、`ProjectId`（L26）、`EnvironmentId`（L19）、`DeploymentId`（L20）枚举定义 |
+| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | `ResourceId` 校验（L161-182）, `ProjectId` 校验（L78-96）, `DeploymentId` 校验（L267-286，仅 count，无调用方）, `ActionId` 校验含 deployments OR 分支（L212-266，死分支）, `EnvironmentId` 校验（L445-457，无调用方） |
 | | [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts) | `canActivate`（L31-45）, `authorizeContext`（L61-83）—— 权限校验触发机制，无装饰器时直接放行（L69-71） |
 | | [mail.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/mail/mail.service.ts) | `sendDeploymentNotification`（L55-82，被 `IS_EMAIL_DEPLOYMENT_NOTIFICATION=false` 永久屏蔽，零调用） |
 | **进程级 Env** | [server/env.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/env.ts) | `Env` 常量 |
