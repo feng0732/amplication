@@ -260,11 +260,78 @@ export enum EnumRelatedFieldStrategy {
 }
 ```
 
-### 6.1 策略一：Delete（级联删除关联字段）
+### 6.1 公共清理函数 `deleteRelatedField()`
 
-核心逻辑位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3149-L3166)：
+两种策略最终都会调用的对端清理函数，位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L2849-L2898)：
 
 ```typescript
+private async deleteRelatedField(
+  permanentId: string, entityId: string, user: User
+): Promise<void> {
+  await this.useLocking(entityId, user, async (entity) => {
+    const field = await this.getField({ where: { permanentId } });
+
+    // 1. 删除对端 EntityField 记录
+    const deletedField = await this.prisma.entityField.delete({
+      where: { entityVersionId_permanentId: { permanentId, entityVersionId: field.entityVersionId } },
+      include: { entityVersion: { include: { entity: true } } },
+    });
+
+    const moduleId = await this.moduleService.getDefaultModuleIdForEntity(entity.resourceId, entity.id);
+
+    // 2. 删除对端关联的 ModuleAction（API 端点权限）
+    await this.moduleActionService.deleteDefaultActionsForRelationField(
+      deletedField, moduleId, user
+    );
+
+    // 3. 删除对端关联的 ModuleDto（DTO 配置）
+    await this.moduleDtoService.deleteDefaultDtosForRelatedEntity(
+      deletedField, deletedField.entityVersion.entity, moduleId, user
+    );
+  });
+}
+```
+
+**`deleteRelatedField()` 执行的三项清理：**
+
+| 步骤 | 操作 | 说明 |
+|-----|------|------|
+| 1 | `prisma.entityField.delete()` | 物理删除对端字段记录 |
+| 2 | `moduleActionService.deleteDefaultActionsForRelationField()` | 删除对端该关系字段对应的所有 API 端点权限配置 |
+| 3 | `moduleDtoService.deleteDefaultDtosForRelatedEntity()` | 删除对端该关系字段对应的嵌套 DTO 配置 |
+
+---
+
+### 6.2 策略一：Delete（级联删除关联字段 + 物理删除本端）
+
+核心逻辑位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3149-L3256)。
+
+**Delete 策略完整流程：**
+
+```
+deleteField(strategy=Delete)
+        │
+        ▼
+  1. 对端清理（deleteRelatedField）
+     ├─ 删除对端 EntityField
+     ├─ 删除对端 ModuleAction
+     └─ 删除对端 ModuleDto
+        │
+        ▼
+  2. 本端物理删除（prisma.entityField.delete）
+        │
+        ▼
+  3. 本端清理（仅当 dataType 是 Lookup/OptionSet 时）
+     ├─ Lookup → deleteDefaultActionsForRelationField
+     ├─ Lookup → deleteDefaultDtosForRelatedEntity
+     └─ OptionSet → deleteDefaultDtoForEnumField
+        │
+        ▼
+  返回已删除的字段对象
+```
+
+```typescript
+// [entity.service.ts L3149-L3166]
 if (field.dataType === EnumDataType.Lookup) {
   const properties = field.properties as unknown as types.Lookup;
   if (fieldStrategy === EnumRelatedFieldStrategy.Delete) {
@@ -280,47 +347,119 @@ if (field.dataType === EnumDataType.Lookup) {
     }
   }
 }
+// ...
+// 本端物理删除 + 本端 ModuleAction/ModuleDto 清理
 ```
 
-`deleteRelatedField()` 额外做的清理工作（[entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L2849-L2898)）：
-- 删除对端 EntityField 记录
-- 同步删除对端关联的 `ModuleAction`（API 端点权限）
-- 同步删除对端关联的 `ModuleDto`（DTO 配置）
+---
 
-### 6.2 策略二：UpdateToScalar（转换为标量字段）
+### 6.3 策略二：UpdateToScalar（转换为标量字段）
 
-核心逻辑位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3167-L3198)：
+#### ⚠️ 关键发现：UpdateToScalar 也会触发对端清理！
+
+**之前的误解**：以为 UpdateToScalar 只是把本端字段改成标量，不会影响对端。
+
+**代码实际情况**：虽然 `deleteField` 的 UpdateToScalar 分支在调用 `updateField()` 后直接 `return`（跳过了 Delete 策略中本端物理删除和本端清理的代码），但 **`updateField()` 内部检测到 dataType 从 Lookup 变为非 Lookup 时，会自动触发 `shouldDeleteRelated` 逻辑，级联删除对端字段及其 ModuleAction、ModuleDto**。
+
+#### 6.3.1 触发点：`updateField()` 中的 `shouldDeleteRelated`
+
+位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L2933-L2996)：
 
 ```typescript
-} else if (fieldStrategy === EnumRelatedFieldStrategy.UpdateToScalar) {
-  const allowMultipleSelection = properties.allowMultipleSelection;
+// [entity.service.ts L2933-L2936]
+// Delete related field in case field data type is changed from lookup
+const shouldDeleteRelated =
+  field.dataType === EnumDataType.Lookup &&          // 原始字段是 Lookup
+  args.data.dataType !== EnumDataType.Lookup;        // 新 dataType 不是 Lookup → ✅ TRUE!
 
-  // to-Many → Json；to-One → 关联实体 ID 的标量类型（通常是 String）
-  field.dataType = allowMultipleSelection
-    ? EnumDataType.Json
-    : await this.getRelatedFieldScalarTypeByRelatedEntityIdType(properties.relatedEntityId);
+// ...
 
-  const data: EntityFieldUpdateInput = {
-    dataType: field.dataType,
-    // to-Many → 字段名不变；to-One → 自动加 Id 后缀
-    name: allowMultipleSelection ? field.name : `${field.name}Id`,
-    displayName: allowMultipleSelection ? field.displayName : `${field.displayName} ID`,
-    properties: DATA_TYPE_TO_DEFAULT_PROPERTIES[field.dataType],
-  };
-
-  await this.updateField({ data, where: { id: args.where.id } }, user);
-  return;  // ← 注意：策略二直接 return，不再执行后续的物理删除
+// [entity.service.ts L2987-L2996]
+// In case related field should be deleted or changed, delete the existing related field
+if (shouldDeleteRelated || shouldChangeRelated) {
+  const properties = field.properties as unknown as types.Lookup;
+  await this.deleteRelatedField(          // ← 自动调用对端清理！
+    properties.relatedFieldId,
+    properties.relatedEntityId,
+    user
+  );
 }
 ```
 
-**UpdateToScalar 的字段转换规则：**
+因为 UpdateToScalar 传入的 `data.dataType` 是 `Json` 或 String（非 Lookup），所以 `shouldDeleteRelated` 恒为 `true`，进而自动触发对端的完整清理。
 
-| 原字段类型 | 转换后 dataType | 字段名变化 | 说明 |
-|----------|----------------|----------|------|
-| to-Many Lookup | `Json` | 不变 | 因为多值关系无法用简单标量表示 |
-| to-One Lookup | 关联实体 ID 的类型（通常 String） | `${name}Id` | 保留外键列作为普通标量字段 |
+#### 6.3.2 UpdateToScalar 的字段转换规则
 
-> 注意：`UpdateToScalar` 是对**本端字段**进行转换，不对对端字段做任何修改。
+位于 [entity.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/107-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L3167-L3195)：
+
+| 原字段类型 | 转换后 dataType | 字段名变化 | displayName 变化 |
+|----------|----------------|----------|----------------|
+| to-Many Lookup | `Json` | 不变 | 不变 |
+| to-One Lookup | 关联实体 ID 的标量类型（通常 String） | `${name}Id` | `${displayName} ID` |
+
+```typescript
+const data: EntityFieldUpdateInput = {
+  dataType: field.dataType,
+  name: allowMultipleSelection ? field.name : `${field.name}Id`,
+  displayName: allowMultipleSelection ? field.displayName : `${field.displayName} ID`,
+  properties: DATA_TYPE_TO_DEFAULT_PROPERTIES[field.dataType],
+};
+await this.updateField({ data, where: { id: args.where.id } }, user);
+return;  // ← 跳过本端物理删除和本端 ModuleAction/ModuleDto 清理
+```
+
+#### 6.3.3 UpdateToScalar 完整流程图
+
+```
+deleteField(strategy=UpdateToScalar)
+        │
+        ▼
+  构造 updateField 参数（dataType: Lookup → Json/String）
+        │
+        ▼
+  调用 updateField(data, where)
+        │
+        ├─────────────────────────────────────────────┐
+        │                                             │
+        ▼                                             ▼
+  updateField 入口                              shouldDeleteRelated = TRUE
+        │                                    (Lookup → 非Lookup)
+        │                                             │
+        │                                             ▼
+        │                                    deleteRelatedField() 对端清理
+        │                                     ├─ 删除对端 EntityField
+        │                                     ├─ 删除对端 ModuleAction
+        │                                     └─ 删除对端 ModuleDto
+        │                                             │
+        ▼                                             ▼
+  prisma.entityField.update()           对端字段、权限、DTO 均已清理
+  ├─ dataType: Lookup → Json/String
+  ├─ name: (to-One 加 Id 后缀)
+  └─ properties: 默认标量属性
+        │
+        ▼
+  return updatedField ──────── 回到 deleteField
+        │
+        ▼
+  deleteField 直接 return;
+  ⚠️ 跳过本端物理删除
+  ⚠️ 跳过本端 ModuleAction 清理
+  ⚠️ 跳过本端 ModuleDto 清理
+```
+
+#### 6.3.4 两种删除策略行为对比
+
+| 行为 | Delete 策略 | UpdateToScalar 策略 |
+|-----|------------|-------------------|
+| 对端 EntityField | ✅ 删除 | ✅ 删除（通过 updateField 内部触发） |
+| 对端 ModuleAction | ✅ 删除 | ✅ 删除（同上） |
+| 对端 ModuleDto | ✅ 删除 | ✅ 删除（同上） |
+| 本端 EntityField | ✅ 物理删除 | ⚠️ 转换为标量字段（保留记录） |
+| 本端 ModuleAction | ✅ 删除 | ❌ **未清理**（return 跳过） |
+| 本端 ModuleDto | ✅ 删除 | ❌ **未清理**（return 跳过） |
+| 数据库列 | 外键列删除 | to-Many → Json 列；to-One → 标量列保留 |
+
+> **潜在不一致点**：UpdateToScalar 策略下，本端的 ModuleAction 和 ModuleDto 没有被清理，仍残留在数据库中。这是因为 `deleteField` 的 UpdateToScalar 分支在调用 `updateField()` 后直接 `return`，跳过了 Delete 策略中 L3228-L3241 的本端清理代码。
 
 ---
 
@@ -582,9 +721,11 @@ model Profile {
 
 | 主题 | 之前描述 | 代码实际情况 | 结论 |
 |-----|---------|------------|------|
-| `isOneToOneRelationField` | 判定严格一对一（同时检查两端） | 只检查本端 `allowMultipleSelection`，实际是 **to-One** 判定 | ❌ 命名有歧义，函数名不准确 |
+| `isOneToOneRelationField` | 判定严格一对一（同时检查两端） | 只检查本端 `allowMultipleSelection`，实际是 **to-One** 判定（包含 One-to-One 和 Many-to-One"多"端） | ❌ 命名有歧义，函数名不准确 |
 | 嵌套 DTO 操作 | Create/Connect/ConnectOrCreate/Disconnect/Set 五种齐全 | **to-Many**：Create 场景仅 Connect，Update 场景 Connect+Disconnect+Set；**to-One**：无独立 DTO，直接用 WhereUniqueInput | ❌ Create 和 ConnectOrCreate 从未实际生成 |
-| to-One 的 DTO | 有独立的 `CreateNestedOneWithout...` 类 | 不生成独立嵌套 DTO，直接引用 `XxxWhereUniqueInput` | ❌ 与描述不一致 |
-| 实体删除 | 物理删除 | 软删除（`deletedAt` + 名称加前缀 + 版本标记 deleted） | ❌ 是软删除不是硬删除 |
-| UpdateToScalar | 笼统说"转换为标量字段" | to-Many→`Json`（名称不变）；to-One→ID 标量类型（字段名加 `Id` 后缀） | ⚠️ 描述不够精确 |
-| Blueprint 级联构建 | 未区分，可能误认为与实体关系有关 | 完全独立的机制，作用于 Resource 构建顺序，与数据模型无关 | ❌ 需要明确区分 |
+| to-One 的 DTO | 有独立的 `CreateNestedOneWithout...` 类 | 不生成独立嵌套 DTO，直接引用 `XxxWhereUniqueInput`（只能通过 ID 关联） | ❌ 与描述不一致 |
+| 实体删除 | 物理删除 | 软删除（`deletedAt` + 名称加 `__${id}_` 前缀 + 当前版本标记 `deleted=true`） | ❌ 是软删除不是硬删除 |
+| UpdateToScalar 对端影响 | 认为"不对对端字段做任何修改" | `updateField()` 内部的 `shouldDeleteRelated`（Lookup→非Lookup）自动触发 `deleteRelatedField()`，**对端 EntityField/ModuleAction/ModuleDto 全部被删除** | ❌ 描述完全错误 |
+| UpdateToScalar 本端转换 | 笼统说"转换为标量字段" | to-Many→`Json`（名称不变）；to-One→ID 标量类型（字段名加 `Id` 后缀，displayName 加 ` ID` 后缀） | ⚠️ 描述不够精确 |
+| UpdateToScalar 本端清理 | 未提及 | 本端 **ModuleAction 和 ModuleDto 未被清理**（`return` 跳过了清理代码），存在残留数据 | ❌ 潜在 Bug |
+| Blueprint 级联构建 | 未区分，可能误认为与实体关系有关 | 完全独立的机制，作用于 Resource 构建顺序（BFS 遍历 `parentShouldBuildWithChild`），与数据模型完全无关 | ❌ 需要明确区分 |
