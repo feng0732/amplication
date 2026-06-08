@@ -121,24 +121,36 @@ export class Value {
 
 | 主题分类 | 主题名变量 | 实际主题值 | 用途 |
 |---------|-----------|-----------|------|
-| Build 管理 | `CODE_GENERATION_REQUEST_TOPIC` | `code-generation.request.internal.1` | 触发代码生成 |
-| | `CODE_GENERATION_SUCCESS_TOPIC` | `code-generation.success.internal.1` | 代码生成成功 |
-| | `CODE_GENERATION_FAILURE_TOPIC` | `code-generation.failure.internal.1` | 代码生成失败 |
+| Build 管理 | `CODE_GENERATION_REQUEST_TOPIC` | `build.internal.code-generation.request.1` | 触发代码生成 |
+| | `CODE_GENERATION_SUCCESS_TOPIC` | `build.internal.code-generation.success.1` | 代码生成成功 |
+| | `CODE_GENERATION_FAILURE_TOPIC` | `build.internal.code-generation.failure.1` | 代码生成失败 |
+| | `CODE_GENERATION_NOTIFY_VERSION_TOPIC` | `build.internal.code-generation.notify-version.1` | 通知代码生成器版本 |
+| | `BUILD_PLUGIN_NOTIFY_VERSION_TOPIC` | `build.internal.plugin.notify-version.1` | 通知插件版本 |
+| | `DSG_LOG_TOPIC` | `build.internal.dsg-log.1` | 代码生成日志 |
 | | `USER_BUILD_TOPIC` | `user-build.internal.1` | 构建完成用户通知 |
-| | `DSG_LOG_TOPIC` | `dsg-log.internal.1` | 代码生成日志 |
-| Git/PR | `CREATE_PR_REQUEST_TOPIC` | `git.internal.PullRequest.request.1` | 发起 PR 创建 |
-| | `CREATE_PR_SUCCESS_TOPIC` | `git.internal.PullRequest.success.1` | PR 创建成功 |
-| | `CREATE_PR_FAILURE_TOPIC` | `git.internal.PullRequest.failure.1` | PR 创建失败 |
-| | `KAFKA_REPOSITORY_PUSH_QUEUE` | `git.external.push.queue.1` | 外部 Git push 事件 |
-| 插件 | `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | | 下载私有插件请求 |
+| 包管理器 | `PACKAGE_MANAGER_CREATE_REQUEST` | `package.manager.create-packages.request.0` | 发起包生成请求 |
+| | `PACKAGE_MANAGER_CREATE_SUCCESS` | `package.manager.create-packages.success.0` | 包生成成功 |
+| | `PACKAGE_MANAGER_CREATE_FAILURE` | `package.manager.create-packages.failure.0` | 包生成失败 |
+| Git/PR | `CREATE_PR_REQUEST_TOPIC` | `git.internal.create-pr.request.2` | 发起 PR 创建 |
+| | `CREATE_PR_SUCCESS_TOPIC` | `git.internal.create-pr.success.1` | PR 创建成功 |
+| | `CREATE_PR_FAILURE_TOPIC` | `git.internal.create-pr.failure.1` | PR 创建失败 |
+| | `CREATE_PR_LOG_TOPIC` | `git.internal.create-pr.log.1` | PR 创建日志 |
+| | `KAFKA_REPOSITORY_PUSH_QUEUE` | `git.external.push.event.0` | 外部 Git push 事件 |
+| | `GENERATE_PULL_REQUEST_TOPIC` | `git.internal.pull-request.request.1` | 发起拉取 PR |
+| | `CREATE_PULL_REQUEST_COMPLETED_TOPIC` | `git.internal.pull-request.completed.1` | 拉取 PR 完成 |
+| 插件 | `DOWNLOAD_PRIVATE_PLUGINS_REQUEST_TOPIC` | `git.internal.download-private-plugins.request.0` | 下载私有插件请求 |
+| | `DOWNLOAD_PRIVATE_PLUGINS_SUCCESS_TOPIC` | `git.internal.download-private-plugins.success.0` | 下载私有插件成功 |
+| | `DOWNLOAD_PRIVATE_PLUGINS_FAILURE_TOPIC` | `git.internal.download-private-plugins.failure.0` | 下载私有插件失败 |
+| | `DOWNLOAD_PRIVATE_PLUGINS_LOG_TOPIC` | `git.internal.download-private-plugins.log.0` | 下载私有插件日志 |
 | 用户/通知 | `USER_ACTION_TOPIC` | `user-action.internal.1` | 用户订阅注册 |
 | | `USER_ANNOUNCEMENT_TOPIC` | `user-announcement.internal.1` | 功能公告广播 |
 | | `TECH_DEBT_CREATED_TOPIC` | `platform.internal.tech-debt.created.1` | 技术债务告警 |
 | AI | `AI_CONVERSATION_START_TOPIC` | `ai.internal.conversation.start.1` | GPT 对话开始 |
 | | `AI_CONVERSATION_COMPLETED_TOPIC` | `ai.internal.conversation.completed.1` | GPT 对话完成 |
-| 权限 | `CHECK_USER_ACCESS_TOPIC` | | 用户构建权限校验（请求/响应模式） |
+| 权限 | `CHECK_USER_ACCESS_TOPIC` | `authorization.internal.can-access-build.request.0` | 用户构建权限校验（请求/响应模式） |
 | 其他 | `USER_ACTION_LOG_TOPIC` | `user-action.internal.action-log.1` | 用户操作步骤日志 |
 | | `DB_SCHEMA_IMPORT_TOPIC` | `user-action.internal.db-schema-import.request.1` | DB Schema 导入请求 |
+| | `SHARED_GRAPHQL_SUBSCRIPTION_PUBSUB_TOPIC` | `shared.internal.graphql-subscrition-pubsub.1` | GraphQL 订阅内部广播 |
 
 ---
 
@@ -565,15 +577,34 @@ GptController.onAiConversationCompleted() 直接使用 message 作为参数传�
 
 #### 5.1.2 amplication-build-manager（1 个 Controller，3 个消费者方法）
 
-**BuildRunnerController**（3 个方法）— [build-runner.controller.ts](packages/amplication-build-manager/src/build-runner/build-runner.controller.ts)：
+**BuildRunnerController**（3 个消费者方法 + 3 个 HTTP POST 端点）— [build-runner.controller.ts](packages/amplication-build-manager/src/build-runner/build-runner.controller.ts)：
 
-| 装饰器 | 订阅主题 | 处理方法 | plainToInstance 校验 |
+| 装饰器 | 订阅主题/路由 | 处理方法 | plainToInstance 校验 |
 |--------|---------|---------|---------------------|
 | `@EventPattern` | `PACKAGE_MANAGER_CREATE_SUCCESS` | `onPackageManagerCreateSuccess()` | ✅ 有 |
 | `@EventPattern` | `PACKAGE_MANAGER_CREATE_FAILURE` | `onPackageManagerCreateFailure()` | ✅ 有 |
 | `@EventPattern` | `CODE_GENERATION_REQUEST_TOPIC` | `onCodeGenerationRequest()` | ❌ **无** |
+| `@Post` (HTTP) | `code-generation-success` | `onCodeGenerationSuccess()` | N/A (HTTP DTO) |
+| `@Post` (HTTP) | `code-generation-failure` | `onCodeGenerationFailure()` | N/A (HTTP DTO) |
+| `@Post` (HTTP) | `notify-plugin-version` | `onNotifyPluginVersion()` | N/A (HTTP DTO) |
 
 `onCodeGenerationRequest()` 直接使用 `message.resourceId` 和 `message.buildId`，未做 DTO 转换。
+
+**Package Manager 事件链补充说明：**
+
+Package Manager 是构建流程中的一个可选项（通过环境变量 `ENABLE_PACKAGE_MANAGER` 开关控制），完整事件链如下：
+
+1. **REQUEST 发布方**：`BuildRunnerService.handleDsgJobCompleted()` → `generatePackages()`（见 [build-runner.service.ts](packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L69-L88)）
+   - 触发条件：所有 DSG 子任务 (jobs) 全部成功，且 `dsgResourceData.packages?.length > 0` 且 `enablePackageManager === true`
+   - 发布事件：`PACKAGE_MANAGER_CREATE_REQUEST`，payload 含 `{ resourceId, buildId, dsgResourceData }`
+
+2. **REQUEST 消费方**：外部 Package Manager 微服务（不在当前代码库中），负责执行 `npm/pnpm/yarn install` 等包安装操作
+
+3. **SUCCESS 消费方**：`BuildRunnerController.onPackageManagerCreateSuccess()` → `BuildRunnerService.onPackageManagerCreateSuccess()` → `codeGenerationAndPackagesCompleted()` → 发布 `CODE_GENERATION_SUCCESS_TOPIC`（见 [build-runner.service.ts](packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L54-L58)）
+
+4. **FAILURE 消费方**：`BuildRunnerController.onPackageManagerCreateFailure()` → `BuildRunnerService.onPackageManagerCreateFailure()` → `emitCodeGenerationFailure()` → 发布 `CODE_GENERATION_FAILURE_TOPIC`（见 [build-runner.service.ts](packages/amplication-build-manager/src/build-runner/build-runner.service.ts#L60-L67)）
+
+如果无需 Package Manager（无 packages 或开关关闭），则在 `handleDsgJobCompleted()` 中直接调用 `codeGenerationAndPackagesCompleted()` 发布 CODE_GENERATION_SUCCESS，跳过该分支。
 
 #### 5.1.3 notification-service（1 个 Controller，5 个消费者方法）
 
@@ -752,7 +783,7 @@ UserAction 是更高层的用户操作记录（如 GptConversation、DBSchemaImp
 
 ---
 
-## 8. 完整工作流示例：构建代码生成 → 推送 Git → 通知用户
+## 8. 完整工作流示例：构建代码生成 → 包管理 → 推送 Git → 通知用户
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -772,17 +803,59 @@ UserAction 是更高层的用户操作记录（如 GptConversation、DBSchemaImp
                                    │ Kafka
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ 3. amplication-build-manager - BuildRunnerController                         │
+│ 3. amplication-build-manager - BuildRunnerController                          │
 │    @EventPattern(CODE_GENERATION_REQUEST_TOPIC)                              │
-│    └─ buildRunnerService.runBuild() → 调用 DSG 生成代码                       │
-│         ├─ 过程中多次 emit DSG_LOG_TOPIC (日志流式回写)                       │
-│         ├─ 成功 → emit CODE_GENERATION_SUCCESS_TOPIC {buildId}               │
-│         └─ 失败 → emit CODE_GENERATION_FAILURE_TOPIC {buildId, errorMessage} │
+│    └─ buildRunnerService.runBuild()                                          │
+│         ├─ emit CODE_GENERATION_NOTIFY_VERSION_TOPIC (版本通知)              │
+│         ├─ splitBuildsIntoJobs() 将大构建拆分为多个 job                        │
+│         └─ 对每个 job 调用 DSG Runner (HTTP POST 到 DSG_RUNNER_URL)           │
+│            ├─ 过程中多次 emit DSG_LOG_TOPIC (日志流式回写)                    │
+│            └─ DSG Runner 完成后回调 build-runner.controller                  │
 └──────────────────────────────────┬───────────────────────────────────────────┘
-                                   │ Kafka
+                                   │ HTTP POST (不是 Kafka)
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ 4. amplication-server - BuildController                                      │
+│ 4. amplication-build-manager - BuildRunnerController (HTTP 回调端点)          │
+│    POST /build-runner/code-generation-success → handleDsgJobCompleted()      │
+│    POST /build-runner/code-generation-failure → emitCodeGenerationFailure()  │
+│                                                                              │
+│ handleDsgJobCompleted() 处理逻辑:                                             │
+│    ├─ buildJobsHandlerService 聚合所有 job 的状态 (Redis)                     │
+│    ├─ 如有失败 job → emit CODE_GENERATION_FAILURE_TOPIC                      │
+│    ├─ 如仍有 job 进行中 → 直接返回 (InProgress)                               │
+│    └─ 所有 job 成功 → 判断是否需要 Package Manager                            │
+│         │                                                                     │
+│         ├─ 有 packages 且 enablePackageManager=true → 进入步骤 5             │
+│         │                                                                     │
+│         └─ 无 packages 或开关关闭 → emit CODE_GENERATION_SUCCESS_TOPIC       │
+│                                 ──────────────────────────────────────→ 跳至步骤 6 │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ 需要 Package Manager
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 5. Package Manager 事件链 (可选分支)                                           │
+│                                                                              │
+│  5a. BuildRunnerService.generatePackages()                                    │
+│      └─ emit PACKAGE_MANAGER_CREATE_REQUEST                                  │
+│         { resourceId, buildId, dsgResourceData }                              │
+│                                   │ Kafka                                     │
+│                                   ▼                                           │
+│  5b. 外部 Package Manager 微服务 (不在当前代码库)                               │
+│      执行 npm/pnpm/yarn install 等包安装操作                                  │
+│         ├─ 成功 → emit PACKAGE_MANAGER_CREATE_SUCCESS                        │
+│         └─ 失败 → emit PACKAGE_MANAGER_CREATE_FAILURE                        │
+│                                   │ Kafka                                     │
+│                                   ▼                                           │
+│  5c. BuildRunnerController 消费响应事件                                       │
+│      ├─ SUCCESS → codeGenerationAndPackagesCompleted()                       │
+│      │         └─ emit CODE_GENERATION_SUCCESS_TOPIC                         │
+│      └─ FAILURE → onPackageManagerCreateFailure()                            │
+│                └─ emit CODE_GENERATION_FAILURE_TOPIC                         │
+└──────────────────────────────────┬───────────────────────────────────────────┘
+                                   │ CODE_GENERATION_SUCCESS / FAILURE
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 6. amplication-server - BuildController                                       │
 │    @EventPattern(CODE_GENERATION_SUCCESS_TOPIC)                              │
 │    ├─ buildService.saveToGitProvider()                                       │
 │    │   └─ Step(PUSH_TO_GIT_PROVIDER:Running)                                 │
@@ -796,7 +869,7 @@ UserAction 是更高层的用户操作记录（如 GptConversation、DBSchemaImp
                     │ Kafka                        │ Kafka
                     ▼                              ▼
 ┌────────────────────────────────────┐  ┌──────────────────────────────────────┐
-│ 5a. git-sync-manager (ee 目录)     │  │ 5b. notification-service             │
+│ 7a. git-sync-manager (ee 目录)     │  │ 7b. notification-service             │
 │     消费 CREATE_PR_REQUEST_TOPIC   │  │     消费 USER_BUILD_TOPIC            │
 │     调用 GitHub/GitLab API 创建 PR  │  │     compose 管道:                    │
 │     成功 → emit CREATE_PR_SUCCESS  │  │       subscribeUser → buildCompleted  │
@@ -805,7 +878,7 @@ UserAction 是更高层的用户操作记录（如 GptConversation、DBSchemaImp
                │ Kafka                  │           completed", {subscriberId})│
                ▼                        └──────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ 6. amplication-server - BuildController                                      │
+│ 8. amplication-server - BuildController                                       │
 │    @EventPattern(CREATE_PR_SUCCESS_TOPIC)                                    │
 │    └─ buildService.onCreatePRSuccess()                                       │
 │         ├─ Step(PUSH_TO_GIT_PROVIDER:Success)                                │
@@ -916,7 +989,11 @@ NestJS Microservices 启动时扫描所有 Controller，收集 `@EventPattern` /
 | 拆单体服务 (AI 对话中间层) | [resourceBtm.service.ts](packages/amplication-server/src/core/resource/resourceBtm.service.ts) |
 | GPT 服务 (AI_CONVERSATION_START 发布源) | [gpt.service.ts](packages/amplication-server/src/core/gpt/gpt.service.ts) |
 | GPT 控制器 (AI_CONVERSATION_COMPLETED 消费者) | [gpt.controller.ts](packages/amplication-server/src/core/gpt/gpt.controller.ts) |
-| 构建执行器 (代码生成消费者) | [build-runner.controller.ts](packages/amplication-build-manager/src/build-runner/build-runner.controller.ts) |
+| 构建执行器 (代码生成消费者+Package Manager) | [build-runner.controller.ts](packages/amplication-build-manager/src/build-runner/build-runner.controller.ts) |
+| 构建执行服务 (runBuild/job拆分/Package Manager事件发布) | [build-runner.service.ts](packages/amplication-build-manager/src/build-runner/build-runner.service.ts) |
+| Package Manager 请求 DTO | [package-manager-create-request/value.ts](libs/schema-registry/src/lib/package-manager-create-request/value.ts) |
+| Package Manager 成功 DTO | [package-manager-create-success/value.ts](libs/schema-registry/src/lib/package-manager-create-success/value.ts) |
+| Package Manager 失败 DTO | [package-manager-create-failure/value.ts](libs/schema-registry/src/lib/package-manager-create-failure/value.ts) |
 | 通知消费者 (5 个通知主题) | [app.controller.ts](packages/notification-service/src/app.controller.ts) |
 | 通知处理管道 (compose 中间件) | [app.service.ts](packages/notification-service/src/app.service.ts) |
 | 通知中间件：用户订阅 | [subscribeUser.ts](packages/notification-service/src/notification-packages/subscribeUser.ts) |
