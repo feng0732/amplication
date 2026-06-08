@@ -314,95 +314,300 @@ export async function prepareContext(dSGResourceData, internalLogger, pluginInst
 
 ---
 
-## 四、运行环境绑定层 —— ❌ 模型已定义，业务逻辑未实现
+## 四、运行环境绑定层 —— 分层完整度核查：权限校验 / 只读查询 / 业务写入
 
-### 4.1 核查结论总览
+### 4.1 核查结论总览（按维度拆分）
 
-| 功能 | Prisma 模型 | 实际写入代码 | 实际查询代码 | 状态 |
-|-----|-----------|------------|------------|-----|
-| Environment 创建 | ✅ `Environment` 表 | ❌ **无**（`createDefaultEnvironment` 仅在 spec 测试中被调用） | ✅ `ResourceResolver.environments` 只读查询 | **模型存在，创建逻辑缺失** |
-| Deployment 写入 | ✅ `Deployment` 表 | ❌ **完全无 `prisma.deployment.create` 调用** | ✅ 权限校验中 `prisma.deployment.count` | **纯预留模型** |
-| 沙箱部署流程 | - | ❌ 代码中无任何 Deployment 创建流程 | - | **未实现** |
-| 容器状态查询 | ✅ `Build.containerStatusQuery/UpdatedAt` 字段 | ❌ **无任何读写代码** | ❌ 无 | **字段预留未启用** |
+| 维度 | Environment | Deployment | Build.containerStatus* |
+|-----|------------|-----------|----------------------|
+| **Prisma 数据模型** | ✅ 已定义 [schema.prisma:615-627](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L615-L627) | ✅ 已定义 [schema.prisma:629-644](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L629-L644) | ✅ 已定义 [schema.prisma:496-497](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L497) |
+| **权限校验函数** | ✅ 已定义 [validation-functions.ts:445-457](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L445-L457) | ✅ 已定义 [validation-functions.ts:267-286](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L286) | N/A（非独立实体） |
+| **权限校验实际触发** | ❌ **无调用方**（无任何 `@AuthorizeContext(EnvironmentId, ...)`） | ❌ **无调用方**（无任何 `@AuthorizeContext(DeploymentId, ...)`） | N/A |
+| **GraphQL DTO** | ✅ `Environment`、`CreateEnvironmentArgs`、`EnvironmentWhereInput` 等 [dto/](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/dto/) | ❌ 无任何 Deployment DTO | N/A |
+| **GraphQL 查询暴露** | ✅ 通过 `Resource.environments` ResolveField 间接暴露 [resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135) | ❌ **完全未暴露**（无独立 Query/Resolver） | ❌ 未暴露 |
+| **GraphQL Mutation 暴露** | ❌ 无 Environment Mutation（DTO 存在但无 Resolver） | ❌ 无 Deployment Mutation | N/A |
+| **业务写入逻辑** | ❌ `createDefaultEnvironment()` 仅在 spec 测试中调用 [environment.service.spec.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.spec.ts) | ❌ 整个代码库无 `prisma.deployment.create/update/delete` | ❌ 无任何读写代码 |
+| **Service 层能力** | ✅ `EnvironmentService`：`createDefaultEnvironment` / `getDefaultEnvironment` / `findMany` [environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts) | ❌ 无 DeploymentService | N/A |
 
-### 4.2 Environment 实体核查
+### 4.2 Environment 权限校验 —— 函数已定义但无触发点
 
-[schema.prisma:615-627](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L615-L627)
+#### 4.2.1 权限校验函数定义
 
-```prisma
-model Environment {
-  id          String       @id @default(cuid())
-  resourceId  String
-  name        String
-  description String?
-  address     String
-  resource    Resource     @relation(...)
-  deployments Deployment[]
+[validation-functions.ts:445-457](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L445-L457)：
+
+```typescript
+[AuthorizableOriginParameter.EnvironmentId]: async (
+  prisma, originId, workspaceId
+) => {
+  const matching = await prisma.environment.findFirst(
+    checkByResourceParameters(originId, workspaceId)
+  );
+  return {
+    canAccessWorkspace: matching !== null,
+    requestedResourceId: matching?.resourceId,
+  };
+},
+```
+
+复用工具函数 `checkByResourceParameters()`（L5-22），校验逻辑为：
+```
+Environment.id == originId
+  AND Environment.resource.deletedAt == null
+  AND Environment.resource.project.workspace.id == workspaceId
+```
+校验通过后返回关联的 `resourceId`，用于后续细粒度资源权限校验。
+
+#### 4.2.2 无实际调用方
+
+全代码库 grep `AuthorizableOriginParameter.EnvironmentId` → 仅在定义处出现。
+
+对比已启用的校验（如 `ResourceId`），启用方式是在 GraphQL resolver 上使用装饰器：
+```typescript
+@AuthorizeContext(AuthorizableOriginParameter.ResourceId, "where.id")
+```
+
+但 Environment 没有任何独立的 Query 或 Mutation resolver，也就没有地方挂载此装饰器。
+
+**结论**：`EnvironmentId` 校验函数是**预埋的基础设施代码**，未来出现独立的 `environment(id: ID!)` Query 时才会被使用，当前版本完全不触发。
+
+### 4.3 Deployment 权限校验 —— 函数已定义但无触发点
+
+#### 4.3.1 权限校验函数定义
+
+[validation-functions.ts:267-286](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L286)：
+
+```typescript
+[AuthorizableOriginParameter.DeploymentId]: async (
+  prisma, originId, workspaceId
+) => {
+  const matching = await prisma.deployment.count({
+    where: {
+      id: originId,
+      environment: {
+        resource: {
+          deletedAt: null,
+          project: { workspaceId },
+        },
+      },
+    },
+  });
+  return { canAccessWorkspace: matching === 1 };
+},
+```
+
+与 EnvironmentId 不同的是：
+- 使用 `count` 而非 `findFirst`（不返回 `resourceId`，因此无法继续做细粒度资源权限校验）
+- 只验证 workspace 级访问权限
+
+#### 4.3.2 关联权限：ActionId 校验中的 Deployment 分支
+
+[validation-functions.ts:212-266](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L212-L266) 的 `ActionId` 校验通过 OR 条件同时覆盖了三种场景：
+
+```typescript
+OR: [
+  { id: originId, deployments: { some: { build: { resource: {...} } } } }, // ← 通过 Deployment 关联
+  { id: originId, builds:      { some: { resource: {...} } } },
+  { id: originId, userAction:  { some: { resource: {...} } } },
+]
+```
+
+这是唯一一处在权限校验中**实际读 Deployment 表**的代码（通过 Action.deployments 关联）。但由于 Deployment 表无业务写入，此分支实际上永不为真。
+
+#### 4.3.3 无独立调用方
+
+全代码库 grep `AuthorizableOriginParameter.DeploymentId` → 仅在定义处出现。无任何 resolver 使用 `@AuthorizeContext(DeploymentId, ...)`。
+
+**结论**：`DeploymentId` 校验函数同样是预埋代码，无实际触发路径。
+
+### 4.4 Environment 只读查询边界核查
+
+#### 4.4.1 暴露方式：仅通过 Resource 嵌套字段
+
+[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)：
+
+```typescript
+@ResolveField(() => [Environment])
+async environments(@Parent() resource: Resource): Promise<Environment[]> {
+  return this.environmentService.findMany({
+    where: { resource: { id: resource.id } },
+  });
 }
 ```
 
-[environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts#L1-L58) 暴露：
-- `createDefaultEnvironment(resourceId)`：创建名为 `"Sandbox environment"` 的 Environment
-- `getDefaultEnvironment(resourceId)`：按名称查找
-- `findMany()`：通用查询
+关键特征：
+- **无独立 Query 端点**（无 `environment(id: ID!)` 或 `environments(where: ...)`）
+- **无 `@AuthorizeContext` 装饰器**
+- 只能在已解析出 Resource 对象的上下文中被访问
 
-**实际调用情况核查**：
-- `environmentService.findMany()` → 仅在 [resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135) 的 GraphQL `environments` ResolveField 中用于只读查询
-- `createDefaultEnvironment()` → **仅在 `environment.service.spec.ts` 测试文件中被调用**，业务代码零调用
-- `getDefaultEnvironment()` → 整个代码库无调用
+#### 4.4.2 实际权限保护机制
 
-**结论**：Environment 表在数据库中可能有历史数据或通过外部脚本初始化，但**当前代码版本不会在 Resource 创建时自动创建 Environment**。
+ResourceResolver 类级别有 [@UseGuards(GqlAuthGuard)](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L53)。
 
-### 4.3 Deployment 实体核查
+`GqlAuthGuard.canActivate()` 的工作流（[gql-auth.guard.ts:31-45](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L31-L45)）：
 
-[schema.prisma:629-644](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L629-L644)
-
-```prisma
-model Deployment {
-  id              String               @id @default(cuid())
-  userId          String
-  buildId         String
-  environmentId   String
-  status          EnumDeploymentStatus
-  message         String?
-  actionId        String
-  statusQuery     Json?
-  statusUpdatedAt DateTime?
-  build           Build      @relation(...)
-  environment     Environment @relation(...)
-}
+```
+1. super.canActivate() → JWT 认证（所有 resolver 必须先过这关）
+2. authorizeContext(handler, requestArgs, user)
+   └─ getAuthorizeContextParameters(handler) → 读取 @AuthorizeContext 元数据
+      ├─ 有元数据 → permissionsService.validateAccess(...)
+      └─ 无元数据 → 直接返回 true（L69-71）
 ```
 
-**实际调用情况核查**：
-- `prisma.deployment.create()` / `prisma.deployment.update()` / `prisma.deployment.delete()` → **整个代码库零结果**
-- 唯一使用：[validation-functions.ts:267-275](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L275) 中权限校验 `prisma.deployment.count(...)`（仅 count 查询，确保用户有权访问某个 deploymentId）
-- 邮件通知：[mail.service.ts:55-82](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/mail/mail.service.ts#L55-L82) 中有 `sendDeploymentNotification()`，但被 `IS_EMAIL_DEPLOYMENT_NOTIFICATION = false`（L18）永久屏蔽，且无任何调用方
+对 `environments` ResolveField 的影响：
+1. **必须先通过 JWT 认证**（任何 GraphQL 操作的前提）
+2. **没有独立的 EnvironmentId 级权限校验**（该字段无 `@AuthorizeContext`，`authorizeContext()` 直接返回 true）
+3. **受父级 Resource 查询的间接保护**：要访问 `Resource.environments`，必须先查询到该 Resource。而 `resource()` Query（L68-72）上有 `@AuthorizeContext(AuthorizableOriginParameter.ResourceId, "where.id")`，只有能通过 ResourceId 校验的用户才能拿到父级 Resource 对象，进而访问嵌套的 environments
 
-**结论**：Deployment 是**纯预留模型**，对应功能尚未实现。
+#### 4.4.3 查询权限边界总结
 
-### 4.4 Build.containerStatusQuery 字段核查
+| 访问路径 | 是否受保护 | 保护方式 |
+|---------|----------|---------|
+| 直接按 ID 查询 Environment | ❌ 无法访问 | 无此 Query 端点 |
+| `query { resource(id) { environments } }` | ✅ | 父级 Resource 的 `@AuthorizeContext(ResourceId, ...)` |
+| `@AuthorizeContext(EnvironmentId, ...)` | ❌ 永不触发 | 无挂载点 |
+| JWT 认证 | ✅ | 类级 `@UseGuards(GqlAuthGuard)` |
 
-[schema.prisma:496-497](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L497)
+### 4.5 Environment/Deployment 业务写入缺失的核查
 
-```prisma
-model Build {
-  containerStatusQuery     Json?
-  containerStatusUpdatedAt DateTime?
-  // ...
-}
+#### 4.5.1 Environment 写入核查
+
+| 写入能力 | 是否存在 | 调用方 |
+|---------|---------|-------|
+| `EnvironmentService.createDefaultEnvironment()` | ✅ 实现 | ❌ 仅 `environment.service.spec.ts` |
+| `PrismaService.environment.create()` | ✅（Prisma 自动生成） | ❌ 业务代码零调用 |
+| Resource 创建流程 | - | ❌ `createService()` → `createResource()` 流程完全不涉及 Environment |
+| `CreateEnvironmentArgs` DTO | ✅ 已定义 | ❌ 无任何 Mutation resolver 消费此 DTO |
+
+Resource 创建完整链路（[resource.service.ts:592-627](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L592-L627)）：
+
+```
+createService(args, user)
+  ├─ createResource(...)           // 仅创建 Resource 记录 + codeGeneratorName
+  ├─ createServiceDefaultObjects()
+  │    ├─ 创建 "user" ResourceRole
+  │    ├─ 条件创建 User Entity
+  │    └─ serviceSettingsService.createDefaultServiceSettings()
+  └─ billingService.reportUsage()  // 上报用量
 ```
 
-**实际调用情况核查**：整个代码库 grep 无任何 `containerStatusQuery` 或 `containerStatusUpdatedAt` 的读写代码（除 schema 和 migration SQL 外）。
+**无任何 Environment 创建步骤。**
 
-**结论**：字段已预留但未启用。
+#### 4.5.2 Deployment 写入核查
 
-### 4.5 运行环境绑定层的真实职责
+| 写入能力 | 是否存在 | 调用方 |
+|---------|---------|-------|
+| DeploymentService | ❌ 不存在 | - |
+| `PrismaService.deployment.create/update/delete` | ✅（Prisma 自动生成） | ❌ 业务代码零调用 |
+| Build 完成流程 | - | ❌ `onCodeGenerationSuccess()` 止于 Git PR 推送 + USER_BUILD_TOPIC |
+| `sendDeploymentNotification()` 邮件 | ✅ 实现 | ❌ `IS_EMAIL_DEPLOYMENT_NOTIFICATION = false` 永久屏蔽 + 无调用方 |
 
-根据代码核查，当前版本中**运行环境绑定层的实际职责为空**。所有 Environment/Deployment 相关的：
-- 数据模型：已定义（Prisma schema）
-- GraphQL 查询字段：已暴露（`Resource.environments`）
-- 权限校验：已接入（`AuthorizableOriginParameter.DeploymentId`）
-- **业务写入逻辑：未实现**
+Build 完成完整链路（[build.controller.ts:87-101](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/build/build.controller.ts#L87-L101)）：
+
+```
+onCodeGenerationSuccess(message)
+  ├─ buildService.saveToGitProvider(buildId)    // 创建 Git PR
+  └─ buildService.onCodeGenerationSuccess(buildId)
+       ├─ kafka.emit(USER_BUILD_TOPIC, ...)     // 通知用户
+       └─ actionService.complete(step, Success) // 标记 Action 步骤完成
+```
+
+**无任何 Deployment 创建步骤。**
+
+#### 4.5.3 Build.containerStatusQuery 字段核查
+
+[schema.prisma:496-497](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L497) 定义了 `containerStatusQuery Json?` 和 `containerStatusUpdatedAt DateTime?`，全代码库 grep 无任何读写代码。
+
+**结论**：预留字段，用于未来存储沙箱容器状态查询参数（如 Kubernetes deployment name、namespace 等），当前未启用。
+
+### 4.6 权限校验、只读查询、业务写入三者的关系架构图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  A. 权限基础设施层（全部已就绪，预留型）                              │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ AuthorizableOriginParameter 枚举                              │  │
+│  │   ├─ EnvironmentId  ✅ 已定义                                  │  │
+│  │   └─ DeploymentId   ✅ 已定义                                  │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ VALIDATION_FUNCTIONS（validation-functions.ts）              │  │
+│  │   ├─ [EnvironmentId]  ✅ 已实现  ❌ 无任何 @AuthorizeContext 触发│  │
+│  │   └─ [DeploymentId]   ✅ 已实现  ❌ 无任何 @AuthorizeContext 触发│  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ ActionId 校验中包含 deployments 关联 OR 分支                   │  │
+│  │   ✅ 已实现  ❌ Deployment 表无数据，实际永不匹配               │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ 依赖（但未被消费）
+                              │
+┌──────────────────────────────────────────────────────────────────────┐
+│  B. GraphQL 暴露层（部分已就绪）                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ Environment DTO 集合                                          │  │
+│  │   Environment / EnvironmentCreateInput / CreateEnvironmentArgs│  │
+│  │   EnvironmentWhereInput / EnvironmentOrderByInput / ...       │  │
+│  │   ✅ 全部已定义  ❌ 仅 ResolveField 消费，无独立 Query/Mutation │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ ResourceResolver.environments ResolveField                   │  │
+│  │   ✅ 已暴露  ❌ 无 @AuthorizeContext 装饰器                    │  │
+│  │   ⚠️  仅靠父级 Resource 查询的鉴权间接保护                     │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ Deployment GraphQL 层                                         │  │
+│  │   ❌ 完全不存在（无 DTO、无 Query、无 Mutation、无 Resolver）  │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ 依赖（但未被消费）
+                              │
+┌──────────────────────────────────────────────────────────────────────┐
+│  C. 业务写入层（完全缺失）                                            │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ EnvironmentService.createDefaultEnvironment()                │  │
+│  │   ✅ 已实现  ❌ Resource 创建流程零调用                        │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ Deployment 写入                                              │  │
+│  │   ❌ 无 Service、无 Prisma 调用、Build 完成流程零写入          │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ Build.containerStatusQuery / containerStatusUpdatedAt        │  │
+│  │   ✅ 字段已定义  ❌ 无任何读写代码                              │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.7 设计特征：典型的"自上而下、由外向内"预留架构
+
+从完整度分布（A 层 100% → B 层 50% → C 层 0%）可以看出，这是典型的**自上而下预留开发模式**：
+
+1. **第 1 步**：数据模型先行（Prisma schema 全部就位）
+2. **第 2 步**：权限基础设施就位（AuthorizableOriginParameter + VALIDATION_FUNCTIONS 全部就位）
+3. **第 3 步**：DTO 类型定义就位（Environment DTO 全部就绪）
+4. **第 4 步**：Service 层骨架就位（EnvironmentService 基本方法就绪）
+5. **第 5 步**：GraphQL 只读端点就位（Resource.environments ResolveField 暴露）
+6. **第 6 步（未完成）**：独立 Query/Mutation 端点 + 业务写入逻辑
+
+当前代码停留在**第 5 步刚完成、第 6 步未开始**的状态。运行环境绑定功能在权限系统、类型系统、查询路径上已经"预留了位置"，但真正的业务操作（创建 Environment、写入 Deployment、部署到沙箱、查询容器状态）尚未开发。
+
+### 4.8 运行环境绑定层的真实职责
+
+根据代码核查，当前版本中运行环境绑定层的**实际可用职责**极其有限：
+
+| 可用能力 | 说明 |
+|---------|------|
+| 数据库中存储 Environment 行 | ✅ 模型存在，若由外部/历史数据写入则可读 |
+| 通过 `Resource.environments` 嵌套查询返回 Environment | ✅ 受 Resource 级权限间接保护，返回空数组或已有数据 |
+| 按 EnvironmentId/DeploymentId 做权限校验 | ❌ 无端点触发，函数存在但不可达 |
+| 自动创建默认 Sandbox Environment | ❌ 业务流程零调用 |
+| 记录 Build 部署结果 | ❌ Deployment 表零写入 |
+| 查询沙箱容器运行状态 | ❌ containerStatusQuery 字段零读写 |
+| 发送部署通知邮件 | ❌ 永久屏蔽 + 零调用 |
+
+**一句话总结**：运行环境绑定层当前仅具备"读已有数据"的骨架能力，不具备任何"写数据/触发操作"的业务能力。
 
 ---
 
@@ -555,39 +760,66 @@ model Build {
 | **Configuration** | 聚合 ServiceSettings/ResourceSettings/Plugins/Entities 等为 DSGResourceData；拆分 Server/AdminUI job；装配 DSG Context | - |
 | **Runtime Binding** | Prisma schema 模型（Environment/Deployment）已定义；GraphQL 查询字段已暴露；权限校验已接入 | **Environment 自动创建、Deployment 记录写入、沙箱容器部署均未实现** |
 
-### 6.2 已发现的设计缺口
+### 6.2 已发现的设计缺口与边界不一致点
 
-#### 缺口 1：Environment 创建逻辑缺失
+#### 缺口 1：Environment 写入链路完整度缺失（Service 层就绪 → 业务流程未接入）
 
-- **现状**：`EnvironmentService.createDefaultEnvironment()` 存在但无业务调用方
-- **风险**：GraphQL `Resource.environments` 字段将永远返回空数组（除非数据库中存在历史/外部写入数据）
+- **现状**：数据模型 ✅ / Service 层 `createDefaultEnvironment()` ✅ / DTO `CreateEnvironmentArgs` ✅，但 Resource 创建流程（`createService()` → `createResource()`）中完全不调用 Environment 创建，也无任何 GraphQL Mutation 消费 `CreateEnvironmentArgs`
+- **风险**：GraphQL `Resource.environments` 字段将永远返回空数组（除非数据库中存在历史/外部写入数据）；Service 层方法永远不被调用成为死代码
 - **相关文件**：
   - [environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts)
   - [resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)
+  - [resource.service.ts:592-627](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L592-L627)
 
-#### 缺口 2：Deployment 完全未实现
+#### 缺口 2：Deployment 完整度更低（模型与权限就绪 → DTO/Resolver/Service 全缺失）
 
-- **现状**：模型、DTO、权限校验齐全，但 `prisma.deployment.create()` 零调用
-- **风险**：`AuthorizableOriginParameter.DeploymentId` 权限校验路径实际上永不可达
+- **现状**：与 Environment 相比，Deployment 缺失层级更多：Prisma 模型 ✅ / 权限校验函数 ✅，但 **DTO 层 ❌ / Service 层 ❌ / GraphQL 层 ❌ / 业务写入 ❌**。Deployment 甚至没有独立的 DTO 类
+- **风险**：
+  - `AuthorizableOriginParameter.DeploymentId` 权限校验路径永不可达（无 resolver 挂载 `@AuthorizeContext`）
+  - `ActionId` 校验中的 `deployments` OR 分支（[validation-functions.ts:221-234](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L221-L234)）永不匹配，死分支
 - **相关文件**：
   - [schema.prisma:629-644](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L629-L644)
-  - [validation-functions.ts:267-275](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L275)
+  - [validation-functions.ts:267-286](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L286)
 
-#### 缺口 3：Build.containerStatusQuery 预留字段未启用
+#### 缺口 3：权限校验函数与 GraphQL 端点不匹配（函数已定义 → 无触发点）
 
-- **现状**：字段存在于 Build 表，无任何读写代码
-- **风险**：无直接风险，属预留扩展点
+- **现状**：`EnvironmentId` 和 `DeploymentId` 在 [AuthorizableOriginParameter](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts#L19-L20) 枚举中已定义，对应的 `VALIDATION_FUNCTIONS` 校验函数也已实现，但全代码库无任何 resolver 使用 `@AuthorizeContext(AuthorizableOriginParameter.EnvironmentId, ...)` 或 `@AuthorizeContext(AuthorizableOriginParameter.DeploymentId, ...)`
+- **风险**：校验函数成为死代码；未来新增端点时容易遗漏权限装饰器（因为缺乏现有示例）
+- **相关文件**：
+  - [validation-functions.ts:267-286](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L286) （DeploymentId）
+  - [validation-functions.ts:445-457](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L445-L457) （EnvironmentId）
+  - [gql-auth.guard.ts:61-83](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L61-L83) （触发机制）
+
+#### 缺口 4：Resource.environments 缺少独立的 @AuthorizeContext 装饰器
+
+- **现状**：`environments` ResolveField（[resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)）没有 `@AuthorizeContext` 装饰器，权限完全依赖父级 Resource 查询的保护。与同 resolver 中的其他 ResolveField（如 `entities`、`builds`）保持一致，但与 Entity/Build 存在独立 Query 端点且有独立权限校验的模式不同
+- **边界情况**：若未来新增独立的 `environment(id: ID!)` Query，必须同时补上 `@AuthorizeContext(AuthorizableOriginParameter.EnvironmentId, "where.id")`，否则将形成越权漏洞
+- **相关文件**：
+  - [resource.resolver.ts:130-135](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts#L130-L135)
+  - [gql-auth.guard.ts:69-71](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts#L69-L71) （无装饰器时直接放行逻辑）
+
+#### 缺口 5：ActionId 权限校验的 Deployment 关联分支为死代码
+
+- **现状**：ActionId 校验的 OR 条件中第一个分支通过 `Action.deployments` 关联来验证归属（[validation-functions.ts:221-234](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L221-L234)）。但 Deployment 表零业务写入，`Action.deployments` 关联永远为空，此分支永不匹配
+- **影响**：无直接安全风险（其他分支仍能校验），但增加了查询复杂度（每次 ActionId 校验都会 JOIN 一个空表），且容易误导后续开发者认为 Deployment 功能已上线
+- **相关文件**：
+  - [validation-functions.ts:212-266](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L212-L266)
+
+#### 缺口 6：Build.containerStatusQuery 预留字段未启用
+
+- **现状**：`containerStatusQuery Json?` 和 `containerStatusUpdatedAt DateTime?` 字段存在于 Build 表，全代码库无任何读写代码
+- **风险**：无直接风险，属预留扩展点。字段命名暗示将用于存储沙箱容器的查询参数（如 Kubernetes deployment name、namespace）
 - **相关文件**：
   - [schema.prisma:496-497](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L497)
 
-#### 缺口 4：Deployment Target 与 Configuration 在 resourceInfo 中的耦合
+#### 缺口 7：Deployment Target 与 Configuration 在 resourceInfo 中的耦合
 
 - **现状**：`resourceInfo` 同时承载 `settings`（配置）和 `codeGeneratorVersionOptions` + `codeGeneratorName`（目标），两个不同关注点封装在同一对象
 - **影响**：未来增加部署目标维度（如云厂商、region）时 `resourceInfo` 会膨胀
 - **相关文件**：
   - [build.service.ts:1501-1516](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/build/build.service.ts#L1501-L1516)
 
-#### 缺口 5：DEFAULT_ENVIRONMENT_NAME 常量重复定义
+#### 缺口 8：DEFAULT_ENVIRONMENT_NAME 常量重复定义
 
 - **现状**：在 `resource.service.ts:83` 和 `environment.service.ts:12` 各定义了一份
 - **影响**：低风险，可维护性问题
@@ -613,9 +845,13 @@ model Build {
 | | [prepare-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/data-service-generator/src/prepare-context.ts) | `prepareContext`（L41-124） |
 | | [dsg-context.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/data-service-generator/src/dsg-context.ts) | `DsgContext` 类 |
 | | [dsg-resource-data.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/libs/util/code-gen-types/src/dsg-resource-data.ts) | `DSGResourceData` 类型 |
-| **Runtime Binding（预留）** | [environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts) | `createDefaultEnvironment`（L22-45，仅测试调用）, `getDefaultEnvironment`（无调用） |
-| | [resource.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts) | `environments` ResolveField（L130-135，只读查询） |
-| | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L615-L644) | `Environment`（L615-627）, `Deployment`（L629-644） 模型, `EnumDeploymentStatus` 枚举 |
-| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L267-L275) | `DeploymentId` 权限校验（仅 count 查询） |
+| **Runtime Binding（预留）** | [environment.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/environment.service.ts) | `createDefaultEnvironment`（L22-45，仅测试调用）, `getDefaultEnvironment`（无调用）, `findMany` |
+| | [environment/dto/](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/environment/dto/) | `Environment` DTO、`CreateEnvironmentArgs`、`EnvironmentWhereInput`、`EnvironmentCreateInput` 等（全部已定义但无独立 Mutation 消费） |
+| | [resource.resolver.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/resource/resource.resolver.ts) | `environments` ResolveField（L130-135，只读查询，无独立 @AuthorizeContext） |
+| | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-prisma-db/prisma/schema.prisma#L496-L644) | `Build.containerStatusQuery/UpdatedAt`（L496-497，预留未启用）, `Environment`（L615-627）, `Deployment`（L629-644）, `EnumDeploymentStatus` 枚举 |
+| | [AuthorizableOriginParameter.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/enums/AuthorizableOriginParameter.ts) | `EnvironmentId`（L19）、`DeploymentId`（L20）枚举定义 |
+| | [validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts) | `DeploymentId` 校验（L267-286，仅 count，无调用方）, `ActionId` 校验含 deployments OR 分支（L212-266，死分支）, `EnvironmentId` 校验（L445-457，无调用方） |
+| | [gql-auth.guard.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/guards/gql-auth.guard.ts) | `canActivate`（L31-45）, `authorizeContext`（L61-83）—— 权限校验触发机制，无装饰器时直接放行（L69-71） |
+| | [mail.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/core/mail/mail.service.ts) | `sendDeploymentNotification`（L55-82，被 `IS_EMAIL_DEPLOYMENT_NOTIFICATION=false` 永久屏蔽，零调用） |
 | **进程级 Env** | [server/env.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-server/src/env.ts) | `Env` 常量 |
 | | [build-manager/env.ts](file:///d:/fz/0601/solo-dogfeeding/code/108-amplication/packages/amplication-build-manager/src/env.ts) | `Env` 常量 |
