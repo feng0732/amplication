@@ -120,13 +120,14 @@ BillingService 提供三种额度查询方法，对应 Stigg 的三种 Entitleme
 
 ### 2.2 Feature 定义
 
-所有计费特性在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts) 中定义，共 29 种：
+所有计费特性在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts) 中定义。枚举共 **28 行**，但由于 `AzureDevOps` 和 `AzureDevops`（大小写不同）共享同一个 feature id `"feature-azure-devops"`，实际为 **27 个独立特性**（详见 6.1 节核准说明）：
 
 ```typescript
 export enum BillingFeature {
   AllowWorkspaceCreation = "feature-allow-workspace-creation",
   AwsCodeCommit = "feature-awscodecommit",
   AzureDevOps = "feature-azure-devops",
+  AzureDevops = "feature-azure-devops",  // 与 AzureDevOps 同一值，大小写别名
   Bitbucket = "feature-bitbucket",
   BlockBuild = "feature-block-build",
   BranchPerResource = "feature-branch-per-resource",
@@ -402,3 +403,320 @@ if (error instanceof BillingLimitationError) {
 | 业务:Git | [git.provider.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/git/git.provider.service.ts) | 企业级 Git Provider 许可 |
 | 业务:自定义动作 | [block.util.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/block/block.util.ts) | Custom Actions 许可 |
 | 数据模型 | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-prisma-db/prisma/schema.prisma) | Subscription/Project.licensed/Resource.licensed |
+
+---
+
+## 六、核准事实澄清
+
+### 6.1 计费特性（BillingFeature）准确数量
+
+在 [billing-feature.types.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/billing-types/src/lib/billing-feature.types.ts#L1-L29) 中枚举定义了 **28 行**，但实际只有 **27 个独立的 feature id**。原因是第 4 行 `AzureDevOps` 和第 5 行 `AzureDevops`（大小写不同）指向同一个字符串值 `"feature-azure-devops"`：
+
+```typescript
+AzureDevOps = "feature-azure-devops",   // L4
+AzureDevops = "feature-azure-devops",   // L5  —— 与上一行值重复
+```
+
+这是 TypeScript 枚举的合法写法，会编译为两个不同的属性名映射到同一值。完整的 27 个独立特性：
+
+| # | 特性名 | Feature ID |
+|---|--------|-----------|
+| 1 | AllowWorkspaceCreation | feature-allow-workspace-creation |
+| 2 | AwsCodeCommit | feature-awscodecommit |
+| 3 | AzureDevOps / AzureDevOps | feature-azure-devops |
+| 4 | Bitbucket | feature-bitbucket |
+| 5 | BlockBuild | feature-block-build |
+| 6 | BranchPerResource | feature-branch-per-resource |
+| 7 | ChangeGitBaseBranch | feature-change-git-base-branch |
+| 8 | CodeGenerationBuilds | feature-code-generation-builds |
+| 9 | CodeGeneratorDotNet | feature-code-generator-dotnet |
+| 10 | CodeGeneratorNodeJsOnly | feature-code-generator-node-js-only |
+| 11 | CodeGeneratorVersion | feature-code-generator-version |
+| 12 | CodePushToGit | feature-code-push-to-git |
+| 13 | CustomActions | feature-custom-actions |
+| 14 | EntitiesPerService | feature-entities-per-service |
+| 15 | GitLab | feature-gitlab |
+| 16 | IgnoreValidationCodeGeneration | feature-ignore-validation-code-generation |
+| 17 | ImportDBSchema | feature-import-db-schema |
+| 18 | JovuRequests | feature-jovu-requests |
+| 19 | Notification | feature-notifications |
+| 20 | PrivatePlugins | feature-private-plugins-module |
+| 21 | Projects | feature-projects |
+| 22 | RedesignArchitecture | feature-redesign-architecture |
+| 23 | Services | feature-services |
+| 24 | ServicesAboveEntitiesPerServiceLimit | feature-services-above-entities-per-service-limit |
+| 25 | SmartGitSync | feature-smart-git-sync |
+| 26 | TeamMembers | feature-team-members |
+
+### 6.2 服务许可（licensed）校验逻辑
+
+`licensed` 字段不仅用于后台记录，还贯穿**服务端拦截**和**前端 UI 禁用**两层校验。
+
+#### 6.2.1 服务端：Entity 创建前的双重许可校验
+
+在 [entity.service.ts#L267-L313](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L267-L313) 中，`checkServiceEntityLicense()` 串联了两层检查：
+
+```typescript
+async checkServiceEntityLicense(resource: Resource) {
+  // 第一层：检查 project.licensed 和 resource.licensed
+  await this.checkServiceLicense(resource);
+  // 第二层：检查 EntitiesPerService (Numeric)
+  const serviceEntityEntitlement = await this.billingService.getNumericEntitlement(...);
+  if (!serviceEntityEntitlement.hasAccess
+      || serviceEntityEntitlement.value <= currentEntityCount) {
+    throw new BillingLimitationError(...);
+  }
+}
+```
+
+其中 `checkServiceLicense()` 的判定条件（[L267-L279](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/entity/entity.service.ts#L267-L279)）：
+
+```typescript
+if (
+  !resource.project?.licensed ||          // 项目超出配额
+  (!resource.licensed                      // 服务超出配额（仅对 Service 类型资源校验）
+    && resource.resourceType === EnumResourceType.Service)
+) {
+  throw new BillingLimitationError(
+    "Your workspace reached its service limitation.",
+    BillingFeature.Services
+  );
+}
+```
+
+#### 6.2.2 服务端：架构重设计移动实体时的许可校验
+
+在 [resource.service.ts#L1246-L1262](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/resource/resource.service.ts#L1246-L1262) 中，将实体从一个服务移动到另一个服务之前，会同时检查**来源项目**和**目标服务**的 `licensed` 状态：
+
+```typescript
+if (!project.licensed || (currentResource && !currentResource.licensed)) {
+  throw new AmplicationError(
+    `Cannot move entities to service: ${serviceName} due to your plan's limitations (number of services)`
+  );
+}
+```
+
+注：这里抛出的是通用的 `AmplicationError` 而非 `BillingLimitationError`，因此前端不会走计费限制弹窗路径，只会显示普通错误提示。
+
+#### 6.2.3 前端：LicenseIndicatorContainer UI 层禁用
+
+[LicenseIndicatorContainer.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Components/LicenseIndicatorContainer.tsx) 是通用的"许可证感知"容器组件，通过 `licensedResourceType` 参数决定读取哪个层级的 licensed 字段：
+
+```typescript
+const currentProjectLicensed = currentProject?.licensed ?? true;
+const currentServiceLicensed = currentResource?.licensed ?? true;
+
+useEffect(() => {
+  if (licensedResourceType === LicensedResourceType.Project && !currentProjectLicensed) {
+    setDisabled(true);
+    setTooltipText(PROJECT_LICENSE_TOOLTIP_TEXT);
+    return;
+  }
+  if (licensedResourceType === LicensedResourceType.Service && !currentServiceLicensed) {
+    setDisabled(true);
+    setTooltipText(SERVICE_LICENSE_TOOLTIP_TEXT);
+    return;
+  }
+  // 同时也可传入 blockByFeatureId（如 BillingFeature.BlockBuild）做额外 Boolean 校验
+  setDisabled(isBlockedFeature);
+}, [...]);
+```
+
+典型使用场景在 [CommitButton.tsx#L159-L164](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L159-L164)：
+
+```tsx
+<LicenseIndicatorContainer
+  blockByFeatureId={BillingFeature.BlockBuild}
+  licensedResourceType={LicensedResourceType.Project}
+>
+  {element /* Generate the code 按钮 */}
+</LicenseIndicatorContainer>
+```
+
+这意味着"Generate the code"按钮会在以下**任一**条件满足时被禁用并显示 Tooltip：
+1. 当前 Project 的 `licensed === false`
+2. Stigg 返回 `BlockBuild` entitlement 的 `hasAccess === false`
+
+### 6.3 架构重设计（RedesignArchitecture）权限
+
+`RedesignArchitecture` 是一个 **Boolean Entitlement**，用于控制"Break the Monolith / Architecture Redesign"功能，对应 Stigg 中的 `feature-redesign-architecture`。权限校验在前后端均有实现。
+
+#### 6.3.1 后端：双重权限检查
+
+在 [resourceBtm.service.ts#L75-L100](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-server/src/core/resource/resourceBtm.service.ts#L75-L100) 的 `checkAccessToBreakTheMonolithWithGpt()` 中，做了**两层独立校验**：
+
+```typescript
+private async checkAccessToBreakTheMonolithWithGpt(user: User) {
+  if (this.billingService.isBillingEnabled) {
+    // 第一层：BillingFeature.RedesignArchitecture 权限
+    const btmWithGpt = (
+      await this.billingService.getBooleanEntitlement(
+        user.workspace?.id,
+        BillingFeature.RedesignArchitecture
+      )
+    ).hasAccess;
+
+    if (!btmWithGpt) {
+      throw new BillingLimitationError(
+        "Available as part of the Enterprise plan only.",
+        BillingFeature.RedesignArchitecture
+      );
+    // 第二层：工作区的 allowLLMFeatures 开关
+    } else if (!userWorkspace.allowLLMFeatures) {
+      throw new AmplicationError(
+        "your workspace settings forbid LLM features use."
+      );
+    }
+  }
+}
+```
+
+调用链：
+- `triggerBreakServiceIntoMicroservices()` → 先调用 `checkAccessToBreakTheMonolithWithGpt()` → 再发起 GPT 请求
+- `finalizeBreakServiceIntoMicroservices()` → 直接处理 GPT 返回结果（不再校验，因为已在 trigger 时校验过）
+- `startRedesign()` → 只做埋点，**不做权限校验**（纯前端状态切换）
+
+#### 6.3.2 前端：三处独立控制入口
+
+前端共三处按钮/页面都绑定了 RedesignArchitecture 权限：
+
+| 位置 | 组件 | 控制方式 |
+|------|------|---------|
+| 架构控制台工具栏 | [RedesignResourceButton.tsx#L36-L88](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Components/RedesignResourceButton.tsx#L36-L88) | `FeatureIndicatorContainer` + `EntitlementType.Boolean`，无权限时按钮禁用 + 锁图标 |
+| 资源页 / 项目页 / 实体列表页 | [BtmButton.tsx#L99-L101](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Resource/break-the-monolith/BtmButton.tsx#L99-L101) | 直接调用 `stigg.getBooleanEntitlement()`，同时检查 `allowLLMFeature`，分 4 种 Tooltip 文案（试用/无权限/LLM关闭/完全访问） |
+| 架构控制台根页面 | [ArchitectureConsole.tsx#L51-L52](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Project/ArchitectureConsole/ArchitectureConsole.tsx#L51-L52) | `FeatureIndicatorContainer` 包裹整个页面内容 |
+
+BtmButton 的四种 Tooltip 状态逻辑（[BtmButton.tsx#L105-L145](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Resource/break-the-monolith/BtmButton.tsx#L105-L145)）：
+
+```
+hasAccess + (Enterprise/Team + Trailing)  →  试用提示 + Upgrade 链接
+!hasAccess                                 →  "Available as part of the Enterprise plan only."
+hasAccess + !allowLLMFeature               →  "LLM features are forbidden in workspace settings"
+hasAccess + (Enterprise/Team + Active)     →  完整功能描述，无升级链接
+```
+
+### 6.4 前端配额错误展示路径
+
+前端配额错误展示分为**两条独立路径**："异步错误弹窗路径"和"同步控件禁用路径"。
+
+#### 6.4.1 路径一：Commit 异步错误 → LimitationDialog 弹窗
+
+这是用户最常接触的路径，用于处理 GraphQL mutation 返回的计费限制错误。完整调用链：
+
+```
+用户点击 Commit 按钮
+  │
+  ▼
+CommitButton.tsx handleClick()
+  │  调用 commitChanges(data)
+  │
+  ▼
+useCommits.ts [useMutation COMMIT_CHANGES]
+  │
+  ├── onError 回调 (L164-L174)
+  │     检查 graphQLErrors 中是否存在
+  │     extensions.code === GraphQLErrorCode.BILLING_LIMITATION_ERROR
+  │     → 若是，setOpenLimitationDialog(true)
+  │
+  └── commitChangesLimitationError (useMemo L219-L233)
+        从 graphQLErrors 中解析：
+          - message: 去掉前缀 "LimitationError: " 后的纯文本
+          - billingFeature: extensions.billingFeature
+        ↓
+  ▼
+CommitButton.tsx render (L165-L199)
+  │
+  └── isLimitationError ? <LimitationDialog /> : <Snackbar />
+        │
+        ├── message={commitChangesLimitationError.message}
+        ├── allowBypassLimitation={bypassLimitations}
+        ├── onConfirm → 跳转到 /purchase（升级）
+        ├── onDismiss → 关闭 + bypassLimitationsRef.current = false
+        └── onBypass  → bypassLimitationsRef.current = true
+                         （下次 commit 时会带上 bypassLimitations=true）
+```
+
+关键实现细节：
+
+1. **错误码定义**：在 [graphql-error-codes.ts](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/libs/util/graphql-error-codes/src/lib/graphql-error-codes.ts#L1-L5) 中：
+   ```typescript
+   export enum GraphQLErrorCode {
+     BILLING_LIMITATION_ERROR = "BILLING_LIMITATION_ERROR",
+     // ...
+   }
+   ```
+
+2. **bypassLimitations 判定**（[useCommits.ts#L212-L217](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/VersionControl/hooks/useCommits.ts#L212-L217)）：
+   ```typescript
+   const bypassLimitations = useMemo(() => {
+     return (
+       currentWorkspace?.subscription?.subscriptionPlan
+         !== EnumSubscriptionPlan.Pro
+     );
+   }, [currentWorkspace]);
+   ```
+   即：**非 Pro 套餐都允许跳过限制**继续生成代码（Pro 套餐必须先升级）。
+
+3. **bypass 回传后端**：用户点击 LimitationDialog 的"Upgrade Later"后，`bypassLimitationsRef.current = true`，下次 commit 时（[CommitButton.tsx#L100](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/VersionControl/CommitButton.tsx#L100)）：
+   ```tsx
+   commitChanges({
+     bypassLimitations: bypassLimitationsRef.current ?? false,
+     // ...
+   });
+   ```
+   后端 `validateSubscriptionPlanLimitationsForWorkspace` 收到 `bypassLimitations=true` 且用户拥有 `IgnoreValidationCodeGeneration` entitlement 时跳过校验。
+
+#### 6.4.2 路径二：同步控件禁用 → FeatureIndicator Tooltip
+
+适用于所有"提前预判用户无权操作"的场景，不让用户点击后再报错。由两个容器组件承载：
+
+**FeatureIndicatorContainer**（[FeatureIndicatorContainer.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Components/FeatureIndicatorContainer.tsx)）：通用特性感知容器，支持 Boolean 和 Metered 两种 Entitlement 类型。
+
+```
+children / render()
+  │
+  ▼
+FeatureIndicatorContainer
+  │
+  ├── stigg.getBooleanEntitlement(featureId).hasAccess  (Boolean 类型)
+  └── stigg.getMeteredEntitlement(featureId)            (Metered 类型)
+        ├── usageLimit / currentUsage / hasAccess
+        └── usageExceeded = usageLimit && currentUsage >= usageLimit
+  │
+  ├── disabled 状态推导
+  │     Boolean: disabled = !hasBooleanAccess
+  │     Metered: disabled = usageExceeded ?? !hasMeteredAccess
+  │
+  ├── icon 状态推导
+  │     disabled → IconType.Lock（锁图标）
+  │     Enterprise/Team/Team + Trailing → IconType.Diamond（钻石图标表示试用）
+  │     其他 → null
+  │
+  └── Tooltip 文案（FeatureIndicator）
+        ├── 已付费完全访问: fullEnterpriseText（无升级链接）
+        ├── 试用中: DEFAULT_TEXT_START + "Upgrade Now" 链接
+        └── 无权限: limitationText + DISABLED_DEFAULT_TEXT_END + 升级链接
+```
+
+典型使用方：
+- [RedesignResourceButton.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Components/RedesignResourceButton.tsx)（Boolean: RedesignArchitecture）
+- [AddNewProject.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Project/AddNewProject.tsx)（Metered: Projects）
+- [Teams/NewTeam.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Teams/NewTeam.tsx)（Metered: TeamMembers）
+- [Entity/EntityList.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Entity/EntityList.tsx)（Boolean: ImportDBSchema）
+
+**FeatureIndicator**（[FeatureIndicator.tsx](file:///d:/fz/0601/solo-dogfeeding/code/102-amplication/packages/amplication-client/src/Components/FeatureIndicator.tsx)）：底层 Tooltip 包装组件，不直接接触 Stigg，仅负责展示：
+- 基于 MUI `Tooltip`，样式为蓝底白字带青蓝色边框
+- 支持两种 CTA：`Upgrade Now`（跳转到 `/${workspaceId}/purchase`）和 `Talk to Us`（外链）
+- 点击链接会埋点 `UpgradeClick`，携带 `billingFeature` 和 `eventOriginLocation`
+
+#### 6.4.3 两条路径的对比
+
+| 维度 | 路径一：LimitationDialog | 路径二：FeatureIndicator Tooltip |
+|------|------------------------|-------------------------------|
+| 触发时机 | GraphQL mutation 响应后（异步） | 渲染时（同步） |
+| 交互形式 | 模态对话框（Confirm/Dismiss/Bypass） | Hover 显示 Tooltip + 按钮置灰 |
+| 是否支持 bypass | 是（非 Pro 套餐可跳过限制） | 否（纯展示） |
+| 错误来源 | 后端 BillingLimitationError | 前端 Stigg SDK entitlement |
+| 典型场景 | Commit 代码生成 | 所有新建按钮（项目/服务/团队/实体等） |
+| 埋点事件 | UpgradeClick / UpgradeLaterClick / PassedLimitsNotificationClose | UpgradeClick |
+
