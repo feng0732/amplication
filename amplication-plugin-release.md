@@ -356,26 +356,66 @@ Tarball.packageTarball()
 
 ##### ▶️ 情况二：`version = "9.9.9"`（合法 SemVer，但 npm 上不存在该版本）
 
-这是整个链路中最复杂、最容易理解错的部分。必须区分**代码意图**、**实际执行路径**、**onError 传参**、**多层 catch 链路**和**用户最终看到的构建日志**五层。
+这是整个链路中最复杂、最容易理解错的部分。必须区分**代码作者意图**、**代码即使执行了也存在的 Bug**、**实际执行路径**、**onError 传参**、**多层 catch 链路**和**用户最终看到的构建日志**六层。
 
 ---
 
-**代码意图（Tarball 分支 2 想做什么）**
+**代码作者意图（Tarball 分支 2 想做什么）**
 
-代码 [Tarball.ts:L52-L64](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52-L64) 的设计初衷是：
+代码 [Tarball.ts:L52-L64](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52-L64) 的设计初衷（理想中的行为）是：
+
+```
+输入：用户请求了不存在的 9.9.9，npm latest 实际是 1.5.0
+期望输出（构建日志）：
+  "@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."
+期望抛出：
+  Error("Could not find version 9.9.9 for @xxx/plugin. Please try to install another version, or the latest version: 1.5.0.")
+```
+
+**但这段代码即使真的执行到了，也输出不了版本号——这是第 4 个 Bug。**
+
+---
+
+**代码即使真执行到也存在的 Bug（Bug 4/4）：latestVersion 是对象，不是字符串**
+
+对照 [Tarball.ts:L37-L38](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L37-L38) 和 [Tarball.ts:L53](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L53)：
 
 ```typescript
+const latestTag = response["dist-tags"].latest;          // 字符串 "1.5.0"
+const latestVersion = response.versions[latestTag];      // Manifest 对象！不是字符串！
+// response.versions 的类型是 { [version: string]: Manifest }
+// Manifest 是 npm 包版本的完整元数据对象，包含 name、version、dist、dependencies、engines 等所有字段
+
+const requestedVersion = response.versions[version || ""];
+
+// ...
+
 if (!requestedVersion.version) {
-  // 想输出："@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."
-  await this.logger.error(
-    [`${name}@${version} is not available`, suggestionMessage].join(". ")
-  );
-  // 想抛出：Error("Could not find version 9.9.9 for @xxx/plugin. Please try...")
-  throw new Error(
-    [`Could not find version ${version} for ${name}`, suggestionMessage].join(". ")
-  );
-}
+  const suggestionMessage =
+    `Please try to install another version, or the latest version: ${latestVersion}.`;
+  //                                                        ↑ 这里直接拼接对象
 ```
+
+**JS 对象在模板字符串中的行为**：普通对象没有自定义 `toString()`，所以 `${latestVersion}` 会被转成字符串 `"[object Object]"`。
+
+对比同文件 L47 的正确写法 [Tarball.ts:L47](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L47)（分支 1 里写对了）：
+
+```typescript
+// 分支 1（正确）：用 latestVersion.version 取字符串版本号
+packageVersion: latestVersion.version,
+
+// 分支 2（错误）：直接用 latestVersion 对象
+`Please try to install another version, or the latest version: ${latestVersion}.`
+```
+
+**最终 suggestionMessage 实际会是**（如果分支 2 能执行到的话）：
+```
+"Please try to install another version, or the latest version: [object Object]."
+```
+
+用户完全看不到 `"1.5.0"` 这个有用的版本号建议，只能看到无意义的 `[object Object]`。错误提示质量为零。
+
+---
 
 **但这段代码实际上永远不会执行。**
 
@@ -395,7 +435,8 @@ plugin.version = "9.9.9"（合法 SemVer，但 npm 上无此版本）
 [Tarball.ts:L39]
   → response = await packument("@xxx/plugin@9.9.9")
     （pacote 返回包完整 packument，包含所有已存在版本，但不含 9.9.9）
-  → latestVersion = response.versions["1.5.0"]（假设 latest 是 1.5.0）
+  → latestTag = response["dist-tags"].latest = "1.5.0"（字符串）
+  → latestVersion = response.versions["1.5.0"]（Manifest 对象，含 version/name/dist/dependencies 等全部字段）
   → requestedVersion = response.versions["9.9.9"] → undefined
   │
   ▼
@@ -408,7 +449,7 @@ plugin.version = "9.9.9"（合法 SemVer，但 npm 上无此版本）
 
 ---
 
-**onError 钩子传参细节（Bug 1/3）**
+**onError 钩子传参细节（Bug 2/4）**
 
 TypeError 首先被 [DynamicPackageInstallationManager.ts:L40-L43](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L40-L43) 捕获：
 
@@ -490,8 +531,8 @@ DSG 进程终止，构建失败
 
 | 日志来源 | 实际输出内容 | 是否会出现 |
 |----------|-------------|-----------|
-| Tarball 分支 2 友好错误日志 | `"@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."` | ❌ **永远不出现**（TypeError 先发生，死代码） |
-| Tarball 分支 2 抛错信息 | `Error: Could not find version 9.9.9 for @xxx/plugin. Please try...` | ❌ **永远不出现**（同上，死代码） |
+| Tarball 分支 2 友好错误日志 | `"@xxx/plugin@9.9.9 is not available. Please try to install another version, or the latest version: 1.5.0."` | ❌ **永远不出现**（TypeError 先发生，死代码）。即使能执行到，也会是 `"... latest version: [object Object]."`（Bug 4/4），看不到实际版本号。 |
+| Tarball 分支 2 抛错信息 | `Error: Could not find version 9.9.9 for @xxx/plugin. Please try...` | ❌ **永远不出现**（同上，死代码）。即使能执行到，message 中同样是 `[object Object]` 而非版本号。 |
 | onError 钩子 `buildLogger.error` [dynamic-package-installation.ts:L53-L55](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/dynamic-package-installation.ts#L53-L55) | `"Failed to installed plugin: @xxx/plugin@9.9.9"` + `{}`（空对象，**无任何错误详情**） | ✅ 会出现，但对用户诊断问题几乎没有帮助 |
 | `generateCodeByResourceData()` `internalLogger.error` [generate-code.ts:L61](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/generate-code.ts#L61) | `"Cannot read properties of undefined (reading 'version')"` + 完整 error 对象（含 stack） | ✅ 会出现（内部日志，通常不向用户展示） |
 | `generateCode()` `context.logger.error` [generate-code.ts:L90](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/generate-code.ts#L90) | `"Failed to generate code: Cannot read properties of undefined (reading 'version')"` | ✅ 会出现在构建日志里（用户能看到） |
@@ -499,15 +540,17 @@ DSG 进程终止，构建失败
 
 ---
 
-> 🔍 **三处代码 Bug 汇总**：
+> 🔍 **四处代码 Bug 汇总**：
 >
-> 1. **Tarball 分支 2 写法缺陷** [Tarball.ts:L52](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52)：`if (!requestedVersion.version)` 应改为 `if (!requestedVersion || !requestedVersion.version)`。当前 `requestedVersion = undefined` 时先抛 TypeError，友好错误分支成为死代码。
+> 1. **Tarball 分支 2 写法缺陷（分支不可达）** [Tarball.ts:L52](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L52)：`if (!requestedVersion.version)` 应改为 `if (!requestedVersion || !requestedVersion.version)`。当前 `requestedVersion = undefined` 时先抛 TypeError，友好错误分支成为死代码。
 >
-> 2. **onError 不传 error 参数** [DynamicPackageInstallationManager.ts:L41](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L41)：`onError(plugin)` 应改为 `onError(plugin, error)`。当前钩子只能写纯文本消息，第二参数永远是空对象。
+> 2. **Tarball 分支 2 建议文案类型错误（即使可达也无用）** [Tarball.ts:L38 + L53](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/Tarball.ts#L38)：`latestVersion` 是 `Manifest` 对象（`response.versions[tag]` 返回 npm 完整版本元数据，含 name/version/dist/dependencies 等字段），不是版本号字符串。模板字符串直接拼接对象会输出 `"[object Object]"`，用户完全看不到建议版本号。正确写法是 `${latestVersion.version}`，同文件 L47 的分支 1 已正确使用该写法。
 >
-> 3. **安装阶段在 try 外面** [create-data-service.ts:L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/create-data-service.ts#L34-L39)：`dynamicPackagesInstallations()` 写在 L41 try 块外面，安装错误无法走 createDataService 内部统一的错误记录路径。
+> 3. **onError 不传 error 参数** [DynamicPackageInstallationManager.ts:L41](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/libs/util/dsg-utils/src/dynamic-installation/DynamicPackageInstallationManager.ts#L41)：`onError(plugin)` 应改为 `onError(plugin, error)`。当前钩子第二参数永远是 `undefined`，展开后是空对象 `{}`，日志里没有任何错误详情。
 >
-> 三重 Bug 叠加的用户体验：用户看不到"请换版本或用最新版"的友好建议，只能先看到一条没有任何错误详情的 `"Failed to installed plugin"`，再看到一条晦涩的 `"Failed to generate code: Cannot read properties of undefined (reading 'version')"`。
+> 4. **安装阶段在 try 外面** [create-data-service.ts:L34-L39](file:///d:/fz/0601/solo-dogfeeding/code/104-amplication/packages/data-service-generator/src/create-data-service.ts#L34-L39)：`dynamicPackagesInstallations()` 写在 L41 try 块外面，安装错误无法走 `createDataService` 内部统一的错误记录路径。
+>
+> 四重 Bug 叠加的用户体验：用户既看不到 `"请换版本或用最新版"` 的友好建议（分支不可达 + 即使可达也是 `[object Object]`），也看不到具体错误原因（onError 不传 error），只能先看到一条毫无信息量的 `"Failed to installed plugin"`，再看到一条晦涩的 `"Failed to generate code: Cannot read properties of undefined (reading 'version')"`。
 
 ##### ▶️ 情况三：`version = "1.0.0"`（合法 SemVer，npm 上存在，但被标记 deprecated）
 
@@ -607,10 +650,14 @@ PluginInstallation.version
                                     │ DSG 进程终止，构建失败                │
                                     └──────────────────────────────────────┘
 
-  ⚠️  3 处 Bug 汇总：
+  ⚠️  4 处 Bug 汇总：
       ① Tarball: if(!requestedVersion.version) 死代码
-      ② DynamicPackageInstallationManager: onError 不传 error 参数
-      ③ createDataService: 动态安装调用在 try 块外面
+         （应写为 if(!requestedVersion || !requestedVersion.version)）
+      ② Tarball: 建议文案 ${latestVersion} 直接拼对象
+         （latestVersion 是 Manifest 对象，输出 [object Object]，
+          正确写法是 ${latestVersion.version}，分支 1 已写对）
+      ③ DynamicPackageInstallationManager: onError 不传 error 参数
+      ④ createDataService: 动态安装调用在 try 块外面
 ```
 
 ### 4.5 插件安装配置校验
