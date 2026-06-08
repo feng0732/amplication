@@ -99,20 +99,55 @@ Amplication 的代码生成流程中存在**两个独立层级**的代码规整�
 
 ### 3.3 数据传输对象（DTOs）
 
-DTO 生成分布在 **Server 端资源 DTO（createEntityDTOs）**、**Server 端自定义 DTO** 和 **Admin 端 DTO** 三条路径。其中 `createEntityDTOs` 是核心，下有 17 种输出成员。
+DTO 生成分布在 **Server 端资源 DTO**、**Server 端自定义 DTO** 和 **Admin 端 DTO** 三条路径。Server 端资源 DTO 的核心是 `createDTOs(entities)`，它在内部按三层来源组装最终的 `DTOs` 对象。
 
-#### 3.3.0 createEntityDTOs 总览
+#### 3.3.0 归属关系与类型定义总览
 
-**生成入口**：[create-dtos.ts#L83-L98](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L83-L98)
+**类型定义**（来自 [code-gen-types.ts#L194-L216](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/libs/util/code-gen-types/src/code-gen-types.ts#L194-L216)）：
+
+```typescript
+// 单个实体的核心 DTO（11 必选 + 2 可选 = 最多 13 个字段）
+export type EntityDTOs = {
+  entity: NamedClassDeclaration;                    // 必选
+  createInput: NamedClassDeclaration;               // 必选
+  updateInput: NamedClassDeclaration;               // 必选
+  whereInput: NamedClassDeclaration;                // 必选
+  whereUniqueInput: NamedClassDeclaration;          // 必选
+  deleteArgs: NamedClassDeclaration;                // 必选（GraphQL Args）
+  countArgs: NamedClassDeclaration;                 // 必选（GraphQL Args）
+  findManyArgs: NamedClassDeclaration;              // 必选（GraphQL Args）
+  findOneArgs: NamedClassDeclaration;               // 必选（GraphQL Args）
+  createArgs?: NamedClassDeclaration;               // 可选（GraphQL Args）
+  updateArgs?: NamedClassDeclaration;               // 可选（GraphQL Args）
+  orderByInput: NamedClassDeclaration;              // 必选
+  listRelationFilter: NamedClassDeclaration;        // 必选
+};
+
+// 单个实体的枚举 DTO（动态数量，取决于枚举字段数）
+export type EntityEnumDTOs = {
+  [dto: string]: namedTypes.TSEnumDeclaration;
+};
+
+// 最终：每个实体 = EntityDTOs ∪ EntityEnumDTOs ∪ toMany 嵌套 DTO
+export type DTOs = {
+  [entity: string]: EntityEnumDTOs & EntityDTOs;
+};
+```
+
+**组装入口**：[create-dtos.ts#L83-L98](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L83-L98)
 
 ```typescript
 export async function createDTOs(entities: Entity[]): Promise<DTOs> {
   const entitiesDTOsMap = await Promise.all(
     entities.map(async (entity) => {
-      const entityDTOs = await createEntityDTOs(entity);      // ① 核心 DTO
-      const entityEnumDTOs = createEntityEnumDTOs(entity);    // ② 枚举 DTO
-      const toManyDTOs = createToManyDTOs(entity);            // ③ toMany 嵌套 DTO
-      const dtos = { ...entityDTOs, ...entityEnumDTOs, ...toManyDTOs };
+      const entityDTOs = await createEntityDTOs(entity);      // ① EntityDTOs：11~13 个
+      const entityEnumDTOs = createEntityEnumDTOs(entity);    // ② EntityEnumDTOs：动态 E 个
+      const toManyDTOs = createToManyDTOs(entity);            // ③ NamedClassDeclaration[]：动态 2R 个
+      const dtos = {
+        ...entityDTOs,     // ① 展开为 {entity, createInput, updateInput, ...}
+        ...entityEnumDTOs, // ② 展开为 {EnumName: TSEnumDeclaration, ...}
+        ...toManyDTOs,     // ③ 数组展开（元素通过 dto.id.name 在上层被寻址）
+      };
       return [entity.name, dtos];
     })
   );
@@ -120,16 +155,63 @@ export async function createDTOs(entities: Entity[]): Promise<DTOs> {
 }
 ```
 
-`createEntityDTOs(entity)` 的输出集合（[create-dtos.ts#L154-L205](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L154-L205)）：
+**createEntityDTOs 内部返回**（[create-dtos.ts#L154-L205](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L154-L205)）：
 
 ```typescript
-const dtos: EntityDTOs = {
-  entity, createInput, updateInput, whereInput, whereUniqueInput, // A. 从头构建
-  deleteArgs, countArgs, findManyArgs, findOneArgs,               // B. 模板+只移除declare class
-  orderByInput,                                                    // C. 模板+完全不清理
-  listRelationFilter,                                              // B. 模板+只移除declare class
-  createArgs?, updateArgs?                                         // B. 模板+只移除declare class（条件）
-};
+async function createEntityDTOs(entity: Entity): Promise<EntityDTOs> {
+  const createEntityFiles = createEntityInputFiles(entity);  // 返回 {entity, createInput, updateInput, whereInput, whereUniqueInput}
+  const createArgs        = await createCreateArgs(...);      // 可选
+  const orderByInput      = await createOrderByInput(entity);
+  const deleteArgs        = await createDeleteArgs(...);
+  const countArgs         = await createCountArgs(...);
+  const findManyArgs      = await createFindManyArgs(...);
+  const findOneArgs       = await createFindOneArgs(...);
+  const updateArgs        = await createUpdateArgs(...);      // 可选
+  const listRelationFilter = await createEntityListRelationFilter(...);
+  const dtos: EntityDTOs = {
+    entity: createEntityFiles.entity,
+    createInput: createEntityFiles.createInput,
+    updateInput: createEntityFiles.updateInput,
+    whereInput: createEntityFiles.whereInput,
+    whereUniqueInput: createEntityFiles.whereUniqueInput,
+    deleteArgs, countArgs, findManyArgs, findOneArgs,
+    orderByInput, listRelationFilter,
+  };
+  if (createArgs) dtos.createArgs = createArgs;
+  if (updateArgs) dtos.updateArgs = updateArgs;
+  return dtos;
+}
+```
+
+**每实体 DTO 总量公式**：
+
+```
+总数 = (11~13) + E + 2R
+       │       │    └─ toMany 关系字段数 × 2（CreateNested + UpdateManyWithout）
+       │       └─ 枚举字段数
+       └─ EntityDTOs（11 必选 + 2 可选 GraphQL Args）
+```
+
+**归属层级图示**：
+
+```
+createDTOs(entities)
+  │
+  ├─ ① createEntityDTOs(entity) → EntityDTOs（11~13 个）
+  │     ├─ A 类：从头构建（5 个）：entity, createInput, updateInput, whereInput, whereUniqueInput
+  │     ├─ B 类：模板 + 只移除 declare class（5~7 个）
+  │     │     ├─ GraphQL Args 必选：deleteArgs, countArgs, findManyArgs, findOneArgs
+  │     │     ├─ GraphQL Args 可选：createArgs?, updateArgs?
+  │     │     └─ listRelationFilter（非 Args 但读取模板）
+  │     └─ C 类：模板 + 完全不清理（1 个）：orderByInput
+  │
+  ├─ ② createEntityEnumDTOs(entity) → EntityEnumDTOs（动态 E 个）
+  │     └─ 枚举字段 → TSEnumDeclaration，从头构建
+  │
+  └─ ③ createToManyDTOs(entity) → NamedClassDeclaration[]（动态 2R 个）
+        ├─ CreateNestedManyWithout{Entity}Input（每个 toMany 关系 1 个）
+        └─ UpdateManyWithout{Entity}Input（每个 toMany 关系 1 个）
+        └─ 均从头构建，classDeclaration()
 ```
 
 **统一的 print 输出路径**：所有 DTO（Class/Enum）最终都走 `createDTOModule()` 或 `createEnumDTOModule()` → `createDTOFile()` → `print(file).code`：
@@ -182,21 +264,23 @@ for (每个 field of entity.fields):
 
 ---
 
-#### 3.3.2 B 类：读取 .template.ts + 只调用 `removeTSClassDeclares`
+#### 3.3.2 B 类：读取 .template.ts + 只调用 `removeTSClassDeclares`（属于 EntityDTOs）
 
-共 **7~9 个**输出成员（`createArgs`、`updateArgs` 为条件生成）：`deleteArgs`、`countArgs`、`findManyArgs`、`findOneArgs`、`listRelationFilter`、`createArgs?`、`updateArgs?`。
+共 **5~7 个**输出成员（均属于 EntityDTOs，`createArgs`、`updateArgs` 为条件生成）：`deleteArgs`、`countArgs`、`findManyArgs`、`findOneArgs`、`listRelationFilter`、`createArgs?`、`updateArgs?`。
+
+其中 `*Args` 系列（4 必选 + 2 可选 = 最多 6 个）对应 **GraphQL 参数类**，`listRelationFilter` 为嵌套关系过滤类。
 
 它们均读取对应的 `*.template.ts`，做 `interpolate` 占位符替换，调用 `removeTSClassDeclares(file)` 清理模板中的 `declare class` 占位符声明，然后通过 `getClassDeclarationById()` **抽取出单个 `NamedClassDeclaration` 节点返回**（不返回整个 file）。
 
-| 输出成员 | 生成函数 | 模板文件 | 清理函数 | 源码位置 |
-|---------|---------|---------|---------|---------|
-| **createArgs**（条件） | `createCreateArgs()` | `create-args.template.ts` | `removeTSClassDeclares` | [create-create-args.ts#L9-L30](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/create/create-create-args.ts#L9-L30) |
-| **updateArgs**（条件） | `createUpdateArgs()` | `update-args.template.ts` | `removeTSClassDeclares` | [create-update-args.ts#L9-L36](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/update/create-update-args.ts#L9-L36) |
-| **deleteArgs** | `createDeleteArgs()` | `delete-args.template.ts` | `removeTSClassDeclares` | [create-delete-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/delete/create-delete-args.ts#L8-L27) |
-| **countArgs** | `createCountArgs()` | `count-args.template.ts` | `removeTSClassDeclares` | [create-count-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/count/create-count-args.ts#L8-L27) |
-| **findManyArgs** | `createFindManyArgs()` | `find-many-args.template.ts` | `removeTSClassDeclares` | [create-find-many-args.ts#L8-L31](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-many/create-find-many-args.ts#L8-L31) |
-| **findOneArgs** | `createFindOneArgs()` | `find-one-args.template.ts` | `removeTSClassDeclares` | [create-find-one-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-one/create-find-one-args.ts#L8-L27) |
-| **listRelationFilter** | `createEntityListRelationFilter()` | `entity-list-relation-filter.template.ts` | `removeTSClassDeclares` | [create-entity-list-relation-filter.ts#L10-L31](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/entity-list-relation-filter/create-entity-list-relation-filter.ts#L10-L31) |
+| 输出成员 | 归属分类 | 生成函数 | 模板文件 | 清理函数 | 源码位置 |
+|---------|---------|---------|---------|---------|---------|
+| **createArgs**（可选） | EntityDTOs / GraphQL Args | `createCreateArgs()` | `create-args.template.ts` | `removeTSClassDeclares` | [create-create-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/create/create-create-args.ts#L9-L30) |
+| **updateArgs**（可选） | EntityDTOs / GraphQL Args | `createUpdateArgs()` | `update-args.template.ts` | `removeTSClassDeclares` | [create-update-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/update/create-update-args.ts#L9-L36) |
+| **deleteArgs** | EntityDTOs / GraphQL Args | `createDeleteArgs()` | `delete-args.template.ts` | `removeTSClassDeclares` | [create-delete-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/delete/create-delete-args.ts#L8-L27) |
+| **countArgs** | EntityDTOs / GraphQL Args | `createCountArgs()` | `count-args.template.ts` | `removeTSClassDeclares` | [create-count-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/count/create-count-args.ts#L8-L27) |
+| **findManyArgs** | EntityDTOs / GraphQL Args | `createFindManyArgs()` | `find-many-args.template.ts` | `removeTSClassDeclares` | [create-find-many-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-many/create-find-many-args.ts#L8-L31) |
+| **findOneArgs** | EntityDTOs / GraphQL Args | `createFindOneArgs()` | `find-one-args.template.ts` | `removeTSClassDeclares` | [create-find-one-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-one/create-find-one-args.ts#L8-L27) |
+| **listRelationFilter** | EntityDTOs / 非 Args | `createEntityListRelationFilter()` | `entity-list-relation-filter.template.ts` | `removeTSClassDeclares` | [create-entity-list-relation-filter.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/entity-list-relation-filter/create-entity-list-relation-filter.ts#L10-L31) |
 
 **处理链（以 deleteArgs 为例）**：
 ```
@@ -220,9 +304,9 @@ readFile(delete-args.template.ts)  ← 含 declare class 占位符
 
 ---
 
-#### 3.3.3 C 类：读取 .template.ts + 完全不调用任何清理函数（orderByInput）
+#### 3.3.3 C 类：读取 .template.ts + 完全不调用任何清理函数（orderByInput，属于 EntityDTOs）
 
-**orderByInput** 是 `createEntityDTOs` 下**唯一**读取了 `.template.ts` 但不调用任何 AST 清理函数的输出成员。
+**orderByInput** 是 `EntityDTOs` 下**唯一**读取了 `.template.ts` 但不调用任何 AST 清理函数的输出成员（共 1 个）。它不属于 GraphQL Args 系列，是独立的排序输入类。
 
 **生成函数**：[order-by-input.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/order-by-input/order-by-input.ts#L31-L87)
 
@@ -328,25 +412,51 @@ export function createNestedInputDTO(classId, entity, toManyField, dtoType) {
 
 ---
 
-#### 3.3.5 createEntityDTOs 输出成员分类汇总
+#### 3.3.5 DTO 输出分类汇总表（统一数量与归属层级）
 
-| 分类 | 输出成员 | 构建方式 | 读取 .template.ts | 清理函数 |
-|------|---------|---------|:-----------------:|:--------:|
-| **A. 从头构建** | `entity` | `classDeclaration()` | ❌ | 0 个 |
-| | `createInput` | `classDeclaration()` | ❌ | 0 个 |
-| | `updateInput` | `classDeclaration()` | ❌ | 0 个 |
-| | `whereInput` | `classDeclaration()` | ❌ | 0 个 |
-| | `whereUniqueInput` | `classDeclaration()` | ❌ | 0 个 |
-| | 枚举 DTOs（entity 内） | `builders.tsEnumDeclaration()` | ❌ | 0 个 |
-| | toMany 嵌套 DTOs | `createNestedInputDTO()` → `classDeclaration()` | ❌ | 0 个 |
-| **B. 模板 + 只移除 declare class** | `createArgs`（条件） | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `updateArgs`（条件） | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `deleteArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `countArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `findManyArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `findOneArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| | `listRelationFilter` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
-| **C. 模板 + 完全不清理** | **`orderByInput`** | `readFile` + `interpolate` + 替换 classBody + 抽取 class | ✅ | **0 个** |
+##### 3.3.5.1 第一层：createEntityDTOs 返回 EntityDTOs（11 必选 + 2 可选 = 最多 13 个）
+
+| 清理分类 | 输出成员 | GraphQL 归属 | 数量 | 构建方式 | 读取 .template.ts | 清理函数 |
+|:--------:|:--------|:-----------|:----:|:--------|:-----------------:|:--------:|
+| A. 从头构建 | `entity` | — | 1 | `classDeclaration()` | ❌ | 0 个 |
+| A. 从头构建 | `createInput` | — | 1 | `classDeclaration()` | ❌ | 0 个 |
+| A. 从头构建 | `updateInput` | — | 1 | `classDeclaration()` | ❌ | 0 个 |
+| A. 从头构建 | `whereInput` | — | 1 | `classDeclaration()` | ❌ | 0 个 |
+| A. 从头构建 | `whereUniqueInput` | — | 1 | `classDeclaration()` | ❌ | 0 个 |
+| A 类小计 | | | **5** | | | |
+| B. 模板 + 只移除 declare class | `deleteArgs` | GraphQL Args（必选） | 1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `countArgs` | GraphQL Args（必选） | 1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `findManyArgs` | GraphQL Args（必选） | 1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `findOneArgs` | GraphQL Args（必选） | 1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `createArgs` | GraphQL Args（可选） | 0~1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `updateArgs` | GraphQL Args（可选） | 0~1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B. 模板 + 只移除 declare class | `listRelationFilter` | 非 Args（嵌套过滤） | 1 | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares` |
+| B 类小计 | | | **5~7** | | | |
+| C. 模板 + 完全不清理 | **`orderByInput`** | 独立排序输入（非 Args） | 1 | `readFile` + `interpolate` + 替换 classBody + 抽取 class | ✅ | **0 个** |
+| C 类小计 | | | **1** | | | |
+| **EntityDTOs 合计** | | | **11~13** | | | |
+
+##### 3.3.5.2 外层合并的枚举 DTO（EntityEnumDTOs，动态 E 个，不属于 EntityDTOs）
+
+| 清理分类 | 输出成员 | 数量 | 构建方式 | 读取 .template.ts | 清理函数 |
+|:--------:|:--------|:----:|:--------|:-----------------:|:--------:|
+| A. 从头构建 | 各枚举字段 → TSEnumDeclaration | E（枚举字段数） | `builders.tsEnumDeclaration()` | ❌ | 0 个 |
+
+##### 3.3.5.3 外层合并的 toMany 嵌套 DTO（toManyDTOs，动态 2R 个，不属于 EntityDTOs）
+
+| 清理分类 | 输出成员 | 数量 | 构建方式 | 读取 .template.ts | 清理函数 |
+|:--------:|:--------|:----:|:--------|:-----------------:|:--------:|
+| A. 从头构建 | CreateNestedManyWithout{Entity}Input | R（toMany 关系数） | `createNestedInputDTO()` → `classDeclaration()` | ❌ | 0 个 |
+| A. 从头构建 | UpdateManyWithout{Entity}Input | R（toMany 关系数） | `createNestedInputDTO()` → `classDeclaration()` | ❌ | 0 个 |
+
+##### 3.3.5.4 总量（每实体）
+
+| 归属层级 | 类型 | 固定/动态 | 数量 |
+|:--------:|:----:|:--------:|:----:|
+| EntityDTOs（createEntityDTOs） | EntityDTOs | 固定 11 + 可选 2 | 11~13 |
+| 枚举 DTO（createEntityEnumDTOs） | EntityEnumDTOs | 动态（取决于枚举字段数 E） | E |
+| toMany 嵌套 DTO（createToManyDTOs） | NamedClassDeclaration[] | 动态（2 × toMany 关系数 R） | 2R |
+| **每实体 DTO 总量** | | | **(11~13) + E + 2R** |
 
 ---
 
@@ -756,7 +866,7 @@ createPublicFiles()
 | Admin Roles | createRolesModule | `JSON.stringify()` | — | ✅ tsModules |
 | Admin Public Files | createPublicFiles | `readCode()` + 字符串替换 / `JSON.stringify()` | — | ❌ 未格式化 |
 | **部分清理的路径** | | | | |
-| GraphQL Args | create*Args（7 种） | 嵌入 DTO print | ✅ 仅 `removeTSClassDeclares` | ✅ dtoModules |
+| GraphQL Args（EntityDTOs B 类） | create*Args（4 必选 + 2 可选 = 最多 6 种） | 嵌入 DTO print | ✅ 仅 `removeTSClassDeclares` | ✅ dtoModules |
 | Admin App.tsx | createAppModule | `print(template).code` | ✅ 2 个 (`removeTSVariableDeclares`, `removeTSIgnoreComments`) | ✅ tsModules |
 | Admin Entity Components | createEntityComponentModules | `print(file).code` | ✅ 3 个（无 `removeESLintComments`） | ✅ tsModules |
 | Seed | createSeed | `print(template).code` | ✅ 1 个 (`removeTSVariableDeclares`) | ✅ seedModule |
