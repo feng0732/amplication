@@ -510,24 +510,25 @@ async createApiToken(args: CreateApiTokenArgs): Promise<ApiToken> {
 
 ---
 
-#### 3.4.3 bcrypt Hash 和 previewChars 的设计意图
+#### 3.4.3 bcrypt Hash 和 previewChars 的真实用途核准
 
-这是 API Token 设计中最精妙的部分：**bcrypt 哈希存储，但不参与校验**。
+这是 API Token 设计中容易误解的部分：**bcrypt 哈希存储于数据库，但完全不参与运行时校验；previewChars 仅用于列表页视觉识别，不用于删除确认。**
 
-**bcrypt Hash 的用途**（不是用于校验）：
+**bcrypt Hash 的唯一真实用途**：
 
-| 用途 | 说明 |
-|------|------|
-| 数据库泄露防护 | 即使攻击者获取数据库备份，看到的是 bcrypt 哈希（默认 10+ salt rounds），无法反推明文 JWT |
-| 视觉确认辅助 | 通过 previewChars 肉眼比对，间接确认数据库记录与用户持有的明文对应 |
+| 用途 | 代码证据 | 说明 |
+|------|---------|------|
+| 数据库泄露防护 | [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L405) `passwordService.hashPassword(token)` | 即使攻击者获取数据库备份，看到的也是按 `BCRYPT_SALT_OR_ROUNDS` 配置生成的 bcrypt 哈希，无法直接反推明文 JWT |
 
-**为什么 hash 不参与校验**：
-JWT 签名（HMAC-SHA256，密钥 `JWT_SECRET`）已经保证了 `userId` 和 `tokenId` 的完整性。攻击者无法伪造 payload 中的 `tokenId` 字段。因此 `validateApiToken` 只需用 `userId + tokenId` 做条件即可，无需再进行 bcrypt 比对（性能开销大）。
+**关于 hash 不参与校验的设计原因**：
+JWT 签名（HMAC-SHA256，密钥 `JWT_SECRET`）已经保证了 `userId` 和 `tokenId` 的完整性。攻击者无法伪造 payload 中的 `tokenId` 字段。因此 `validateApiToken` 只需用 `userId + tokenId` 做条件即可，无需再进行 bcrypt 比对（bcrypt 性能开销大，约 100ms/次）。
 
-**previewChars 的生成和用途**：
+代码证据：[auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L425-L452) `validateApiToken` 函数签名接收了 `token: string` 参数，但函数体内从未引用该参数。
+
+**previewChars 的生成和真实用途**：
 
 ```typescript
-// auth.service.ts
+// [auth.service.ts L387]
 const TOKEN_PREVIEW_LENGTH = 8;
 const previewChars = token.slice(-TOKEN_PREVIEW_LENGTH);  // 取明文 JWT 最后 8 字符
 ```
@@ -541,7 +542,9 @@ const previewChars = token.slice(-TOKEN_PREVIEW_LENGTH);  // 取明文 JWT 最�
 
 显示效果示例：`***********aBc123Xy`
 
-用户删除 token 时，可通过预览字符确认删的是对的那个（虽然还有 token name 作为主要识别方式）。
+**真实用途核准**（代码证据）：
+- ✅ **列表页 token 视觉识别**：列表行中展示 `***********abc123xy`，辅助用户在多个 token 中快速定位（配合 token name 使用）
+- ❌ **不用于删除确认**：删除弹窗（[DeleteApiToken.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/DeleteApiToken.tsx#L59-L67)）只显示标题 `Delete ${apiToken.name}` 和通用 message，**不显示 previewChars 让用户二次确认**
 
 ---
 
@@ -658,59 +661,67 @@ const expired = differenceInDays(new Date(), expirationDate) > 0;
 
 ---
 
-#### 3.4.6 删除授权边界
+#### 3.4.6 删除授权边界核准
 
-**删除的双层校验**：
+**完整删除流程（代码级核准）**：
 
 ```
-前端 DeleteApiToken                    auth.resolver.ts                 validation-functions.ts
-     │                                     │                                   │
-     │ 1. 点击垃圾桶图标                    │                                   │
-     │────────────────────────────────────>│                                   │
-     │                                     │                                   │
-     │                                     │ 2. 弹出确认对话框                 │
-     │<────────────────────────────────────│                                   │
-     │                                     │                                   │
-     │ 3. 用户确认 "Delete"                │                                   │
-     │────────────────────────────────────>│                                   │
-     │                                     │                                   │
-     │                                     │ 4. @UseGuards(GqlAuthGuard)      │
-     │                                     │    校验 User JWT                  │
-     │                                     │                                   │
-     │                                     │ 5. @AuthorizeContext(            │
-     │                                     │      AuthorizableOriginParameter.ApiTokenId,
-     │                                     │      "where.id")                  │
-     │                                     │    ↓ 调用                          │
-     │                                     │                                   │ 6. VALIDATION_FUNCTIONS[ApiTokenId]
-     │                                     │                                   │    prisma.apiToken.count({
-     │                                     │                                   │      where: {
-     │                                     │                                   │        id: originId,       // token ID
-     │                                     │                                   │        userId: user.id,    // ⚠️ 当前用户 ID
-     │                                     │                                   │      }
-     │                                     │                                   │    })
-     │                                     │                                   │    ↓ count === 1 ?
-     │                                     │                                   │
-     │                                     │ 7. 权限校验通过                    │
-     │                                     │───────────────────────────────────│
-     │                                     │                                   │
-     │                                     │ 8. authService.deleteApiToken()  │
-     │                                     │    prisma.apiToken.delete({       │
-     │                                     │      where: { id: args.where.id }│
-     │                                     │    })                              │
-     │                                     │ 9. refetchQueries GET_API_TOKENS │
-     │<────────────────────────────────────│                                   │
-     │                                     │                                   │
+前端 DeleteApiToken 组件（本地状态）          auth.resolver.ts                 validation-functions.ts
+     │                                              │                                   │
+     │ 1. 点击垃圾桶图标                             │                                   │
+     │    setConfirmDelete(true)                     │                                   │
+     │    ───────────────────────                    │                                   │
+     │    ↓ (组件本地 state 变更)                     │                                   │
+     │ 2. 前端本地 ConfirmationDialog 弹出           │                                   │
+     │    标题: "Delete ${apiToken.name}"            │                                   │
+     │    文案: "This API token will stop working    │                                   │
+     │           immediately. Are you sure you       │                                   │
+     │           want to delete this token?"         │                                   │
+     │    ⚠️ 不显示 previewChars，不要求用户二次输入   │                                   │
+     │                                              │                                   │
+     │ 3. 用户点击 "Delete" 按钮                     │                                   │
+     │─────────────────────────────────────────────>│                                   │
+     │                                              │                                   │
+     │                                              │ 4. @UseGuards(GqlAuthGuard)       │
+     │                                              │    校验 User JWT                   │
+     │                                              │                                    │
+     │                                              │ 5. @AuthorizeContext(             │
+     │                                              │      ApiTokenId, "where.id")       │
+     │                                              │    ↓ 调用                           │
+     │                                              │                                   │ 6. VALIDATION_FUNCTIONS[ApiTokenId]
+     │                                              │                                   │    prisma.apiToken.count({
+     │                                              │                                   │      where: {
+     │                                              │                                   │        id: originId,
+     │                                              │                                   │        userId: user.id,  // 只能删自己
+     │                                              │                                   │      }
+     │                                              │                                   │    }) === 1
+     │                                              │                                   │
+     │                                              │ 7. 权限校验通过                     │
+     │                                              │───────────────────────────────────│
+     │                                              │                                   │
+     │                                              │ 8. authService.deleteApiToken()   │
+     │                                              │    prisma.apiToken.delete({        │
+     │                                              │      where: { id: args.where.id } │
+     │                                              │    })                               │
+     │ 9. refetchQueries GET_API_TOKENS 刷新列表     │                                   │
+     │<─────────────────────────────────────────────│                                   │
 ```
 
-**权限校验的精确实现**（[validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L198-L211)）：
-
+**前端确认弹窗代码证据**（[DeleteApiToken.tsx](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-client/src/Settings/DeleteApiToken.tsx#L59-L67)）：
 ```typescript
-[AuthorizableOriginParameter.ApiTokenId]: async (
-  prisma: PrismaService,
-  originId: string,     // 要删除的 token ID
-  workspaceId: string,  // 未使用（ApiToken 是用户级资源，非工作区级）
-  user: AuthUser        // 当前登录用户
-) => {
+<ConfirmationDialog
+  isOpen={confirmDelete}
+  title={`Delete ${apiToken.name}`}  // ⚠️ 只显示 token name
+  confirmButton={CONFIRM_BUTTON}
+  dismissButton={DISMISS_BUTTON}
+  message="This API token will stop working immediately. Are you sure you want to delete this token?"
+  // ⚠️ 不显示 previewChars，不要求用户输入预览字符确认
+/>
+```
+
+**后端授权核心代码**（[validation-functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/permissions/validation-functions.ts#L198-L211)）：
+```typescript
+[AuthorizableOriginParameter.ApiTokenId]: async (prisma, originId, workspaceId, user) => {
   const matching = await prisma.apiToken.count({
     where: {
       id: originId,       // token ID 匹配
@@ -718,15 +729,15 @@ const expired = differenceInDays(new Date(), expirationDate) > 0;
     },
   });
   return { canAccessWorkspace: matching === 1 };
-  // ⚠️ 返回字段名是 canAccessWorkspace，但实际语义是"能否操作该 token"
-  // 这是因为复用了统一的 ValidationResponse 类型
+  // 注意：返回字段名 canAccessWorkspace 是复用统一类型，实际语义是"能否操作该 token"
 };
 ```
 
-**删除授权边界结论**：
-- **用户只能删除自己的 tokens**，即使知道别人的 token ID 也无法删除
-- 删除后前端立即通过 `refetchQueries` 刷新列表
-- 删除确认文案：*"This API token will stop working immediately. Are you sure you want to delete this token?"*
+**删除授权边界核准结论**：
+- ✅ **前端确认**：本地 `ConfirmationDialog`，只显示 token name，不显示 previewChars
+- ✅ **后端授权**：`count({ id, userId }) === 1`，用户只能删除自己的 tokens，即使知道别人的 token ID 也无法删除
+- ✅ **立即生效**：数据库 `prisma.apiToken.delete()` 物理删除，立即生效
+- ✅ **列表同步**：删除后 `refetchQueries` 立即刷新列表
 
 ---
 
@@ -961,102 +972,38 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
 #### Step 2: API Token 滑动过期校验
 
+**分支触发条件**：`payload.type === EnumTokenType.ApiToken`
+
 **代码位置**：
-- [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L22-L34)（分支判断）
+- [jwt.strategy.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/jwt.strategy.ts#L22-L34)（分支判断 + 调用）
 - [auth.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/101-amplication/packages/amplication-server/src/core/auth/auth.service.ts#L421-L452)（滑动过期校验实现）
 
-**JwtStrategy 中的判断逻辑**：
-
+**核心校验逻辑**：
 ```typescript
-// [jwt.strategy.ts L22-L34]
-async validate(req, payload: JwtDto): Promise<AuthUser> {
-  if (payload.type === EnumTokenType.ApiToken) {
-    const jwt = ExtractJwt.fromAuthHeaderAsBearerToken()(req);
-    // ⚠️ 注意：此处将原始 JWT 明文传给 validateApiToken
-    const isValid = await this.authService.validateApiToken({
-      userId: payload.userId,
-      tokenId: payload.tokenId,
-      token: jwt,
-    });
-    if (!isValid === true) {
-      throw new UnauthorizedException();
-    }
-  }
-  // ...后续 Step 3
-}
-```
-
-**`validateApiToken` 实现 — 原子操作的精确边界**：
-
-```typescript
-// [auth.service.ts L421-L452]
-const TOKEN_EXPIRY_DAYS = 30;
-
-async validateApiToken(args: {
-  userId: string;
-  tokenId: string;
-  token: string;   // ⚠️ token 参数虽然传入，但函数体内没有使用
-}): Promise<boolean> {
-  // 计算 30 天前此刻的精确时间点
-  const lastAccessThreshold = subDays(new Date(), TOKEN_EXPIRY_DAYS);
-
-  // 原子操作：查找 + 更新 lastAccessAt
-  const apiToken = await this.prismaService.apiToken.updateMany({
-    where: {
-      userId: args.userId,       // ① 匹配用户 ID
-      id: args.tokenId,       // ② 匹配 API Token 记录 ID
-      lastAccessAt: {
-        gt: lastAccessThreshold,  // ③ 严格大于 T-30 天
-      },
-      user: {
-        deletedAt: null,        // ④ 关联用户未软删除
-      },
-    },
-    data: {
-      lastAccessAt: new Date(),  // 校验通过则原子更新，续期
-    },
+// JwtStrategy.validate()
+if (payload.type === EnumTokenType.ApiToken) {
+  const jwt = ExtractJwt.fromAuthHeaderAsBearerToken()(req);
+  const isValid = await this.authService.validateApiToken({
+    userId: payload.userId,
+    tokenId: payload.tokenId,
+    token: jwt,      // ⚠️ 传入但未使用
   });
-
-  return apiToken.count === 1;  // 精确匹配 1 行才算成功
+  if (!isValid === true) throw new UnauthorizedException();
 }
 ```
 
-**边界细节**：
+**`validateApiToken` 原子操作的四条件 where 子句**（精确匹配才通过）：
 
-| 条件 | 精确含义 | 边界说明 |
-|-------|---------|---------|
-| `lastAccessAt: { gt: lastAccessThreshold }` | `lastAccessAt > NOW - 30天` | 严格大于，不含等于 | 恰好 30×24h 前的那一刻已失效 |
-| `user: { deletedAt: null }` | 关联用户未被软删除 | 通过 Prisma 嵌套过滤 | 用户被删则 API Token 同时失效 |
-| `apiToken.count === 1` | 精确匹配 1 条记录 | 防并发、防伪造 | 多行匹配都不允许 |
+| 条件 | 精确含义 | 失败后果 |
+|------|---------|---------|
+| `userId: args.userId` | 记录属于该用户 | 失败 |
+| `id: args.tokenId` | token 记录存在（未被删除） | 失败 |
+| `lastAccessAt: { gt: subDays(NOW, 30) }` | 严格大于 30 天前此刻（滑动窗口） | 连续 30 天无访问已过期 |
+| `user: { deletedAt: null }` | 关联用户未被软删除 | 用户被删同步失效 |
 
-**关于 `token` 参数为何传入但未使用的设计意图**：
+通过以上全部条件 → `updateMany` 原子更新 `lastAccessAt = new Date()` 完成滑动续期 → 返回 `count === 1` 判定成功。
 
-`validateApiToken` 虽然接收了明文 `token` 参数，但**没有进行 bcrypt 比对**。原因：
-- 因为 API Token 的明文 JWT 已经由 Step 1 的 Passport 签名校验过，签名正确意味着 `userId` 和 `tokenId` 未被篡改
-- 数据库存储的 bcrypt 哈希（`passwordService.hashPassword(token)`）只用于：
-  - 创建时给用户展示预览（`previewChars = token.slice(-8)`）和删除前由用户通过预览字符肉眼确认
-  - 防止数据库泄露后攻击者无法直接从数据库获取明文
-
-**API Token 完整生命周期**：
-
-```
-创建时：
-  createApiToken()
-    ├── token = prepareApiToken(user, tokenId)   // 签发 JWT，包含 tokenId claim
-    ├── previewChars = token.slice(-8)  // 只展示后 8 字符
-    ├── hashedToken = bcrypt.hash(token)   // 只存储哈希
-    └── 返回明文 token，只此一次返回给用户
-
-校验时：
-  validateApiToken()
-    ├── JWT 签名校验 → 解析出 userId + tokenId（Step 1）
-    ├── 数据库 UPDATE WHERE userId + tokenId + lastAccessAt > T-30d
-    └── bcrypt 哈希不参与校验（签名已保证完整性）
-
-删除时：
-  deleteApiToken(id)
-    └── 用户通过 previewChars 视觉确认，再删除
-```
+> **关于 `token` 参数传入但未使用的说明**、**bcrypt 哈希真实用途**、**previewChars 真实用途**、**前端过期展示 vs 后端判定差异**、**删除授权边界**等完整分析，详见 [3.4 API Token 完整生命周期深度分析](#34-api-token-完整生命周期深度分析)。3.4 节是 API Token 相关结论的唯一权威来源。
 
 ---
 
