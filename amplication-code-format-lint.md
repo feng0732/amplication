@@ -99,57 +99,258 @@ Amplication 的代码生成流程中存在**两个独立层级**的代码规整�
 
 ### 3.3 数据传输对象（DTOs）
 
-DTO 生成分布在 **Server 端资源 DTO**、**Server 端自定义 DTO**、**Server 端 GraphQL Args** 和 **Admin 端 DTO** 四条路径。
+DTO 生成分布在 **Server 端资源 DTO（createEntityDTOs）**、**Server 端自定义 DTO** 和 **Admin 端 DTO** 三条路径。其中 `createEntityDTOs` 是核心，下有 17 种输出成员。
 
-#### 3.3.1 Server 端资源 DTO（Entity DTOs）
+#### 3.3.0 createEntityDTOs 总览
 
-**生成入口**：[create-dtos.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts)
-
-**print 输出点**：[create-dto-module.ts#L128](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-dto-module.ts#L128)（普通 DTO）和 [create-enum-dto-module.ts#L36](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-enum-dto-module.ts#L36)（枚举 DTO）
+**生成入口**：[create-dtos.ts#L83-L98](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L83-L98)
 
 ```typescript
-// createDTOModules() → createDTOModulesInternal() [L50-L70]
-//   → 遍历所有 DTO
-//      ├─ Class 类型: createDTOModule(dto, dtoNameToPath)
-//      │    → createDTOFile(dto, path, dtoNameToPath)
-//      │         → builders.file(builders.program(statements))
-//      │         → addImports(file, ...)  ← 注入依赖 import
-//      │    → addAutoGenerationComment(file)
-//      │    → print(file).code  ← 代码输出点
-//      │
-//      └─ Enum 类型: createEnumDTOModule(dto, dtoNameToPath)
-//           → createDTOFile(dto, path, dtoNameToPath)  (同上)
-//           → 注入 registerEnumType() 调用 [create-enum-dto-module.ts#L25-L28]
-//           → addImports(file, [from "@nestjs/graphql"])
-//           → addAutoGenerationComment(file)
-//           → print(file).code  ← 代码输出点
+export async function createDTOs(entities: Entity[]): Promise<DTOs> {
+  const entitiesDTOsMap = await Promise.all(
+    entities.map(async (entity) => {
+      const entityDTOs = await createEntityDTOs(entity);      // ① 核心 DTO
+      const entityEnumDTOs = createEntityEnumDTOs(entity);    // ② 枚举 DTO
+      const toManyDTOs = createToManyDTOs(entity);            // ③ toMany 嵌套 DTO
+      const dtos = { ...entityDTOs, ...entityEnumDTOs, ...toManyDTOs };
+      return [entity.name, dtos];
+    })
+  );
+  return Object.fromEntries(entitiesDTOsMap);
+}
+```
+
+`createEntityDTOs(entity)` 的输出集合（[create-dtos.ts#L154-L205](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L154-L205)）：
+
+```typescript
+const dtos: EntityDTOs = {
+  entity, createInput, updateInput, whereInput, whereUniqueInput, // A. 从头构建
+  deleteArgs, countArgs, findManyArgs, findOneArgs,               // B. 模板+只移除declare class
+  orderByInput,                                                    // C. 模板+完全不清理
+  listRelationFilter,                                              // B. 模板+只移除declare class
+  createArgs?, updateArgs?                                         // B. 模板+只移除declare class（条件）
+};
+```
+
+**统一的 print 输出路径**：所有 DTO（Class/Enum）最终都走 `createDTOModule()` 或 `createEnumDTOModule()` → `createDTOFile()` → `print(file).code`：
+
+```
+[各生成函数返回 NamedClassDeclaration / TSEnumDeclaration]
+         ↓
+createDTOModule(dto, dtoNameToPath)  [create-dto-module.ts#L115-L135]
+  → createDTOFile(dto, path, ...)    [L137-L156]
+       → builders.file(builders.program([dto, exportNames([dto.id])]))
+       → addImports(file, importContainedIdentifiers2(dto, moduleToIds))
+  → shouldAddAutoGenerationComment && addAutoGenerationComment(file)
+  → print(file).code  ← 唯一代码输出点 [L128]
+  → moduleMap.set({ path, code })
+```
+
+**关键设计**：所有 `create*Args`、`orderByInput`、`listRelationFilter` 等基于模板生成的 DTO，都**只抽取出单个 `NamedClassDeclaration` 节点返回**，而不是返回整个 File AST。File 对象是在 `createDTOFile()` 中通过 `builders.file(builders.program(...))` **重新构建**的，因此模板中的 `@ts-ignore`、顶层 import、`declare class` 等内容不会出现在最终输出中。
+
+---
+
+#### 3.3.1 A 类：从头构建 AST（不读取 .template.ts，不调用任何清理函数）
+
+共 **5 个**输出成员：`entity`、`createInput`、`updateInput`、`whereInput`、`whereUniqueInput`。
+
+它们在 [createEntityInputFiles()](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L104-L152) 中通过 `pipe(createEntityDTO, createCreateInput, createUpdateInput, createWhereInput, createWhereUniqueInput)` 逐个字段累加属性，最后调用 `classDeclaration()` 从头构建 AST：
+
+| 输出成员 | 生成函数 | 源码位置 | 构建方式 |
+|---------|---------|---------|---------|
+| **entity** | `createEntityDTO()` | [create-entity-dto.ts#L13-L37](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-entity-dto.ts#L13-L37) | `classDeclaration(builders.identifier(entity.name), builders.classBody(properties), null, [OBJECT_TYPE_DECORATOR])` |
+| **createInput** | `createCreateInput()` | [create-create-input.ts#L9-L35](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-create-input.ts#L9-L35) | `classDeclaration(builders.identifier("${entityName}CreateInput"), ..., [INPUT_TYPE_DECORATOR])` |
+| **updateInput** | `createUpdateInput()` | [create-update-input.ts#L9-L36](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-update-input.ts#L9-L36) | `classDeclaration(builders.identifier("${entityName}UpdateInput"), ...)` |
+| **whereInput** | `createWhereInput()` | [create-where-input.ts#L12-L38](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-where-input.ts#L12-L38) | `classDeclaration(builders.identifier("${entityName}WhereInput"), ...)` |
+| **whereUniqueInput** | `createWhereUniqueInput()` | [create-where-unique-input.ts#L12-L38](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-where-unique-input.ts#L12-L38) | `classDeclaration(builders.identifier("${entityName}WhereUniqueInput"), ...)` |
+
+**处理链（以 entity 为例）**：
+```
+for (每个 field of entity.fields):
+  createEntityDTO(entityDTOsFilesObj)  → 累加 properties[]
+最后一个 field 时:
+  classDeclaration(identifier, classBody(properties), null, [decorator])
+  → 返回 NamedClassDeclaration
+  → 上层 createDTOModule() → createDTOFile() → builders.file(...) → print(file).code
 ```
 
 | 项目 | 状态 |
 |------|------|
-| **AST 清理函数** | ❌ **一个都没有调用**（Class 和 Enum DTO 均从头构建 AST，不从 .template.ts 文件读取） |
-| **Prettier 格式化** | ✅ 在 [create-server.ts#L108](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/create-server.ts#L108) 通过 `dtoModules.replaceModulesCode(formatCode)` 格式化 |
-| **输出文件** | `src/<entity>/base/<DtoName>.ts`、`src/<entity>/base/<EnumName>.ts` 等 |
-
-#### 3.3.2 Server 端 GraphQL Args
-
-**生成入口**：7 个文件，如 [create-create-args.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/create/create-create-args.ts#L9-L30)
-
-```typescript
-// createCreateArgs(entity, createInput)
-//   → readFile(templatePath)
-//   → interpolate(file, mapping)
-//   → removeTSClassDeclares(file)  ← 唯一调用的清理函数
-//   → (不直接 print) 返回 classDeclaration，嵌入上层 DTO
-```
-
-| 项目 | 状态 |
-|------|------|
-| **AST 清理函数** | ✅ 仅调用 `removeTSClassDeclares`（1 个） |
+| **是否读取 .template.ts** | ❌ 否 |
+| **AST 清理函数** | ❌ 0 个（本就无 `declare`/注释需清理） |
 | **Prettier 格式化** | ✅ 属于 `dtoModules`，在 [create-server.ts#L108](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/create-server.ts#L108) 格式化 |
-| **输出文件** | `src/<entity>/dto/graphql/<operation>/<ArgsName>.ts`（作为上层 DTO 的一部分输出） |
 
-#### 3.3.3 Server 端自定义 DTO（Custom DTOs）
+---
+
+#### 3.3.2 B 类：读取 .template.ts + 只调用 `removeTSClassDeclares`
+
+共 **7~9 个**输出成员（`createArgs`、`updateArgs` 为条件生成）：`deleteArgs`、`countArgs`、`findManyArgs`、`findOneArgs`、`listRelationFilter`、`createArgs?`、`updateArgs?`。
+
+它们均读取对应的 `*.template.ts`，做 `interpolate` 占位符替换，调用 `removeTSClassDeclares(file)` 清理模板中的 `declare class` 占位符声明，然后通过 `getClassDeclarationById()` **抽取出单个 `NamedClassDeclaration` 节点返回**（不返回整个 file）。
+
+| 输出成员 | 生成函数 | 模板文件 | 清理函数 | 源码位置 |
+|---------|---------|---------|---------|---------|
+| **createArgs**（条件） | `createCreateArgs()` | `create-args.template.ts` | `removeTSClassDeclares` | [create-create-args.ts#L9-L30](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/create/create-create-args.ts#L9-L30) |
+| **updateArgs**（条件） | `createUpdateArgs()` | `update-args.template.ts` | `removeTSClassDeclares` | [create-update-args.ts#L9-L36](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/update/create-update-args.ts#L9-L36) |
+| **deleteArgs** | `createDeleteArgs()` | `delete-args.template.ts` | `removeTSClassDeclares` | [create-delete-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/delete/create-delete-args.ts#L8-L27) |
+| **countArgs** | `createCountArgs()` | `count-args.template.ts` | `removeTSClassDeclares` | [create-count-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/count/create-count-args.ts#L8-L27) |
+| **findManyArgs** | `createFindManyArgs()` | `find-many-args.template.ts` | `removeTSClassDeclares` | [create-find-many-args.ts#L8-L31](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-many/create-find-many-args.ts#L8-L31) |
+| **findOneArgs** | `createFindOneArgs()` | `find-one-args.template.ts` | `removeTSClassDeclares` | [create-find-one-args.ts#L8-L27](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/find-one/create-find-one-args.ts#L8-L27) |
+| **listRelationFilter** | `createEntityListRelationFilter()` | `entity-list-relation-filter.template.ts` | `removeTSClassDeclares` | [create-entity-list-relation-filter.ts#L10-L31](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/entity-list-relation-filter/create-entity-list-relation-filter.ts#L10-L31) |
+
+**处理链（以 deleteArgs 为例）**：
+```
+readFile(delete-args.template.ts)  ← 含 declare class 占位符
+  → interpolate(file, { ID, WHERE_UNIQUE_INPUT })
+  → removeTSClassDeclares(file)  ← 唯一调用：清理模板中的 declare class
+  → getClassDeclarationById(file, id)  ← 抽取出目标 class 节点
+  → 返回 NamedClassDeclaration（不返回整个 file）
+  → 上层 createDTOModule() → createDTOFile() → builders.file(...) → print(file).code
+```
+
+**关键说明**：
+- `removeTSClassDeclares` 的作用是**清除模板中的 `declare class XXX` 占位符声明**，避免它们干扰 `getClassDeclarationById` 的查找和最终输出
+- 模板中的 `@ts-ignore` 注释不需要清理，因为返回的是抽取出的 class 节点，**新 File 是重新构建的**
+
+| 项目 | 状态 |
+|------|------|
+| **是否读取 .template.ts** | ✅ 是 |
+| **AST 清理函数** | ✅ 仅 `removeTSClassDeclares`（1 个） |
+| **Prettier 格式化** | ✅ 属于 `dtoModules`，在 [create-server.ts#L108](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/create-server.ts#L108) 格式化 |
+
+---
+
+#### 3.3.3 C 类：读取 .template.ts + 完全不调用任何清理函数（orderByInput）
+
+**orderByInput** 是 `createEntityDTOs` 下**唯一**读取了 `.template.ts` 但不调用任何 AST 清理函数的输出成员。
+
+**生成函数**：[order-by-input.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/order-by-input/order-by-input.ts#L31-L87)
+
+**模板文件内容**：[order-by-input.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/order-by-input/order-by-input.template.ts)
+
+```typescript
+import { Field, InputType } from "@nestjs/graphql";
+//@ts-ignore                              ← 模板里有 @ts-ignore
+import { SortOrder } from "../../util/SortOrder";
+import { ApiProperty } from "@nestjs/swagger";
+import { IsOptional, IsEnum } from "class-validator";
+
+@InputType({ isAbstract: true, ... })
+export class ID {                           ← 占位符 class 名称
+  @ApiProperty({ required: false, enum: ["asc", "desc"] })
+  @IsOptional()
+  @IsEnum(SortOrder)
+  @Field(() => SortOrder, { nullable: true })
+  FIELD_NAME?: SortOrder;                    ← 占位符字段
+}
+```
+
+**处理链**：
+```typescript
+// createOrderByInput(entity) [L31-L87]
+//   1. readFile(templatePath)                             ← 读取含 @ts-ignore 的模板
+//   2. interpolate(file, { ID: createOrderByInputId(entity.name) })
+//                                                        ← 替换 class 名称 ID → EntityOrderByInput
+//   3. getClassDeclarationById(file, id)                 ← 抽取出目标 class 节点
+//   4. 为每个 entity.field 构建新的 classProperty 列表
+//   5. classDeclaration.body = builders.classBody(properties)
+//                                                        ← 完全替换 classBody！原模板中的 FIELD_NAME 被全部丢弃
+//   6. return classDeclaration as NamedClassDeclaration  ← 只返回抽取出的 class 节点
+//   → 上层 createDTOModule() → createDTOFile() → builders.file(...) → print(file).code
+```
+
+| 项目 | 状态 |
+|------|------|
+| **是否读取 .template.ts** | ✅ 是 |
+| **AST 清理函数** | ❌ **0 个**（既不调 `removeTSClassDeclares`，也不调 `removeTSIgnoreComments`） |
+| **为什么不需要清理**：模板中虽然有 `//@ts-ignore`（第 2 行），但：<br>① 抽取出的是单个 `classDeclaration` 节点（不包含 File 顶层的注释）<br>② `classDeclaration.body` 被整个**重新构建**（L84），原模板字段的装饰器和注释被丢弃<br>③ 最终的 File 对象是在 `createDTOFile` 中通过 `builders.file(builders.program([...]))` 重新构建的，原模板的顶层内容不会带入 |
+| **Prettier 格式化** | ✅ 属于 `dtoModules` |
+
+---
+
+#### 3.3.4 createEntityDTOs 外的 DTO 成员（枚举 + 嵌套 toMany）
+
+##### 3.3.4.1 枚举 DTOs（createEntityEnumDTOs）
+
+**生成入口**：[create-dtos.ts#L207-L215](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L207-L215)
+
+```typescript
+function createEntityEnumDTOs(entity: Entity): EntityEnumDTOs {
+  const enumFields = getEnumFields(entity);
+  return Object.fromEntries(
+    enumFields.map((field) => {
+      const enumDTO = createEnumDTO(field, entity);  // 从头构建
+      return [createEnumName(field, entity), enumDTO];
+    })
+  );
+}
+```
+
+**createEnumDTO()**：[create-enum-dto.ts#L10-L20](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/create-enum-dto.ts#L10-L20)
+
+```typescript
+// builders.tsEnumDeclaration(builders.identifier(name), enumMembers)
+```
+
+| 项目 | 状态 |
+|------|------|
+| **是否读取 .template.ts** | ❌ 否 |
+| **AST 清理函数** | ❌ 0 个（`builders.tsEnumDeclaration` 从头构建） |
+| **Prettier 格式化** | ✅ 属于 `dtoModules` |
+
+##### 3.3.4.2 toMany 嵌套 DTOs（createToManyDTOs）
+
+**生成入口**：[create-dtos.ts#L217-L221](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/create-dtos.ts#L217-L221)
+
+```typescript
+function createToManyDTOs(entity: Entity): NamedClassDeclaration[] {
+  const allCreateNestedManyWithoutInput = createCreateNestedManyDTOs(entity);
+  const allUpdateManyWithoutInput = createUpdateManyWithoutInputDTOs(entity);
+  return [...allCreateNestedManyWithoutInput, ...allUpdateManyWithoutInput];
+}
+```
+
+**底层构建**：[create-nested-input-dto.ts#L28-L42](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/nested-input-dto/create-nested-input-dto.ts#L28-L42)
+
+```typescript
+export function createNestedInputDTO(classId, entity, toManyField, dtoType) {
+  const properties = createNestedManyProperties(...);
+  const decorators = properties.length ? [INPUT_TYPE_DECORATOR] : [];
+  return classDeclaration(classId, builders.classBody(properties), null, decorators);
+}
+```
+
+| 项目 | 状态 |
+|------|------|
+| **是否读取 .template.ts** | ❌ 否 |
+| **AST 清理函数** | ❌ 0 个（`classDeclaration` 从头构建） |
+| **Prettier 格式化** | ✅ 属于 `dtoModules` |
+
+---
+
+#### 3.3.5 createEntityDTOs 输出成员分类汇总
+
+| 分类 | 输出成员 | 构建方式 | 读取 .template.ts | 清理函数 |
+|------|---------|---------|:-----------------:|:--------:|
+| **A. 从头构建** | `entity` | `classDeclaration()` | ❌ | 0 个 |
+| | `createInput` | `classDeclaration()` | ❌ | 0 个 |
+| | `updateInput` | `classDeclaration()` | ❌ | 0 个 |
+| | `whereInput` | `classDeclaration()` | ❌ | 0 个 |
+| | `whereUniqueInput` | `classDeclaration()` | ❌ | 0 个 |
+| | 枚举 DTOs（entity 内） | `builders.tsEnumDeclaration()` | ❌ | 0 个 |
+| | toMany 嵌套 DTOs | `createNestedInputDTO()` → `classDeclaration()` | ❌ | 0 个 |
+| **B. 模板 + 只移除 declare class** | `createArgs`（条件） | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `updateArgs`（条件） | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `deleteArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `countArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `findManyArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `findOneArgs` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| | `listRelationFilter` | `readFile` + `interpolate` + 抽取 class | ✅ | `removeTSClassDeclares`（1 个） |
+| **C. 模板 + 完全不清理** | **`orderByInput`** | `readFile` + `interpolate` + 替换 classBody + 抽取 class | ✅ | **0 个** |
+
+---
+
+#### 3.3.6 Server 端自定义 DTO（Custom DTOs）
 
 **生成入口**：[create-custom-dtos.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/custom-types/create-custom-dtos.ts)
 
@@ -165,11 +366,11 @@ DTO 生成分布在 **Server 端资源 DTO**、**Server 端自定义 DTO**、**S
 
 | 项目 | 状态 |
 |------|------|
-| **AST 清理函数** | ❌ **一个都没有调用**（从头构建 AST，不使用模板） |
+| **AST 清理函数** | ❌ 0 个（从头构建 AST，不使用模板） |
 | **Prettier 格式化** | ❌ 未格式化。`customDtos` 在 [create-server.ts#L73](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/create-server.ts#L73) 生成，但未出现在任何 `replaceModulesCode(formatCode)` 调用中 |
 | **输出文件** | `src/<customModuleName>/<DtoName>.ts` |
 
-#### 3.3.4 Admin 端 DTOs
+#### 3.3.7 Admin 端 DTOs
 
 **生成入口**：[admin/create-dto-modules.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/admin/create-dto-modules.ts)
 
@@ -183,7 +384,7 @@ DTO 生成分布在 **Server 端资源 DTO**、**Server 端自定义 DTO**、**S
 
 | 项目 | 状态 |
 |------|------|
-| **AST 清理函数** | ❌ **一个都没有调用**（从已构建的 Server DTO AST 转换而来，不重新读取模板） |
+| **AST 清理函数** | ❌ 0 个（从已构建的 Server DTO AST 转换而来，不重新读取模板） |
 | **Prettier 格式化** | ✅ 在 [create-admin.ts#L121](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/admin/create-admin.ts#L121) 通过 `tsModules.replaceModulesCode(formatCode)` 格式化 |
 | **输出文件** | Admin UI 项目 `src/**/*DTO*.ts` |
 
@@ -529,9 +730,12 @@ createPublicFiles()
 | **用户指定的边界模块** | | | | |
 | 微服务连接 | connectMicroservices | `print(template).code`（模板） | ❌ 0 个 | ❌ 未格式化 |
 | 主文件 | createMainFile | `print(template).code`（模板，可选 BigInt 注入） | ❌ 0 个 | ✅ 自格式化 |
-| 数据传输对象-资源 DTO | createDTOModules | `print(file).code`（从头构建 AST） | ❌ 0 个 | ✅ dtoModules |
+| 数据传输对象-资源 DTO (A类) | entity / createInput / updateInput / whereInput / whereUniqueInput | `print(file).code`（从头构建 AST，不读取模板） | ❌ 0 个 | ✅ dtoModules |
+| 数据传输对象-资源 DTO (B类) | createArgs? / updateArgs? / deleteArgs / countArgs / findManyArgs / findOneArgs / listRelationFilter | `print(file).code`（读取模板 + 抽取 class + 重包装） | ✅ 仅 `removeTSClassDeclares`（1 个） | ✅ dtoModules |
+| 数据传输对象-资源 DTO (C类) | **orderByInput** | `print(file).code`（读取模板 + 替换 classBody + 抽取 class + 重包装） | ❌ **0 个（读取模板但不清理）** | ✅ dtoModules |
+| 数据传输对象-枚举/嵌套 DTO | createEntityEnumDTOs / createToManyDTOs | `print(file).code`（从头构建 AST） | ❌ 0 个 | ✅ dtoModules |
 | 数据传输对象-自定义 DTO | createCustomDtos | `print(file).code`（从头构建 AST） | ❌ 0 个 | ❌ 未格式化 |
-| 数据传输对象-Admin DTO | admin/createDTOModules | `print(file).code`（Server DTO 转换） | ❌ 0 个 | ✅ tsModules |
+| 数据传输对象-Admin DTO | admin/createDTOModules | `print(file).code`（Server DTO Class → TSTypeAlias 转换） | ❌ 0 个 | ✅ tsModules |
 | 枚举-资源字段枚举 | createEnumDTO（嵌入 DTO） | 嵌入 DTO 的 print 输出 | ❌ 0 个 | ✅ dtoModules |
 | 枚举-MB Topics | createTopicsEnum | `print(astFile).code`（从头构建） | ❌ 0 个 | ✅ messageBrokerModules |
 | 枚举-Admin EnumRoles | createEnumRolesModule | `print(file).code`（从头构建） | ❌ 0 个 | ✅ tsModules |
@@ -560,25 +764,38 @@ createPublicFiles()
 
 ### 5.2 代码输出方式分类
 
-从 print 输出方式可以看出"不调用清理函数"的根本原因分为三类：
+从 print 输出方式可以看出"不调用清理函数"的根本原因分为四类：
 
-1. **从头构建 AST（`builders.*` / `EnumBuilder`）** — 不读取 `.template.ts` 模板文件，因此 AST 中本就不存在需要清理的 `declare` 声明和 ESLint 注释。
-   - 路径：资源 DTO、自定义 DTO、Admin DTO、所有枚举（Topics/EnumRoles/SecretsNameKey）、消息代理 Topics
+1. **从头构建 AST（`builders.*` / `EnumBuilder` / `classDeclaration`）** — 不读取 `.template.ts` 模板文件，因此 AST 中本就不存在需要清理的 `declare` 声明和 ESLint 注释。
+   - 路径：资源 DTO A 类（entity/createInput/updateInput/whereInput/whereUniqueInput）、自定义 DTO、Admin DTO、所有枚举（Topics/EnumRoles/SecretsNameKey/资源枚举）、toMany 嵌套 DTO、消息代理 Topics
 
-2. **直接读取磁盘文件（`fs.readFile` / `readCode` / `readStaticModules`）** — 跳过 recast AST 层，直接将字符串内容写入 ModuleMap。
+2. **读取模板但只抽取出单个节点后重新包装 File** — 通过 `readFile` + `interpolate` 读取模板，但通过 `getClassDeclarationById()` 抽取出单个 `NamedClassDeclaration` 节点返回，不返回整个 File。File 对象在 `createDTOFile()` 中由 `builders.file(builders.program([dto, ...]))` 重新构建，因此模板顶层的 `@ts-ignore`、import、`declare` 声明不会出现在最终输出。
+   - 路径 B 类：createArgs/updateArgs/deleteArgs/countArgs/findManyArgs/findOneArgs/listRelationFilter（需调用 `removeTSClassDeclares` 清理模板中的 `declare class` 占位符，避免干扰 class 查找）
+   - 路径 C 类：**orderByInput**（模板中只有单个 `export class ID`，无额外 `declare class`，因此连 `removeTSClassDeclares` 都不需要调用；模板中的 `//@ts-ignore` 位于 File 顶层，不在抽取的 class 节点中；且 `classBody` 被整体重新构建）
+
+3. **直接读取磁盘文件（`fs.readFile` / `readCode` / `readStaticModules`）** — 跳过 recast AST 层，直接将字符串内容写入 ModuleMap。
    - 路径：静态模块、Types Related Files、Docker Compose、密钥管理静态文件、.gitignore、package.json、Admin Public Files
 
-3. **不使用 TypeScript AST（专用库/字符串处理）** — 例如 Prisma Schema DSL、JSON.stringify、YAML prepare、`.env` 键值拼接等。
+4. **不使用 TypeScript AST（专用库/字符串处理）** — 例如 Prisma Schema DSL、JSON.stringify、YAML prepare、`.env` 键值拼接等。
    - 路径：Prisma Schema、.env、Admin Roles、Admin manifest.json
 
 ---
 
 ## 6. 关键设计观察
 
-1. **"从头构建 AST"的路径天然不需要清理**：资源 DTO、所有枚举、Admin DTO 等路径不使用 `.template.ts` 模板文件，而是用 `builders.tsEnumDeclaration`、`builders.classDeclaration`、`builders.tsTypeAliasDeclaration` 等从头构建 AST——这些节点中本就不会有 `declare var/class/interface` 或 `eslint-disable` 注释，因此无需调用清理函数。
+1. **"从头构建 AST"的路径天然不需要清理**：资源 DTO A 类（entity/createInput/updateInput/whereInput/whereUniqueInput）、所有枚举、Admin DTO、toMany 嵌套 DTO 等路径不使用 `.template.ts` 模板文件，而是用 `builders.tsEnumDeclaration`、`builders.classDeclaration`、`builders.tsTypeAliasDeclaration` 等从头构建 AST——这些节点中本就不会有 `declare var/class/interface` 或 `eslint-disable` 注释，因此无需调用清理函数。
 
-2. **主文件和微服务连接是例外**：它们**使用了 `.template.ts` 模板**（[main.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/create-main/main.template.ts) 和 [connect-microservices.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/connect-microservices/connect-microservices.template.ts)），但模板文件本身不包含需要清理的声明和注释，因此开发者未调用清理函数。这是一个**潜在的不一致点**——如果未来模板中加入了需要清理的内容（如 `declare var`），生成代码会直接暴露这些声明。
+2. **DTO B/C 类的"抽取节点+重建 File"设计让大部分清理变得多余**：所有基于模板的 DTO（Args 系列、orderByInput、listRelationFilter）都只返回单个 `NamedClassDeclaration` 节点，最终 File 由 `createDTOFile()` 重新构建。这意味着：
+   - 模板顶层的 `//@ts-ignore`、`import` 语句、注释节点天然不会进入输出
+   - 只有模板中的 `declare class` 占位符声明会干扰 `getClassDeclarationById` 的查找，因此 B 类（Args/ListRelationFilter）需要调用 `removeTSClassDeclares`
+   - C 类（orderByInput）因为模板中没有额外的 `declare class`，连这个调用都省略了
 
-3. **Prettier 格式化覆盖的盲区**：`connectMicroservicesModule`、`customDtos`、`customModulesModules`、`secretsManagerModule`、`staticModules`（Server+Admin）、`prismaSchemaModule`、`dotEnvModule`（Server+Admin）、`connectMicroservicesModule`、`dockerComposeFile`、`dockerComposeDevFile`、`gitIgnore`、Admin `publicFilesModules` 均未被 Prettier 格式化。其中 `connectMicroservicesModule`（TS 文件）和 `customDtos`/`customModulesModules`（TS 文件）属于 Prettier 支持的类型但遗漏了格式化调用。
+3. **orderByInput 是读取模板但完全不清理的唯一 DTO**：其模板 [order-by-input.template.ts](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/order-by-input/order-by-input.template.ts) 含有 `//@ts-ignore` 注释和 `FIELD_NAME` 占位字段，但：
+   - `@ts-ignore` 位于 File 顶层，不在抽取的 class 节点中
+   - `classBody` 被 `classDeclaration.body = builders.classBody(properties)` 整体替换（[order-by-input.ts#L84](file:///d:/fz/0601/solo-dogfeeding/code/105-amplication/packages/data-service-generator/src/server/resource/dto/graphql/order-by-input/order-by-input.ts#L84)），原字段被丢弃
+   - 最终 File 重新构建
+   因此不需要任何清理函数调用。
 
-4. **GraphQL Args 是 DTO 家族中唯一调用清理的路径**：7 种 GraphQL Args 文件读取了 `.template.ts`（含 `declare class`），因此调用了 `removeTSClassDeclares`。而普通 Class DTO、Enum DTO、Admin DTO 均从头构建 AST，无需清理。
+4. **主文件和微服务连接是"直接 print 整个模板 File"的例外**：它们**使用了 `.template.ts` 模板**但不做节点抽取——直接对整个 File 调用 `print(template).code`。目前模板文件本身不包含需要清理的声明和注释，因此开发者未调用清理函数。这是一个**潜在的不一致点**——如果未来模板中加入了 `declare var` 或 `eslint-disable`，生成代码会直接暴露这些内容（因为没有重新构建 File，也没有调用清理）。
+
+5. **Prettier 格式化覆盖的盲区**：`connectMicroservicesModule`、`customDtos`、`customModulesModules`、`secretsManagerModule`、`staticModules`（Server+Admin）、`prismaSchemaModule`、`dotEnvModule`（Server+Admin）、`dockerComposeFile`、`dockerComposeDevFile`、`gitIgnore`、Admin `publicFilesModules` 均未被 Prettier 格式化。其中 `connectMicroservicesModule`（TS 文件）和 `customDtos`/`customModulesModules`（TS 文件）属于 Prettier 支持的类型但遗漏了格式化调用。
